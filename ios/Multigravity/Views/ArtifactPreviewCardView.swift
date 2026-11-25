@@ -21,6 +21,7 @@ public struct ArtifactPreviewCardView: View {
     }
 
     private var isPlanArtifact: Bool {
+        if artifact.requestFeedback == true { return true }
         let lower = (artifact.uri + " " + artifact.title).lowercased()
         return lower.contains("implementation_plan") || lower.contains("plan")
     }

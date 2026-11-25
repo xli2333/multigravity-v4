@@ -77,14 +77,8 @@ extension MessageBubbleView {
             
             if !message.artifacts.isEmpty {
                 VStack(spacing: 8) {
-                    ForEach(message.artifacts, id: \.uri) { artifact in
-                        let isProceedTarget: Bool = {
-                            guard canProceed else { return false }
-                            if let targetUri = proceedArtifactUri, !targetUri.isEmpty {
-                                return artifact.uri == targetUri
-                            }
-                            return artifact.artifactType == "implementation_plan" || message.artifacts.count == 1
-                        }()
+                    ForEach(message.artifacts, id: \.uri) { (artifact: ArtifactItem) in
+                        let isProceedTarget = shouldShowInlineProceed(for: artifact)
                         ArtifactPreviewCardView(
                             artifact: artifact,
                             canProceed: isProceedTarget,
@@ -207,5 +201,17 @@ extension MessageBubbleView {
                 )
             }
         )
+    }
+
+    private func shouldShowInlineProceed(for artifact: ArtifactItem) -> Bool {
+        guard canProceed else { return false }
+        if let targetUri = proceedArtifactUri, !targetUri.isEmpty {
+            return artifact.uri == targetUri
+        }
+        if artifact.requestFeedback == true {
+            return true
+        }
+        let lower = (artifact.uri + " " + artifact.title).lowercased()
+        return lower.contains("implementation_plan") || lower.contains("plan") || message.artifacts.count == 1
     }
 }
