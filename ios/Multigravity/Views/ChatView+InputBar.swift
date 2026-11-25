@@ -29,7 +29,7 @@ extension ChatView {
     var inputBar: some View {
         let hasAuxCommandChip = viewModel.selectedSlashCommand != nil
             && viewModel.selectedSlashCommand?.name != "goal"
-            && viewModel.selectedSlashCommand?.name != "teamwork"
+            && viewModel.selectedSlashCommand?.name != "swarm"
         let hasInlineProceedCard = viewModel.canProceed && viewModel.messages.contains(where: { !$0.artifacts.isEmpty })
         let showFallbackProceedChip = viewModel.canProceed && !hasInlineProceedCard
 
@@ -250,7 +250,7 @@ extension ChatView {
                         isInputFocused = false
                         showSwarmSheet = true
                     } else {
-                        viewModel.toggleQuickSlashMode("teamwork", fallbackTitle: "Swarm", fallbackIcon: "graph_2")
+                        viewModel.toggleQuickSlashMode("swarm", fallbackTitle: "Swarm", fallbackIcon: "swarm_bee")
                     }
                 },
                 onOpenSwarmBoard: {
@@ -387,7 +387,7 @@ private struct ChatInputTextAndSendRow: View {
     }
 
     private var isSwarmHighlighted: Bool {
-        viewModel.isSwarmActive || viewModel.selectedSlashCommand?.name == "teamwork"
+        viewModel.isSwarmActive || viewModel.selectedSlashCommand?.name == "swarm"
     }
 
     private var isGoalHighlighted: Bool {
@@ -589,7 +589,7 @@ private struct ChatInputTextAndSendRow: View {
                     showIcon: showModeIcons,
                     action: onTapSwarm
                 ) {
-                    SlashCommandIconView(name: "teamwork", icon: "graph_2", size: 10.5)
+                    SlashCommandIconView(name: "swarm", icon: "swarm_bee", size: 10.5)
                 }
                 .contextMenu {
                     if !viewModel.isDraftConversation {

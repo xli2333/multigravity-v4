@@ -359,12 +359,12 @@ public struct CommandHubTabView: View {
             if let cid = targetConv?.id {
                 activeSwarmCascadeId = cid
             } else {
-                onStartTemplateSession("/teamwork ")
+                onStartTemplateSession("/swarm ")
             }
         } label: {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 6) {
-                    SlashCommandIconView(name: "teamwork", icon: "graph_2", size: 13)
+                    SlashCommandIconView(name: "swarm", icon: "swarm_bee", size: 13)
                         .foregroundColor(AGPalette.violetText(colorScheme))
                     Text("活跃 Swarm")
                         .font(.system(size: 12, weight: .bold))
