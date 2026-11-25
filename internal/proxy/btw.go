@@ -447,12 +447,20 @@ func (p *Proxy) handleBtwStatus(w http.ResponseWriter, r *http.Request) {
 	entry, _ := defaultBtwTracker.getSide(sideID)
 
 	var question, thinking, answer string
-	for _, msg := range details.AllMessages {
+	lastUserIdx := -1
+	for i := len(details.AllMessages) - 1; i >= 0; i-- {
+		if details.AllMessages[i].Type == "user" {
+			lastUserIdx = i
+			question = strings.TrimSpace(details.AllMessages[i].Content)
+			break
+		}
+	}
+	tailStart := 0
+	if lastUserIdx >= 0 {
+		tailStart = lastUserIdx + 1
+	}
+	for _, msg := range details.AllMessages[tailStart:] {
 		switch msg.Type {
-		case "user":
-			if question == "" {
-				question = strings.TrimSpace(msg.Content)
-			}
 		case "agent":
 			if msg.Thinking != "" {
 				if thinking != "" {

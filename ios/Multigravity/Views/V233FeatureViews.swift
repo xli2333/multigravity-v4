@@ -383,6 +383,7 @@ public struct WorkspaceTrustBanner: View {
 
 public struct BtwSideQuestionSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
     public let parentCascadeId: String
     public let activeModel: String
     public let initialQuote: String?
@@ -394,6 +395,9 @@ public struct BtwSideQuestionSheet: View {
     @State private var entries: [BtwSideQuestionEntry] = []
     @State private var activeSideId: String? = nil
     @State private var activeStatus: BtwStatusResponse? = nil
+    @State private var resolvedSideAnswer: String = ""
+    @State private var resolvedSideThinking: String = ""
+    @State private var resolvedSideRunning: Bool = false
     @State private var isStarting: Bool = false
     @State private var errorMsg: String? = nil
     @State private var showThinking: Bool = false
@@ -412,6 +416,21 @@ public struct BtwSideQuestionSheet: View {
         self.onOpenStandalone = onOpenStandalone
     }
 
+    private func buildCleanInsertText(cascadeId: String, title: String?, question: String?, answer: String) -> String {
+        let trimmedAns = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAns.isEmpty else { return "" }
+        let shortId = String(cascadeId.prefix(8))
+        let headerTitle = (title?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (question?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? ""
+        let header = headerTitle.isEmpty ? "Side question (\(shortId))" : "Side question (\(shortId)): \(headerTitle)"
+        let quoted = trimmedAns
+            .components(separatedBy: "\n")
+            .map { "> \($0)" }
+            .joined(separator: "\n")
+        return "**\(header)**\n\(quoted)"
+    }
+
     public var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -422,19 +441,19 @@ public struct BtwSideQuestionSheet: View {
                                 HStack {
                                     Label("引用片段", systemImage: "text.quote")
                                         .font(.system(size: 11.5, weight: .semibold))
-                                        .foregroundColor(.indigo)
+                                        .foregroundColor(AGPalette.accentText(colorScheme))
                                     Spacer()
                                     Button("清除") { quoteText = "" }
                                         .font(.system(size: 11.5))
-                                        .foregroundColor(.secondary)
+                                        .foregroundColor(AGPalette.textSecondary(colorScheme))
                                 }
                                 Text(quoteText)
                                     .font(.system(size: 12.5))
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(AGPalette.textSecondary(colorScheme))
                                     .lineLimit(5)
                                     .padding(10)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color(uiColor: .secondarySystemBackground))
+                                    .background(AGPalette.recessedWell(colorScheme))
                                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                             }
                         }
@@ -443,22 +462,33 @@ public struct BtwSideQuestionSheet: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 8) {
                                     ForEach(entries) { entry in
+                                        let isCurrent = activeSideId == entry.cascadeId
                                         Button {
-                                            activeSideId = entry.cascadeId
+                                            if activeSideId != entry.cascadeId {
+                                                resolvedSideAnswer = ""
+                                                resolvedSideThinking = ""
+                                                activeStatus = nil
+                                                activeSideId = entry.cascadeId
+                                            }
                                         } label: {
                                             HStack(spacing: 5) {
                                                 Circle()
-                                                    .fill(entry.status == "CASCADE_RUN_STATUS_RUNNING" ? Color.green : Color.indigo.opacity(0.6))
+                                                    .fill(entry.status == "CASCADE_RUN_STATUS_RUNNING" ? AGPalette.emeraldFill(colorScheme) : AGPalette.accentFill(colorScheme))
                                                     .frame(width: 6, height: 6)
                                                 Text(entry.title ?? entry.question ?? "Side question")
-                                                    .font(.system(size: 12, weight: .medium))
+                                                    .font(.system(size: 12, weight: isCurrent ? .semibold : .medium))
+                                                    .foregroundColor(isCurrent ? AGPalette.accentText(colorScheme) : AGPalette.textSecondary(colorScheme))
                                                     .lineLimit(1)
-                                                    .frame(maxWidth: 160, alignment: .leading)
+                                                    .frame(maxWidth: 165, alignment: .leading)
                                             }
                                             .padding(.horizontal, 10)
                                             .padding(.vertical, 6)
-                                            .background(activeSideId == entry.cascadeId ? Color.indigo.opacity(0.18) : Color(uiColor: .secondarySystemBackground))
+                                            .background(isCurrent ? AGPalette.accentSoft(colorScheme) : AGPalette.cardBackground(colorScheme))
                                             .clipShape(Capsule())
+                                            .overlay(
+                                                Capsule()
+                                                    .stroke(isCurrent ? AGPalette.accentFill(colorScheme).opacity(0.42) : AGPalette.border(colorScheme), lineWidth: 1)
+                                            )
                                         }
                                         .buttonStyle(.plain)
                                     }
@@ -467,135 +497,194 @@ public struct BtwSideQuestionSheet: View {
                         }
 
                         if let st = activeStatus {
+                            let effectiveQuestion = entries.first(where: { $0.cascadeId == st.cascadeId })?.question ?? st.question
+                            let effectiveAnswer = resolvedSideAnswer
+                            let effectiveThinking = resolvedSideThinking
+                            let effectiveRunning = resolvedSideRunning || (st.isRunning == true)
+
                             VStack(alignment: .leading, spacing: 10) {
-                                if let q = st.question, !q.isEmpty {
+                                if let q = effectiveQuestion, !q.isEmpty {
                                     Text(q)
                                         .font(.system(size: 14, weight: .semibold))
-                                        .padding(10)
+                                        .foregroundColor(AGPalette.textPrimary(colorScheme))
+                                        .padding(11)
                                         .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(Color.indigo.opacity(0.10))
+                                        .background(AGPalette.accentSoft(colorScheme))
                                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                .stroke(AGPalette.accentFill(colorScheme).opacity(0.28), lineWidth: 1)
+                                        )
                                 }
 
-                                if let think = st.thinking, !think.isEmpty {
+                                if !effectiveThinking.isEmpty {
                                     DisclosureGroup("深度思考", isExpanded: $showThinking) {
-                                        Text(think)
+                                        Text(effectiveThinking)
                                             .font(.system(size: 12))
-                                            .foregroundColor(.secondary)
+                                            .foregroundColor(AGPalette.textSecondary(colorScheme))
                                             .padding(.top, 4)
                                     }
                                     .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundColor(AGPalette.textSecondary(colorScheme))
                                     .padding(10)
-                                    .background(Color(uiColor: .secondarySystemBackground))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    .agCard(cornerRadius: 10)
                                 }
 
                                 if let err = st.errorMessage, st.hasError == true, !err.isEmpty {
                                     Text(err)
                                         .font(.system(size: 13))
-                                        .foregroundColor(.red)
+                                        .foregroundColor(AGPalette.roseText(colorScheme))
                                         .padding(10)
-                                        .background(Color.red.opacity(0.10))
+                                        .background(AGPalette.roseSoft(colorScheme))
                                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 }
 
-                                if let ans = st.answer, !ans.isEmpty {
-                                    MarkdownContentView(content: ans)
-                                        .padding(12)
+                                if !effectiveAnswer.isEmpty {
+                                    MarkdownContentView(content: effectiveAnswer)
+                                        .padding(13)
                                         .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(Color(uiColor: .secondarySystemBackground))
-                                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        .agCard(cornerRadius: 13)
 
-                                    HStack(spacing: 10) {
-                                        Button {
-                                            let text = (st.insertText?.isEmpty == false ? st.insertText! : ans)
-                                            dismiss()
-                                            onInsertIntoMain(text)
-                                        } label: {
-                                            Label("插入主对话", systemImage: "arrow.turn.down.left")
-                                                .font(.system(size: 13.5, weight: .semibold))
-                                                .frame(maxWidth: .infinity)
+                                    if effectiveRunning {
+                                        HStack(spacing: 6) {
+                                            ProgressView().controlSize(.mini)
+                                            Text("正在补充生成...")
+                                                .font(.system(size: 11.5))
+                                                .foregroundColor(AGPalette.textSecondary(colorScheme))
                                         }
-                                        .buttonStyle(.borderedProminent)
-                                        .tint(.indigo)
-
-                                        if let onOpenStandalone {
+                                    } else {
+                                        HStack(spacing: 10) {
                                             Button {
+                                                let cleanInsert = buildCleanInsertText(
+                                                    cascadeId: st.cascadeId,
+                                                    title: st.title,
+                                                    question: effectiveQuestion,
+                                                    answer: effectiveAnswer
+                                                )
                                                 dismiss()
-                                                onOpenStandalone(st.cascadeId)
+                                                onInsertIntoMain(cleanInsert.isEmpty ? effectiveAnswer : cleanInsert)
                                             } label: {
-                                                Image(systemName: "arrow.up.right.square")
+                                                HStack(spacing: 6) {
+                                                    Image(systemName: "arrow.turn.down.left")
+                                                        .font(.system(size: 12.5, weight: .bold))
+                                                    Text("引用结论回主对话")
+                                                        .font(.system(size: 13.5, weight: .semibold))
+                                                }
+                                                .foregroundColor(.white)
+                                                .frame(maxWidth: .infinity)
+                                                .padding(.vertical, 10)
+                                                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(AGPalette.accentFill(colorScheme)))
                                             }
-                                            .buttonStyle(.bordered)
-                                            .accessibilityLabel("在独立会话打开")
+                                            .buttonStyle(.plain)
+
+                                            if let onOpenStandalone {
+                                                Button {
+                                                    dismiss()
+                                                    onOpenStandalone(st.cascadeId)
+                                                } label: {
+                                                    Image(systemName: "arrow.up.right.square")
+                                                        .font(.system(size: 15, weight: .semibold))
+                                                        .foregroundColor(AGPalette.textPrimary(colorScheme))
+                                                        .frame(width: 40, height: 38)
+                                                        .agCard(cornerRadius: 10)
+                                                }
+                                                .buttonStyle(.plain)
+                                                .accessibilityLabel("在独立会话打开")
+                                            }
                                         }
                                     }
-                                } else if st.isRunning == true {
-                                    HStack(spacing: 8) {
+                                } else if effectiveRunning {
+                                    HStack(spacing: 9) {
                                         ProgressView().controlSize(.small)
-                                        Text("旁路快问正在生成回复...")
-                                            .font(.system(size: 13))
-                                            .foregroundColor(.secondary)
+                                            .tint(AGPalette.accentText(colorScheme))
+                                        Text("旁路快问正在检索上下文并生成回复...")
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundColor(AGPalette.textSecondary(colorScheme))
                                     }
-                                    .padding(.vertical, 8)
+                                    .padding(14)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .agCard(cornerRadius: 12)
+                                } else {
+                                    Text("暂无旁路回复内容")
+                                        .font(.system(size: 12.5))
+                                        .foregroundColor(AGPalette.textTertiary(colorScheme))
+                                        .padding(.vertical, 8)
                                 }
                             }
                         } else if !isStarting && entries.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
-                                Label("旁路快问（不打断主对话流）", systemImage: "bubble.left.and.exclamationmark.bubble.right")
-                                    .font(.system(size: 13.5, weight: .semibold))
-                                    .foregroundColor(.primary)
-                                Text("随时就当前上下文发起独立快问，回答完成后可一键将结论引用插入主对话输入框。")
+                                HStack(spacing: 6) {
+                                    SlashCommandIconView(name: "btw", size: 15)
+                                        .foregroundColor(AGPalette.accentText(colorScheme))
+                                    Text("旁路快问（不打断主对话流）")
+                                        .font(.system(size: 13.5, weight: .semibold))
+                                        .foregroundColor(AGPalette.textPrimary(colorScheme))
+                                }
+                                Text("继承当前会话完整上下文发起独立快问（可调工具查文件），回答完成后可一键将结论引用插入主对话输入框。")
                                     .font(.system(size: 12.5))
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(AGPalette.textSecondary(colorScheme))
                             }
-                            .padding(12)
+                            .padding(13)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(uiColor: .secondarySystemBackground))
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .agCard(cornerRadius: 12)
                         }
 
                         if let err = errorMsg {
                             Text(err)
                                 .font(.system(size: 12.5))
-                                .foregroundColor(.red)
+                                .foregroundColor(AGPalette.roseText(colorScheme))
                         }
                     }
                     .padding(16)
                 }
 
-                Divider()
+                Rectangle()
+                    .fill(AGPalette.borderSubtle(colorScheme))
+                    .frame(height: 0.75)
+
+                let canSubmit = !isStarting && (!questionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !quoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 HStack(spacing: 8) {
                     TextField("输入旁路快问（/btw）...", text: $questionText, axis: .vertical)
                         .lineLimit(1...4)
                         .font(.system(size: 14.5))
+                        .foregroundColor(AGPalette.textPrimary(colorScheme))
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
-                        .background(Color(uiColor: .secondarySystemBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .background(AGPalette.recessedWell(colorScheme))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(AGPalette.border(colorScheme), lineWidth: 1)
+                        )
 
                     Button {
                         Task { await submitQuestion() }
                     } label: {
                         if isStarting {
                             ProgressView().controlSize(.small)
-                                .frame(width: 36, height: 36)
+                                .frame(width: 34, height: 34)
                         } else {
-                            Image(systemName: "paperplane.fill")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
-                                .frame(width: 36, height: 36)
-                                .background(Color.indigo)
-                                .clipShape(Circle())
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(canSubmit ? AGPalette.accentFill(colorScheme) : AGPalette.recessedWell(colorScheme))
+                                    .frame(width: 34, height: 34)
+                                AGLinearIcon(
+                                    .arrowUp,
+                                    size: 15,
+                                    color: canSubmit ? .white : AGPalette.textTertiary(colorScheme),
+                                    lineWidth: 2.2
+                                )
+                            }
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(isStarting || (questionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && quoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                    .disabled(!canSubmit)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(Color(uiColor: .systemBackground))
+                .background(AGPalette.cardBackground(colorScheme))
             }
+            .background(AGPageBackgroundView())
             .navigationTitle("/btw 旁路快问")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
@@ -614,12 +703,60 @@ public struct BtwSideQuestionSheet: View {
             }
             .task(id: activeSideId) {
                 guard let sid = activeSideId, let baseURL = AppSettings.shared.gatewayURL else { return }
+                var emptyPollCount = 0
                 while !Task.isCancelled {
-                    if let st = try? await APIClient.shared.fetchBtwStatus(cascadeId: sid, baseURL: baseURL) {
+                    async let stTask = try? APIClient.shared.fetchBtwStatus(cascadeId: sid, baseURL: baseURL)
+                    async let msgTask = try? APIClient.shared.fetchMessages(cascadeId: sid, limit: 18, offset: 0, baseURL: baseURL)
+                    let (st, tailRes) = await (stTask, msgTask)
+
+                    if let st {
                         activeStatus = st
-                        if st.isRunning != true {
-                            break
+                    }
+
+                    if let tailRes {
+                        let msgs = tailRes.messages
+                        let isRun = tailRes.status == "CASCADE_RUN_STATUS_RUNNING" || (st?.isRunning == true)
+                        resolvedSideRunning = isRun
+
+                        // Strictly isolate ONLY messages belonging to the /btw question turn (after the last .user message)
+                        // so inherited parent conversation history never bleeds into the /btw answer card.
+                        if let lastUserIdx = msgs.lastIndex(where: { $0.sender == .user }) {
+                            let sideSlice = msgs[(lastUserIdx + 1)...]
+                            let ansParts = sideSlice
+                                .filter { $0.sender == .agent }
+                                .map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                .filter { !$0.isEmpty }
+                            let thinkParts = sideSlice
+                                .compactMap { $0.thinking?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                .filter { !$0.isEmpty }
+                            resolvedSideAnswer = ansParts.joined(separator: "\n\n")
+                            resolvedSideThinking = thinkParts.joined(separator: "\n\n")
+                        } else {
+                            resolvedSideAnswer = ""
+                            resolvedSideThinking = ""
                         }
+
+                        if let idx = entries.firstIndex(where: { $0.cascadeId == sid }) {
+                            let updated = BtwSideQuestionEntry(
+                                cascadeId: entries[idx].cascadeId,
+                                parentCascadeId: entries[idx].parentCascadeId,
+                                title: entries[idx].title,
+                                question: entries[idx].question,
+                                quote: entries[idx].quote,
+                                status: tailRes.status,
+                                createdAt: entries[idx].createdAt
+                            )
+                            entries[idx] = updated
+                        }
+
+                        if !isRun {
+                            if !resolvedSideAnswer.isEmpty || (st?.hasError == true) || emptyPollCount >= 3 {
+                                break
+                            }
+                            emptyPollCount += 1
+                        }
+                    } else if let st, st.isRunning != true {
+                        break
                     }
                     try? await Task.sleep(nanoseconds: 850_000_000)
                 }
@@ -649,6 +786,9 @@ public struct BtwSideQuestionSheet: View {
             )
             questionText = ""
             quoteText = ""
+            resolvedSideAnswer = ""
+            resolvedSideThinking = ""
+            resolvedSideRunning = true
             let entry = BtwSideQuestionEntry(
                 cascadeId: res.cascadeId,
                 parentCascadeId: parentCascadeId,
