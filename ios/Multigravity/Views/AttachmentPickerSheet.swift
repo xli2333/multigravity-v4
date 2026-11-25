@@ -298,45 +298,60 @@ private struct PhotoThumbnail: View {
     }
 }
 
-/// A single cell in the photo grid with selection badge and clean touch boundaries.
+/// A single cell in the photo grid with WeChat-style dual hit targets:
+/// tap photo body -> full-screen zoomable preview; tap top-right badge -> toggle selection.
 private struct PhotoGridCell: View {
     @Environment(\.colorScheme) private var colorScheme
     let asset: PHAsset
     let isSelected: Bool
     let selectionOrder: Int?
     let imageManager: PHCachingImageManager
+    let onPreview: () -> Void
     let onToggle: () -> Void
 
     var body: some View {
-        Button(action: onToggle) {
-            PhotoThumbnail(asset: asset, manager: imageManager)
-                .overlay(Color.black.opacity(isSelected ? 0.25 : 0))
-                .overlay(alignment: .topTrailing) {
-                    ZStack {
-                        if let selectionOrder {
-                            Circle()
-                                .fill(AGPalette.accentFill(colorScheme))
-                            Circle()
-                                .stroke(Color.white, lineWidth: 1.5)
-                            Text("\(selectionOrder + 1)")
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundColor(.white)
-                        } else {
-                            Circle()
-                                .fill(Color.black.opacity(0.35))
-                            Circle()
-                                .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
-                        }
+        ZStack(alignment: .topTrailing) {
+            Button(action: onPreview) {
+                PhotoThumbnail(asset: asset, manager: imageManager)
+                    .overlay(Color.black.opacity(isSelected ? 0.25 : 0))
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onToggle) {
+                ZStack {
+                    if let selectionOrder {
+                        Circle()
+                            .fill(AGPalette.accentFill(colorScheme))
+                        Circle()
+                            .stroke(Color.white, lineWidth: 1.5)
+                        Text("\(selectionOrder + 1)")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.white)
+                    } else {
+                        Circle()
+                            .fill(Color.black.opacity(0.35))
+                        Circle()
+                            .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
                     }
-                    .frame(width: 22, height: 22)
-                    .shadow(color: Color.black.opacity(0.35), radius: 2, x: 0, y: 1)
-                    .padding(6)
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(width: 22, height: 22)
+                .shadow(color: Color.black.opacity(0.35), radius: 2, x: 0, y: 1)
+                .frame(width: 36, height: 36, alignment: .topTrailing)
+                .padding(.top, 5)
+                .padding(.trailing, 5)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
+}
+
+private struct AlbumPreviewLaunchState: Identifiable {
+    let id = UUID()
+    let assets: [PHAsset]
+    let initialIndex: Int
 }
 
 /// Full-height pull-up sheet behind the chat "+" button: quick action tiles in Recents,
@@ -360,6 +375,7 @@ struct AttachmentPickerSheet: View {
     @State private var selectedAssetMap: [String: PHAsset] = [:] // Preserves PHAsset references across album switches
     @State private var showAlbumDrawer = false
     @State private var showFileImporter = false
+    @State private var previewLaunchState: AlbumPreviewLaunchState? = nil
     private let imageManager = PHCachingImageManager()
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 4)
@@ -389,6 +405,23 @@ struct AttachmentPickerSheet: View {
                 dismiss()
                 onFilesPicked(urls)
             }
+        }
+        .fullScreenCover(item: $previewLaunchState) { state in
+            AlbumAssetPreviewSheet(
+                assets: state.assets,
+                initialIndex: state.initialIndex,
+                selected: $selected,
+                selectedAssetMap: $selectedAssetMap,
+                remainingImageSlots: remainingImageSlots,
+                onConfirm: {
+                    let picked = selected.compactMap { selectedAssetMap[$0] }
+                    previewLaunchState = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        dismiss()
+                        onPhotosPicked(picked)
+                    }
+                }
+            )
         }
     }
 
@@ -523,10 +556,14 @@ struct AttachmentPickerSheet: View {
                                                 asset: asset,
                                                 isSelected: order != nil,
                                                 selectionOrder: order,
-                                                imageManager: imageManager
-                                            ) {
-                                                toggleSelection(for: asset)
-                                            }
+                                                imageManager: imageManager,
+                                                onPreview: {
+                                                    openPreviewAround(index: index)
+                                                },
+                                                onToggle: {
+                                                    toggleSelection(for: asset)
+                                                }
+                                            )
                                             .id("\(photos.selectedAlbumId)_\(asset.localIdentifier)")
                                         }
                                     }
@@ -761,22 +798,59 @@ struct AttachmentPickerSheet: View {
         .accessibilityLabel(isDenied ? String(localized: "前往系统设置开启相册权限") : String(localized: "授权访问相册以选择最近照片"))
     }
     
-    private var footer: some View {
-        Button {
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            let picked = selected.compactMap { selectedAssetMap[$0] }
-            dismiss()
-            onPhotosPicked(picked)
-        } label: {
-            Text("添加 (\(selected.count))")
-                .font(.system(size: 15.5, weight: .semibold))
-                .foregroundColor(.white)
-                .padding(.horizontal, 30)
-                .padding(.vertical, 12)
-                .background(Capsule().fill(AGPalette.accentFill(colorScheme)))
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.36 : 0.16), radius: 10, x: 0, y: 4)
+    private func openPreviewAround(index: Int) {
+        let total = photos.assetCount
+        guard total > 0, index >= 0, index < total else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let start = max(0, index - 60)
+        let end = min(total - 1, index + 60)
+        var slice: [PHAsset] = []
+        slice.reserveCapacity(end - start + 1)
+        for i in start...end {
+            if let a = photos.asset(at: i) {
+                slice.append(a)
+            }
         }
-        .buttonStyle(.plain)
+        guard !slice.isEmpty else { return }
+        let localIdx = max(0, min(index - start, slice.count - 1))
+        previewLaunchState = AlbumPreviewLaunchState(assets: slice, initialIndex: localIdx)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                let picked = selected.compactMap { selectedAssetMap[$0] }
+                guard !picked.isEmpty else { return }
+                previewLaunchState = AlbumPreviewLaunchState(assets: picked, initialIndex: 0)
+            } label: {
+                Text("预览")
+                    .font(.system(size: 14.5, weight: .semibold))
+                    .foregroundColor(AGPalette.textPrimary(colorScheme))
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(Capsule().fill(AGPalette.cardBackground(colorScheme)))
+                    .overlay(Capsule().stroke(AGPalette.border(colorScheme), lineWidth: 1))
+                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.30 : 0.10), radius: 8, x: 0, y: 3)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                let picked = selected.compactMap { selectedAssetMap[$0] }
+                dismiss()
+                onPhotosPicked(picked)
+            } label: {
+                Text("添加 (\(selected.count))")
+                    .font(.system(size: 15.5, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 12)
+                    .background(Capsule().fill(AGPalette.accentFill(colorScheme)))
+                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.36 : 0.16), radius: 10, x: 0, y: 4)
+            }
+            .buttonStyle(.plain)
+        }
     }
     
     private static func topViewController() -> UIViewController? {
@@ -813,6 +887,282 @@ enum PhotoAssetLoader {
                 if !hasResumed {
                     hasResumed = true
                     cont.resume(returning: img)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Full-Screen Zoomable Photo Album Preview (WeChat-style)
+
+private struct AlbumAssetPreviewSheet: View {
+    let assets: [PHAsset]
+    let initialIndex: Int
+    @Binding var selected: [String]
+    @Binding var selectedAssetMap: [String: PHAsset]
+    let remainingImageSlots: Int
+    let onConfirm: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var currentIndex: Int
+
+    init(
+        assets: [PHAsset],
+        initialIndex: Int,
+        selected: Binding<[String]>,
+        selectedAssetMap: Binding<[String: PHAsset]>,
+        remainingImageSlots: Int,
+        onConfirm: @escaping () -> Void
+    ) {
+        self.assets = assets
+        self.initialIndex = initialIndex
+        self._selected = selected
+        self._selectedAssetMap = selectedAssetMap
+        self.remainingImageSlots = remainingImageSlots
+        self.onConfirm = onConfirm
+        self._currentIndex = State(initialValue: max(0, min(initialIndex, max(0, assets.count - 1))))
+    }
+
+    private var currentAsset: PHAsset? {
+        assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
+    }
+
+    private var currentSelectionOrder: Int? {
+        guard let id = currentAsset?.localIdentifier else { return nil }
+        return selected.firstIndex(of: id)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            TabView(selection: $currentIndex) {
+                ForEach(Array(assets.enumerated()), id: \.element.localIdentifier) { idx, asset in
+                    ZoomablePHAssetView(asset: asset)
+                        .tag(idx)
+                        .ignoresSafeArea()
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Top chrome: close, counter, selection toggle
+                HStack(spacing: 12) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 36, height: 36)
+                            .background(Circle().fill(Color.black.opacity(0.55)))
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    Text("\(currentIndex + 1) / \(assets.count)")
+                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.black.opacity(0.45)))
+
+                    Spacer()
+
+                    if let asset = currentAsset {
+                        Button {
+                            toggleCurrentSelection(for: asset)
+                        } label: {
+                            ZStack {
+                                if let order = currentSelectionOrder {
+                                    Circle()
+                                        .fill(AGPalette.accentFill(colorScheme))
+                                    Circle()
+                                        .stroke(Color.white, lineWidth: 1.8)
+                                    Text("\(order + 1)")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundColor(.white)
+                                } else {
+                                    Circle()
+                                        .fill(Color.black.opacity(0.45))
+                                    Circle()
+                                        .stroke(Color.white.opacity(0.92), lineWidth: 1.8)
+                                }
+                            }
+                            .frame(width: 28, height: 28)
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                .padding(.bottom, 10)
+                .background(
+                    LinearGradient(
+                        colors: [Color.black.opacity(0.68), Color.black.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .ignoresSafeArea(edges: .top)
+                )
+
+                Spacer()
+
+                // Bottom chrome: select hint & confirm button
+                HStack {
+                    if let asset = currentAsset {
+                        Button {
+                            toggleCurrentSelection(for: asset)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: currentSelectionOrder != nil ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundColor(currentSelectionOrder != nil ? AGPalette.accentFill(colorScheme) : .white.opacity(0.85))
+                                Text(currentSelectionOrder != nil ? "已选择" : "选择此图")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.white)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(Capsule().fill(Color.white.opacity(0.14)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        if selected.isEmpty, let asset = currentAsset, remainingImageSlots > 0 {
+                            selected.append(asset.localIdentifier)
+                            selectedAssetMap[asset.localIdentifier] = asset
+                        }
+                        onConfirm()
+                    } label: {
+                        let count = selected.isEmpty ? 1 : selected.count
+                        Text("添加 (\(count))")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 22)
+                            .padding(.vertical, 10)
+                            .background(Capsule().fill(AGPalette.accentFill(colorScheme)))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 12)
+                .padding(.bottom, 16)
+                .background(
+                    LinearGradient(
+                        colors: [Color.black.opacity(0.0), Color.black.opacity(0.72)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .ignoresSafeArea(edges: .bottom)
+                )
+            }
+        }
+        .statusBarHidden(true)
+    }
+
+    private func toggleCurrentSelection(for asset: PHAsset) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        if let order = selected.firstIndex(of: asset.localIdentifier) {
+            selected.remove(at: order)
+            selectedAssetMap.removeValue(forKey: asset.localIdentifier)
+        } else if selected.count < remainingImageSlots {
+            selected.append(asset.localIdentifier)
+            selectedAssetMap[asset.localIdentifier] = asset
+        } else {
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        }
+    }
+}
+
+private struct ZoomablePHAssetView: View {
+    let asset: PHAsset
+
+    @State private var uiImage: UIImage? = nil
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let uiImage {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFit()
+                    .scaleEffect(scale)
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { value in
+                                scale = max(1.0, min(4.0, lastScale * value))
+                            }
+                            .onEnded { _ in
+                                lastScale = scale
+                                if scale < 1.05 {
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                        scale = 1.0
+                                        lastScale = 1.0
+                                    }
+                                }
+                            }
+                    )
+                    .onTapGesture(count: 2) {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            if scale > 1.2 {
+                                scale = 1.0
+                                lastScale = 1.0
+                            } else {
+                                scale = 2.4
+                                lastScale = 2.4
+                            }
+                        }
+                    }
+            } else {
+                ProgressView()
+                    .tint(.white)
+            }
+        }
+        .task(id: asset.localIdentifier) {
+            loadFullImage()
+        }
+        .onDisappear {
+            if requestID != PHInvalidImageRequestID {
+                PHImageManager.default().cancelImageRequest(requestID)
+                requestID = PHInvalidImageRequestID
+            }
+        }
+    }
+
+    private func loadFullImage() {
+        let currentId = asset.localIdentifier
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        let screenScale = UIScreen.main.scale
+        let target = CGSize(
+            width: UIScreen.main.bounds.width * screenScale * 1.5,
+            height: UIScreen.main.bounds.height * screenScale * 1.5
+        )
+        requestID = PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: target,
+            contentMode: .aspectFit,
+            options: options
+        ) { img, _ in
+            guard let img else { return }
+            DispatchQueue.main.async {
+                if asset.localIdentifier == currentId {
+                    uiImage = img
                 }
             }
         }

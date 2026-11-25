@@ -15,9 +15,11 @@ public final class ZLPhotoPickerBridge {
     
     private func configureDefaults() {
         let config = ZLPhotoConfiguration.default()
-        // 只允许图片，不允许视频
+        // 只允许图片，不允许视频，支持相册内点击预览大图
         config.allowSelectImage = true
         config.allowSelectVideo = false
+        config.allowPreviewPhotos = true
+        config.showPreviewButtonInAlbum = true
         
         // 核心：相册中首格展示相机拍照（微信同款）
         config.allowTakePhotoInLibrary = true

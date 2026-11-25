@@ -278,11 +278,6 @@ extension ChatView {
                 .frame(height: 0.75),
             alignment: .top
         )
-        .fullScreenCover(item: $previewDraftGallery) { gallery in
-            ImageViewerSheet(gallery: gallery)
-                .presentationBackground(.clear)
-                .ignoresSafeArea()
-        }
     }
     // hasSendableDraft / isSendDisabled 仅在 ChatInputTextAndSendRow 内部计算：
     // 不要在 ChatView 上重新声明并在 body 中读取，否则会把 inputText 订阅带回 ChatView.body，打字时整页重绘。

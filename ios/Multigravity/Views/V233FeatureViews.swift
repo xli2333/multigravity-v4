@@ -703,10 +703,13 @@ public struct BtwSideQuestionSheet: View {
             }
             .task(id: activeSideId) {
                 guard let sid = activeSideId, let baseURL = AppSettings.shared.gatewayURL else { return }
+                resolvedSideAnswer = ""
+                resolvedSideThinking = ""
+                resolvedSideRunning = true
                 var emptyPollCount = 0
                 while !Task.isCancelled {
                     async let stTask = try? APIClient.shared.fetchBtwStatus(cascadeId: sid, baseURL: baseURL)
-                    async let msgTask = try? APIClient.shared.fetchMessages(cascadeId: sid, limit: 18, offset: 0, baseURL: baseURL)
+                    async let msgTask = try? APIClient.shared.fetchMessages(cascadeId: sid, limit: 24, offset: nil, baseURL: baseURL)
                     let (st, tailRes) = await (stTask, msgTask)
 
                     if let st {
