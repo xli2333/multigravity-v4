@@ -1,0 +1,60 @@
+name: Build iOS Unsigned IPA (v4.0)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  package-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Xcode version
+        run: xcodebuild -version
+
+      - name: Build Release Multigravity.app (Unsigned for On-Device Signing)
+        run: |
+          xcodebuild \
+            -project ios/Multigravity.xcodeproj \
+            -scheme Multigravity \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/build_ipa \
+            clean build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package Payload into Multigravity-v4.0-unsigned.ipa
+        run: |
+          cd ios/build_ipa/Build/Products/Release-iphoneos
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R Multigravity.app Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/Multigravity-v4.0-unsigned.ipa"
+          ls -lh "$GITHUB_WORKSPACE/Multigravity-v4.0-unsigned.ipa"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Multigravity-v4.0-unsigned-ipa
+          path: Multigravity-v4.0-unsigned.ipa
+          retention-days: 30
+
+      - name: Publish Direct-Download IPA to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v4.0-ipa-latest
+          target_commitish: ${{ github.sha }}
+          name: "Multigravity iOS v4.0 (Unsigned IPA for On-Device Signing)"
+          body: |
+            手机端直接点击下方 `Multigravity-v4.0-unsigned.ipa` 下载，导入 **轻松签 (ESign) / 全能签 / Feather / GBox / 巨魔 TrollStore** 即可本机一键签名安装，无需连接电脑。
+          files: Multigravity-v4.0-unsigned.ipa
+          prerelease: false

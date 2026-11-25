@@ -1,0 +1,543 @@
+package com.antigravity.mobile.ui.components
+
+import com.antigravity.mobile.ui.util.loc
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.antigravity.mobile.data.model.RunningTaskItem
+import com.antigravity.mobile.data.service.ApiClient
+import com.antigravity.mobile.data.service.openTerminalWebSocket
+import com.antigravity.mobile.data.service.sendTerminalInput
+import com.antigravity.mobile.ui.theme.AntigravityTheme
+import com.antigravity.mobile.ui.util.rememberHaptic
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun RunningTasksCard(
+    tasks: List<RunningTaskItem>,
+    onStopTask: (RunningTaskItem) -> Unit,
+    onSendToBackground: ((RunningTaskItem) -> Unit)? = null,
+    cascadeId: String = "",
+    compactMode: Boolean = false,
+    onToggleExpand: ((Boolean) -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    if (tasks.isEmpty()) return
+
+    var isCardExpanded by remember(cascadeId, compactMode) { mutableStateOf(!compactMode) }
+    var expandedTaskIds by remember { mutableStateOf(setOf<String>()) }
+    var activeTerminalTaskId by remember { mutableStateOf<String?>(null) }
+    var terminalLog by remember { mutableStateOf("") }
+    var terminalInput by remember { mutableStateOf("") }
+    var copiedTaskId by remember { mutableStateOf<String?>(null) }
+
+    val colors = AntigravityTheme.colors
+    val haptic = rememberHaptic()
+    val clipboardManager = LocalClipboardManager.current
+    val coroutineScope = rememberCoroutineScope()
+
+    DisposableEffect(activeTerminalTaskId) {
+        val tid = activeTerminalTaskId
+        var ws: WebSocket? = null
+        if (!tid.isNullOrBlank()) {
+            ws = ApiClient.defaultInstance?.openTerminalWebSocket(tid, object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val chunk = try {
+                        val obj = JSONObject(text)
+                        obj.optString("output").ifBlank { obj.optString("data").ifBlank { obj.optString("chunk") } }
+                    } catch (_: Exception) {
+                        text
+                    }
+                    if (chunk.isNotBlank()) {
+                        terminalLog = (terminalLog + chunk).takeLast(6000)
+                    }
+                }
+            })
+        }
+        onDispose {
+            try { ws?.close(1000, "closed") } catch (_: Exception) {}
+        }
+    }
+
+    LaunchedEffect(copiedTaskId) {
+        if (copiedTaskId != null) {
+            delay(1500)
+            copiedTaskId = null
+        }
+    }
+
+    val arrowRotation by animateFloatAsState(
+        targetValue = if (isCardExpanded) 0f else 180f,
+        animationSpec = spring(
+            dampingRatio = 0.82f,
+            stiffness = Spring.StiffnessMediumLow
+        ),
+        label = "tasksArrowRotation"
+    )
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .shadow(
+                elevation = 4.dp,
+                shape = RoundedCornerShape(18.dp),
+                ambientColor = Color.Black.copy(alpha = 0.04f),
+                spotColor = Color.Black.copy(alpha = 0.08f)
+            ),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = colors.surface),
+        border = CardDefaults.outlinedCardBorder().copy(brush = SolidColor(colors.border.copy(alpha = 0.5f)))
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+            // Header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        isCardExpanded = !isCardExpanded
+                        onToggleExpand?.invoke(isCardExpanded)
+                    },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = colors.accentIndigo,
+                        trackColor = colors.accentIndigo.copy(alpha = 0.2f)
+                    )
+
+                    Text(
+                        text = "${tasks.size} 个任务正在执行".loc,
+                        color = colors.textPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(colors.surfaceVariant)
+                            .padding(horizontal = 7.dp, vertical = 2.5.dp)
+                    ) {
+                        Text(
+                            text = "${tasks.size}",
+                            color = colors.textSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (!isCardExpanded && tasks.size == 1) {
+                        val singleTask = tasks.first()
+                        Box(
+                            modifier = Modifier
+                                .size(26.dp)
+                                .clip(CircleShape)
+                                .clickable {
+                                    haptic.medium()
+                                    onStopTask(singleTask)
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(19.dp)
+                                    .clip(CircleShape)
+                                    .background(colors.accentRed.copy(alpha = 0.9f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.5.dp)
+                                        .clip(RoundedCornerShape(1.dp))
+                                        .background(colors.surface)
+                                )
+                            }
+                        }
+                    }
+
+                    Icon(
+                        imageVector = Icons.Default.KeyboardArrowDown,
+                        contentDescription = if (isCardExpanded) "折叠任务".loc else "展开任务".loc,
+                        tint = colors.textSecondary,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .graphicsLayer(rotationZ = arrowRotation)
+                    )
+                }
+            }
+
+            AnimatedVisibility(
+                visible = isCardExpanded,
+                enter = expandVertically(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ) + fadeIn(
+                    animationSpec = spring(dampingRatio = 0.82f)
+                ),
+                exit = shrinkVertically(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ) + fadeOut(
+                    animationSpec = spring(dampingRatio = 0.82f)
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    tasks.forEachIndexed { index, task ->
+                        val desc = task.displayTitle
+                        val rawCmd = task.commandLine.ifBlank { task.displayCommand }
+                        val isCmdExpanded = expandedTaskIds.contains(task.id)
+                        val isCopied = copiedTaskId == task.id
+                        val isLong = rawCmd.length > 100 || rawCmd.lines().size > 3
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 2.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // Top bar of task row: summary + copy + stop
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                if (desc.isNotBlank() && desc != rawCmd) {
+                                    Text(
+                                        text = desc,
+                                        color = colors.textPrimary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                } else {
+                                    Spacer(modifier = Modifier.weight(1f))
+                                }
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (onSendToBackground != null) {
+                                        Text(
+                                            text = "转后台".loc,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            color = colors.accentBlue,
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(colors.accentBlue.copy(alpha = 0.12f))
+                                                .clickable {
+                                                    haptic.light()
+                                                    onSendToBackground(task)
+                                                }
+                                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                    if (task.id.isNotBlank()) {
+                                        val isTermOpen = activeTerminalTaskId == task.id
+                                        Text(
+                                            text = if (isTermOpen) "收起终端".loc else "终端".loc,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            color = colors.accentIndigo,
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(colors.accentIndigo.copy(alpha = 0.12f))
+                                                .clickable {
+                                                    haptic.light()
+                                                    terminalLog = ""
+                                                    activeTerminalTaskId = if (isTermOpen) null else task.id
+                                                }
+                                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                    // Stop Task Button
+                                    Box(
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clip(CircleShape)
+                                            .clickable {
+                                                haptic.medium()
+                                                onStopTask(task)
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(20.dp)
+                                                .clip(CircleShape)
+                                                .background(colors.accentRed.copy(alpha = 0.9f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(7.dp)
+                                                    .clip(RoundedCornerShape(1.dp))
+                                                    .background(colors.surface)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Terminal-style command bubble (长按命令行复制，消除常驻复制按钮噪点)
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(colors.surfaceVariant.copy(alpha = 0.7f))
+                                    .combinedClickable(
+                                        onClick = {},
+                                        onLongClick = {
+                                            haptic.light()
+                                            clipboardManager.setText(AnnotatedString(rawCmd))
+                                            copiedTaskId = task.id
+                                        }
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = highlightCommand(rawCmd, colors.accentIndigo, colors.textPrimary),
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        maxLines = if (isCmdExpanded) Int.MAX_VALUE else 3,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+
+                                    if (isLong) {
+                                        Row(
+                                            modifier = Modifier
+                                                .clickable {
+                                                    expandedTaskIds = if (isCmdExpanded) {
+                                                        expandedTaskIds - task.id
+                                                    } else {
+                                                        expandedTaskIds + task.id
+                                                    }
+                                                }
+                                                .padding(top = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                        ) {
+                                            Text(
+                                                text = if (isCmdExpanded) "收起".loc else "展开完整命令".loc,
+                                                color = colors.accentIndigo,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                            Icon(
+                                                imageVector = if (isCmdExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                                contentDescription = null,
+                                                tint = colors.accentIndigo,
+                                                modifier = Modifier.size(12.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                if (isCopied) {
+                                    Row(
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .background(Color(0xFF4CAF50).copy(alpha = 0.92f))
+                                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(10.dp)
+                                        )
+                                        Text(
+                                            text = "已复制".loc,
+                                            fontSize = 10.sp,
+                                            color = Color.White,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (activeTerminalTaskId == task.id && task.id.isNotBlank()) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(Color(0xFF121418))
+                                        .padding(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = terminalLog.ifBlank { "等待终端输出流…".loc },
+                                        color = Color(0xFFE5E5EA),
+                                        fontSize = 10.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        maxLines = 10
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        listOf("y" to "y\n", "n" to "n\n", "Enter" to "\n", "Ctrl+C" to "\u0003").forEach { (lbl, seq) ->
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = Color(0xFF2C2C2E),
+                                                modifier = Modifier.clickable {
+                                                    coroutineScope.launch {
+                                                        ApiClient.defaultInstance?.sendTerminalInput(task.id, seq, cascadeId)
+                                                    }
+                                                }
+                                            ) {
+                                                Text(
+                                                    text = lbl,
+                                                    color = if (lbl == "Ctrl+C") Color(0xFFFF453A) else Color.White,
+                                                    fontSize = 10.sp,
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        OutlinedTextField(
+                                            value = terminalInput,
+                                            onValueChange = { terminalInput = it },
+                                            placeholder = { Text("输入命令或回答…".loc, fontSize = 11.sp, color = Color.Gray) },
+                                            singleLine = true,
+                                            textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        TextButton(onClick = {
+                                            val cmdText = terminalInput
+                                            if (cmdText.isNotEmpty()) {
+                                                terminalInput = ""
+                                                coroutineScope.launch {
+                                                    ApiClient.defaultInstance?.sendTerminalInput(task.id, "$cmdText\n", cascadeId)
+                                                }
+                                            }
+                                        }) {
+                                            Text("发送".loc, color = colors.accentBlue, fontSize = 11.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (index < tasks.size - 1) {
+                            HorizontalDivider(
+                                modifier = Modifier.fillMaxWidth(),
+                                thickness = 0.5.dp,
+                                color = colors.border.copy(alpha = 0.4f)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun highlightCommand(command: String, accentColor: Color, defaultTextColor: Color): AnnotatedString {
+    return buildAnnotatedString {
+        withStyle(SpanStyle(color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold)) {
+            append("$ ")
+        }
+        val parts = command.split(" ")
+        var isFirstWord = true
+        parts.forEachIndexed { idx, part ->
+            if (idx > 0) append(" ")
+            when {
+                part.startsWith("-") -> {
+                    withStyle(SpanStyle(color = Color(0xFFFF9800))) {
+                        append(part)
+                    }
+                }
+                part in listOf("&&", "||", "|", ";") -> {
+                    withStyle(SpanStyle(color = Color(0xFFBA68C8))) {
+                        append(part)
+                    }
+                    isFirstWord = true
+                }
+                isFirstWord && part.isNotEmpty() -> {
+                    withStyle(SpanStyle(color = accentColor, fontWeight = FontWeight.SemiBold)) {
+                        append(part)
+                    }
+                    isFirstWord = false
+                }
+                else -> {
+                    withStyle(SpanStyle(color = defaultTextColor.copy(alpha = 0.85f))) {
+                        append(part)
+                    }
+                }
+            }
+        }
+    }
+}

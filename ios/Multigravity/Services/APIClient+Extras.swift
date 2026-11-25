@@ -1,0 +1,448 @@
+import Foundation
+
+private struct EmptyBody: Encodable {}
+
+/// 网关统一错误体 {"error": "..."}。
+private struct GatewayErrorBody: Decodable { let error: String? }
+
+extension APIClient {
+    // MARK: - 改动 diff / Git / 搜索 / 导出
+
+    /// POST JSON 到网关的非 RPC 接口，失败时优先取网关 {"error": "..."} 里的说明。
+    private func gatewayPost<Req: Encodable, Resp: Decodable>(
+        path: String,
+        body: Req,
+        baseURL: URL,
+        timeout: TimeInterval = 20,
+        failurePrefix: String
+    ) async throws -> Resp {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        request.timeoutInterval = timeout
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.networkError("Invalid response type")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            if http.statusCode == 401 {
+                NotificationCenter.default.post(name: .deviceTokenRevoked, object: nil)
+            }
+            let msg = (try? JSONDecoder().decode(GatewayErrorBody.self, from: data))?.error
+                ?? String(data: data, encoding: .utf8)
+                ?? "HTTP \(http.statusCode)"
+            throw APIError.serverError(statusCode: http.statusCode, message: "\(failurePrefix): \(msg)")
+        }
+        do {
+            return try JSONDecoder().decode(Resp.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    /// 可选模型目录（网关从 language_server 实时取，失败时返回内置兜底）。
+    public func fetchModels(baseURL: URL, refresh: Bool = false) async throws -> ModelsResponse {
+        var components = URLComponents(url: baseURL.appendingPathComponent("gateway/models"), resolvingAgainstBaseURL: false)
+        if refresh { components?.queryItems = [URLQueryItem(name: "refresh", value: "1")] }
+        guard let url = components?.url else { throw APIError.invalidURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.serverError(statusCode: code, message: String(localized: "获取模型列表失败"))
+        }
+        do {
+            return try JSONDecoder().decode(ModelsResponse.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    /// 刷新网关的升级自检结果（GET /gateway/status 的 compat 字段）。失败时保持上一次的结果不变。
+    @MainActor
+    public func refreshGatewayCompat(baseURL: URL) async {
+        var request = URLRequest(url: baseURL.appendingPathComponent("gateway/status"))
+        request.httpMethod = "GET"
+        request.timeoutInterval = 8
+        guard let (data, response) = try? await transport.send(request: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else { return }
+        GatewayCompatStore.shared.update(GatewayCompat.fromStatusData(data))
+    }
+
+    /// 手机端 "/" 菜单（系统命令 + 技能）。
+    public func fetchSlashCommands(baseURL: URL) async throws -> [SlashCommandOption] {
+        let resp: SlashCommandsResponse = try await gatewayPost(
+            path: "gateway/slash-commands",
+            body: EmptyBody(),
+            baseURL: baseURL,
+            failurePrefix: String(localized: "获取斜杠命令失败")
+        )
+        return resp.commands
+    }
+
+    public func fetchCascadeChanges(cascadeId: String, fromStepIndex: Int? = nil, baseURL: URL) async throws -> CascadeChangesResponse {
+        try await gatewayPost(
+            path: "gateway/cascade/changes",
+            body: CascadeChangesRequest(cascadeId: cascadeId, fromStepIndex: fromStepIndex),
+            baseURL: baseURL,
+            timeout: 30,
+            failurePrefix: String(localized: "获取本会话改动失败")
+        )
+    }
+
+    public func fetchChapterTitles(cascadeId: String, ranges: [CascadeStepRange], baseURL: URL) async throws -> [CascadeChapterTitleItem] {
+        let resp: CascadeChaptersResponse = try await gatewayPost(
+            path: "gateway/cascade/chapters",
+            body: CascadeChaptersRequest(cascadeId: cascadeId, ranges: ranges),
+            baseURL: baseURL,
+            timeout: 12,
+            failurePrefix: String(localized: "获取章节标题失败")
+        )
+        return resp.chapters
+    }
+
+    public func fetchGitStatus(cascadeId: String, baseURL: URL) async throws -> GitStatusResponse {
+        try await gatewayPost(
+            path: "gateway/git/status",
+            body: GitCascadeRequest(cascadeId: cascadeId),
+            baseURL: baseURL,
+            failurePrefix: String(localized: "获取 Git 状态失败")
+        )
+    }
+
+    public func gitCommit(cascadeId: String, message: String, paths: [String], push: Bool, baseURL: URL) async throws -> GitCommitResponse {
+        try await gatewayPost(
+            path: "gateway/git/commit",
+            body: GitCommitRequest(cascadeId: cascadeId, message: message, paths: paths, push: push),
+            baseURL: baseURL,
+            timeout: push ? 150 : 70,
+            failurePrefix: String(localized: "提交失败")
+        )
+    }
+
+    public func gitPush(cascadeId: String, baseURL: URL) async throws -> GitCommitResponse {
+        try await gatewayPost(
+            path: "gateway/git/push",
+            body: GitCascadeRequest(cascadeId: cascadeId),
+            baseURL: baseURL,
+            timeout: 150,
+            failurePrefix: String(localized: "推送失败")
+        )
+    }
+
+    /// 会话内容全文搜索（language_server SearchConversations，经网关透传）。
+    public func searchConversations(query: String, baseURL: URL) async throws -> [ConversationSearchResult] {
+        let resp: ConversationSearchResponse = try await rpc(
+            method: "SearchConversations",
+            body: ConversationSearchRequest(query: query),
+            baseURL: baseURL
+        )
+        return resp.results
+    }
+
+    /// 导出会话为 Markdown（language_server ConvertTrajectoryToMarkdown，经网关透传）。
+    public func exportConversationMarkdown(cascadeId: String, baseURL: URL) async throws -> String {
+        let resp: MarkdownExportResponse = try await rpc(
+            method: "ConvertTrajectoryToMarkdown",
+            body: MarkdownExportRequest(conversationId: cascadeId),
+            baseURL: baseURL
+        )
+        return resp.markdown
+    }
+
+    /// 获取当前挂载的所有 MCP 服务状态及工具清单（language_server GetMcpServerStates，经网关透传）。
+    public func fetchMcpServerStates(baseURL: URL) async throws -> [McpServerState] {
+        let resp: GetMcpServerStatesResponse = try await rpc(
+            method: "GetMcpServerStates",
+            body: EmptyRequest(),
+            baseURL: baseURL
+        )
+        return resp.states ?? []
+    }
+
+    /// 获取当前挂载的所有技能清单（language_server GetAllSkills，经网关透传）。
+    public func fetchAllSkills(baseURL: URL) async throws -> [SkillInfo] {
+        let resp: GetAllSkillsResponse = try await rpc(
+            method: "GetAllSkills",
+            body: EmptyRequest(),
+            baseURL: baseURL
+        )
+        return resp.skills ?? []
+    }
+
+    /// 获取全局所有正在运行的后台任务（language_server ListBackgroundTasks，经网关补全会话与工作区信息）。
+    public func fetchGlobalBackgroundTasks(baseURL: URL) async throws -> [GlobalBackgroundTaskItem] {
+        let resp: GlobalBackgroundTasksResponse = try await gatewayPost(
+            path: "gateway/tasks/background",
+            body: EmptyBody(),
+            baseURL: baseURL,
+            timeout: 10,
+            failurePrefix: String(localized: "获取后台任务失败")
+        )
+        return resp.tasks
+    }
+
+    /// 读取后台任务日志文件的最新尾部内容（/gateway/tasks/background/log）。
+    public func fetchBackgroundTaskLog(
+        conversationId: String,
+        taskId: String,
+        logUri: String?,
+        baseURL: URL
+    ) async throws -> BackgroundTaskLogResponse {
+        try await gatewayPost(
+            path: "gateway/tasks/background/log",
+            body: BackgroundTaskLogRequest(conversationId: conversationId, taskId: taskId, logUri: logUri),
+            baseURL: baseURL,
+            timeout: 10,
+            failurePrefix: String(localized: "读取日志失败")
+        )
+    }
+
+    // MARK: - Swarm 蜂群协同接口
+
+    /// 获取当前会话关联的 Swarm 蜂群快照（/gateway/swarm?cascadeId=...）。
+    public func fetchSwarmSnapshot(cascadeId: String, baseURL: URL) async throws -> SwarmSnapshot {
+        var components = URLComponents(url: baseURL.appendingPathComponent("gateway/swarm"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "cascadeId", value: cascadeId)]
+        guard let url = components?.url else { throw APIError.invalidURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let msg = (try? JSONDecoder().decode(GatewayErrorBody.self, from: data))?.error ?? String(localized: "获取 Swarm 快照失败")
+            throw APIError.serverError(statusCode: code, message: msg)
+        }
+        do {
+            return try JSONDecoder().decode(SwarmSnapshot.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    /// 向 Swarm 协作板注入人类反馈（POST /gateway/swarm/feedback）。
+    public func sendSwarmFeedback(cascadeId: String, coordinatorId: String? = nil, content: String, baseURL: URL) async throws {
+        let _: EmptyResponse = try await gatewayPost(
+            path: "gateway/swarm/feedback",
+            body: SwarmFeedbackRequest(cascadeId: cascadeId, coordinatorId: coordinatorId, feedback: content),
+            baseURL: baseURL,
+            timeout: 15,
+            failurePrefix: String(localized: "发送反馈失败")
+        )
+    }
+
+    /// 催促/唤醒 Swarm 某个休眠或卡顿的成员（POST /gateway/swarm/nudge）。
+    public func nudgeSwarmMember(cascadeId: String, coordinatorId: String? = nil, member: String, baseURL: URL) async throws {
+        let _: EmptyResponse = try await gatewayPost(
+            path: "gateway/swarm/nudge",
+            body: SwarmNudgeRequest(cascadeId: cascadeId, coordinatorId: coordinatorId, workerName: member),
+            baseURL: baseURL,
+            timeout: 15,
+            failurePrefix: String(localized: "催促成员失败")
+        )
+    }
+
+    // MARK: - Plugins 插件市场接口
+
+    /// 获取所有插件清单及鉴权状态（GET /gateway/plugins）。
+    public func fetchPlugins(baseURL: URL) async throws -> CascadePluginsResponse {
+        let url = baseURL.appendingPathComponent("gateway/plugins")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.serverError(statusCode: code, message: String(localized: "获取插件清单失败"))
+        }
+        do {
+            return try JSONDecoder().decode(CascadePluginsResponse.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    /// 安装指定插件并可选自动恢复会话（POST /gateway/plugins/install）。
+    public func installPlugin(id: String, conversationId: String? = nil, autoResume: Bool = true, baseURL: URL) async throws -> PluginInstallResponse {
+        try await gatewayPost(
+            path: "gateway/plugins/install",
+            body: PluginInstallRequest(pluginId: id, cascadeId: conversationId, autoResume: autoResume),
+            baseURL: baseURL,
+            timeout: 30,
+            failurePrefix: String(localized: "安装插件失败")
+        )
+    }
+
+    // MARK: - Automations 定时与守护任务接口
+
+    /// 获取所有定时自动化任务状态与触发记录（GET /gateway/automations）。
+    public func fetchAutomations(baseURL: URL) async throws -> AutomationsResponse {
+        let url = baseURL.appendingPathComponent("gateway/automations")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.serverError(statusCode: code, message: String(localized: "获取自动化任务失败"))
+        }
+        do {
+            return try JSONDecoder().decode(AutomationsResponse.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    /// 管理定时任务运行状态（POST /gateway/automations/manage）。
+    public func manageAutomation(action: String, sidecarId: String, baseURL: URL) async throws {
+        let _: EmptyResponse = try await gatewayPost(
+            path: "gateway/automations/manage",
+            body: AutomationManageRequest(sidecarId: sidecarId, action: action),
+            baseURL: baseURL,
+            timeout: 15,
+            failurePrefix: String(localized: "操作定时任务失败")
+        )
+    }
+
+    /// 获取定时任务日志（GET /gateway/automations/logs?sidecarId=...&tail=...）。
+    public func fetchAutomationLogs(sidecarId: String, tail: Int = 200, baseURL: URL) async throws -> AutomationLogsResponse {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("gateway/automations/logs"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "sidecarId", value: sidecarId),
+            URLQueryItem(name: "tail", value: String(tail))
+        ]
+        guard let url = comps?.url else {
+            throw APIError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.serverError(statusCode: code, message: String(localized: "获取运行日志失败"))
+        }
+        do {
+            return try JSONDecoder().decode(AutomationLogsResponse.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Workflow 模板持久化同步接口
+
+    private func gatewayJSONRequest<Resp: Decodable>(
+        method: String,
+        path: String,
+        bodyData: Data? = nil,
+        baseURL: URL,
+        timeout: TimeInterval = 15,
+        failurePrefix: String
+    ) async throws -> Resp {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = method
+        if let bodyData {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = bodyData
+        }
+        request.timeoutInterval = timeout
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await transport.send(request: request)
+        } catch {
+            throw APIError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.networkError("Invalid response type")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            if http.statusCode == 401 {
+                NotificationCenter.default.post(name: .deviceTokenRevoked, object: nil)
+            }
+            let msg = (try? JSONDecoder().decode(GatewayErrorBody.self, from: data))?.error
+                ?? String(data: data, encoding: .utf8)
+                ?? "HTTP \(http.statusCode)"
+            throw APIError.serverError(statusCode: http.statusCode, message: "\(failurePrefix): \(msg)")
+        }
+        do {
+            return try JSONDecoder().decode(Resp.self, from: data)
+        } catch {
+            throw APIError.decodingError(error.localizedDescription)
+        }
+    }
+
+    /// 获取有序 Workflow 模板列表（GET /gateway/workflow-templates）。
+    public func fetchWorkflowTemplates(baseURL: URL) async throws -> WorkflowTemplatesResponse {
+        try await gatewayJSONRequest(
+            method: "GET",
+            path: "gateway/workflow-templates",
+            baseURL: baseURL,
+            failurePrefix: String(localized: "获取 Workflow 模板失败")
+        )
+    }
+
+    /// 保存有序 Workflow 模板列表（PUT /gateway/workflow-templates）。
+    public func saveWorkflowTemplates(_ templates: [WorkflowTemplateRecord], baseURL: URL) async throws -> WorkflowTemplatesResponse {
+        let body = try JSONEncoder().encode(WorkflowTemplatesUpdateRequest(templates: templates))
+        return try await gatewayJSONRequest(
+            method: "PUT",
+            path: "gateway/workflow-templates",
+            bodyData: body,
+            baseURL: baseURL,
+            failurePrefix: String(localized: "保存 Workflow 模板失败")
+        )
+    }
+
+    /// 重置 Workflow 模板列表为系统默认（DELETE /gateway/workflow-templates）。
+    public func resetWorkflowTemplates(baseURL: URL) async throws -> WorkflowTemplatesResponse {
+        try await gatewayJSONRequest(
+            method: "DELETE",
+            path: "gateway/workflow-templates",
+            baseURL: baseURL,
+            failurePrefix: String(localized: "重置 Workflow 模板失败")
+        )
+    }
+}

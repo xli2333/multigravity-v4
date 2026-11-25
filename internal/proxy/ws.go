@@ -1,0 +1,716 @@
+package proxy
+
+import (
+	"bytes"
+	"compress/flate"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"antigravity-mobile/internal/localtls"
+
+	"github.com/gorilla/websocket"
+)
+
+// allowedOrigins holds trusted origins loaded from MULTIGRAVITY_ALLOWED_ORIGINS (or ALLOWED_ORIGINS).
+// Format: comma-separated list of origins, e.g. "https://my-ddns.example.com,https://[2001:db8::1]:58900"
+var allowedOrigins []string
+
+func init() {
+	origins := os.Getenv("MULTIGRAVITY_ALLOWED_ORIGINS")
+	if origins == "" {
+		origins = os.Getenv("ALLOWED_ORIGINS")
+	}
+	if origins != "" {
+		for _, o := range strings.Split(origins, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				allowedOrigins = append(allowedOrigins, strings.ToLower(o))
+			}
+		}
+	}
+}
+
+func isLoopbackHostname(h string) bool {
+	if strings.EqualFold(h, "localhost") || h == "127.0.0.1" || h == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func loopbackOriginMatchesRequestPort(u *url.URL, requestHost string) bool {
+	if requestHost == "" {
+		return false
+	}
+	reqHostname, reqPort, err := net.SplitHostPort(requestHost)
+	if err != nil {
+		reqHostname = requestHost
+		reqPort = ""
+	}
+	reqHostname = strings.Trim(reqHostname, "[]")
+	if !isLoopbackHostname(reqHostname) {
+		return false
+	}
+	originPort := u.Port()
+	if reqPort != "" {
+		if originPort == "" {
+			if strings.EqualFold(u.Scheme, "https") || strings.EqualFold(u.Scheme, "wss") {
+				originPort = "443"
+			} else if strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "ws") {
+				originPort = "80"
+			}
+		}
+		return originPort == reqPort
+	}
+	return originPort == "" ||
+		(originPort == "80" && (strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "ws"))) ||
+		(originPort == "443" && (strings.EqualFold(u.Scheme, "https") || strings.EqualFold(u.Scheme, "wss")))
+}
+
+// IsAllowedOrigin validates that an Origin header represents a trusted caller.
+// It blocks Cross-Site WebSocket Hijacking (CSWSH) from malicious third-party websites.
+func IsAllowedOrigin(origin string, requestHost string) bool {
+	// Allow requests with no Origin header (native mobile apps, CLI, curl)
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	originHost := strings.Trim(u.Hostname(), "[]")
+	lowerOrigin := strings.ToLower(origin)
+
+	// 1. Loopback addresses (must match requestHost's loopback port unless explicitly listed in ALLOWED_ORIGINS)
+	if isLoopbackHostname(originHost) && loopbackOriginMatchesRequestPort(u, requestHost) {
+		return true
+	}
+
+	// 2. Configured host / DDNS domains from environment
+	var trustedHosts []string
+	if dh := strings.TrimSpace(os.Getenv("DDNS_HOST")); dh != "" {
+		trustedHosts = append(trustedHosts, strings.ToLower(dh))
+	}
+	if gh := strings.TrimSpace(os.Getenv("MULTIGRAVITY_HOST")); gh != "" {
+		trustedHosts = append(trustedHosts, strings.ToLower(gh))
+	} else if gh := strings.TrimSpace(os.Getenv("GATEWAY_HOST")); gh != "" {
+		trustedHosts = append(trustedHosts, strings.ToLower(gh))
+	}
+	// S5: Tunnel relay server addresses intentionally excluded — they are relay endpoints, not a
+	// browser origin. Including it would allow CSWSH from any page on that domain.
+	// Add it to ALLOWED_ORIGINS if truly needed.
+
+	for _, th := range trustedHosts {
+		if originHost == th || strings.HasSuffix(originHost, "."+th) {
+			return true
+		}
+	}
+
+	// 4. Check explicitly configured allowed origins (ALLOWED_ORIGINS env var)
+	for _, allowed := range allowedOrigins {
+		if lowerOrigin == allowed || strings.HasPrefix(lowerOrigin, allowed+":") {
+			return true
+		}
+	}
+
+	// 5. Match requestHost ONLY IF requestHost itself is a verified private/loopback IP or configured domain
+	if requestHost != "" {
+		reqHostname, _, err := net.SplitHostPort(requestHost)
+		if err != nil {
+			reqHostname = requestHost
+		}
+		reqHostname = strings.Trim(reqHostname, "[]")
+
+		isSafeReqHost := false
+		if reqHostname == "localhost" || reqHostname == "127.0.0.1" || reqHostname == "::1" {
+			isSafeReqHost = true
+		} else if ip := net.ParseIP(reqHostname); ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()) {
+			isSafeReqHost = true
+		} else {
+			for _, th := range trustedHosts {
+				if reqHostname == th || strings.HasSuffix(reqHostname, "."+th) {
+					isSafeReqHost = true
+					break
+				}
+			}
+		}
+
+		if isSafeReqHost {
+			for _, scheme := range []string{"http://", "https://"} {
+				if lowerOrigin == scheme+strings.ToLower(requestHost) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// HasBrowserFingerprint detects whether an incoming HTTP request originates from a standard web browser.
+// Standard web browsers compliant with RFC 6455 MUST include an Origin header during WebSocket handshakes.
+func HasBrowserFingerprint(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Site") != "" || r.Header.Get("Sec-Fetch-Mode") != "" || r.Header.Get("Sec-Fetch-Dest") != "" {
+		return true
+	}
+	ua := r.Header.Get("User-Agent")
+	if strings.Contains(ua, "Mozilla/") && !strings.Contains(ua, "Antigravity") && !strings.Contains(ua, "CFNetwork") && !strings.Contains(ua, "Darwin") {
+		return true
+	}
+	return false
+}
+
+// CheckWebSocketOrigin validates the Origin of an incoming WebSocket upgrade request.
+func CheckWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if HasBrowserFingerprint(r) {
+			slog.Warn(fmt.Sprintf("[WS] Rejected WebSocket connection: missing Origin header from browser client (host: %s, UA: %s)", r.Host, r.Header.Get("User-Agent")))
+			return false
+		}
+		return true
+	}
+	allowed := IsAllowedOrigin(origin, r.Host)
+	if !allowed {
+		slog.Warn(fmt.Sprintf("[WS] Rejected WebSocket connection from untrusted origin: %s (host: %s)", origin, r.Host))
+	}
+	return allowed
+}
+
+var proxyWriteBufferPool = &sync.Pool{}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:    131072, // 128KB (was 32KB)
+	WriteBufferSize:   131072, // 128KB (was 32KB)
+	WriteBufferPool:   proxyWriteBufferPool,
+	CheckOrigin:       CheckWebSocketOrigin,
+	EnableCompression: true, // PERF: permessage-deflate — reduces text/JSON WS bandwidth by 60-80%
+}
+
+// streamWriteBufferPool backs streamUpgrader's write buffers. gorilla borrows a buffer only while a
+// message is being written, so an idle (or between-pushes) stream connection holds no write buffer.
+// Pools must not be shared between upgraders with different WriteBufferSize.
+var streamWriteBufferPool = &sync.Pool{}
+
+// streamUpgrader serves the per-cascade stream (HandleCascadeStream). Unlike the proxy/mux upgrader
+// it neither carries bulk data nor receives anything but control frames from clients, so it uses
+// small buffers: payloads larger than the write buffer are simply split across frames, which every
+// client (browsers, OkHttp, NWConnection) reassembles transparently.
+var streamUpgrader = websocket.Upgrader{
+	ReadBufferSize:    4096,
+	WriteBufferSize:   32 * 1024,
+	WriteBufferPool:   streamWriteBufferPool,
+	CheckOrigin:       CheckWebSocketOrigin,
+	EnableCompression: true,
+}
+
+// sanitizeWebSocketHeaders normalizes HTTP headers required for WebSocket upgrade.
+// Reverse proxies (e.g. Cloudflare Tunnel, Nginx, ALB) or HTTP/2 gateways often:
+// 1. Join duplicate Sec-WebSocket-Key headers into a comma-separated list (e.g. "key1, key2")
+// 2. Omit or strip Sec-WebSocket-Key when converting from HTTP/2 Extended CONNECT (RFC 8441)
+// 3. Add surrounding quotes or spaces
+// This function ensures RFC 6455 compliance before passing the request to Gorilla WebSocket.
+func sanitizeWebSocketHeaders(r *http.Request) {
+	// 1. Normalize 'Connection' header to ensure it contains 'upgrade'
+	conn := r.Header.Get("Connection")
+	if !strings.Contains(strings.ToLower(conn), "upgrade") {
+		r.Header.Set("Connection", "Upgrade")
+	}
+
+	// 2. Normalize 'Upgrade' header to ensure it contains 'websocket'
+	up := r.Header.Get("Upgrade")
+	if !strings.Contains(strings.ToLower(up), "websocket") {
+		r.Header.Set("Upgrade", "websocket")
+	}
+
+	// 3. Normalize 'Sec-WebSocket-Version'
+	if r.Header.Get("Sec-Websocket-Version") == "" {
+		r.Header.Set("Sec-Websocket-Version", "13")
+	}
+
+	// 4. Normalize 'Sec-WebSocket-Key'
+	// Extract candidate keys from all header entries and comma-separated tokens
+	var validKey string
+	for k, vv := range r.Header {
+		if strings.EqualFold(k, "Sec-WebSocket-Key") {
+			for _, rawHeader := range vv {
+				for _, part := range strings.Split(rawHeader, ",") {
+					candidate := strings.TrimSpace(part)
+					candidate = strings.Trim(candidate, "\"")
+					if decoded, err := base64.StdEncoding.DecodeString(candidate); err == nil && len(decoded) == 16 {
+						validKey = candidate
+						break
+					}
+				}
+				if validKey != "" {
+					break
+				}
+			}
+		}
+		if validKey != "" {
+			break
+		}
+	}
+
+	// If no valid 16-byte base64 key was found (e.g. stripped by an HTTP/2 proxy),
+	// generate a compliant RFC 6455 16-byte nonce so the handshake completes cleanly.
+	if validKey == "" {
+		nonce := make([]byte, 16)
+		if _, err := rand.Read(nonce); err == nil {
+			validKey = base64.StdEncoding.EncodeToString(nonce)
+		} else {
+			validKey = "dGhlIHNhbXBsZSBub25jZQ==" // fallback RFC 6455 example nonce
+		}
+	}
+
+	// Remove any duplicate or unconventional cased keys and set standard canonical key
+	var toDelete []string
+	for k := range r.Header {
+		if strings.EqualFold(k, "Sec-WebSocket-Key") {
+			toDelete = append(toDelete, k)
+		}
+	}
+	for _, k := range toDelete {
+		delete(r.Header, k)
+	}
+	r.Header.Set("Sec-Websocket-Key", validKey)
+}
+
+// HandleWebSocket handles client WebSocket connections and proxies to upstream language_server.
+func (p *Proxy) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	cur := p.insp.Current()
+	if cur == nil || !cur.IsHealthy {
+		http.Error(w, "Antigravity language_server unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	sanitizeWebSocketHeaders(r)
+
+	// Upgrade client connection
+	clientConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Warn("[WS] Upgrade failed", "err", err)
+		return
+	}
+	_ = clientConn.SetCompressionLevel(flate.BestSpeed)
+	defer clientConn.Close()
+	defer p.trackWSConn(clientConn)()
+
+	// Dial upstream language_server
+	upstreamURL := fmt.Sprintf("wss://127.0.0.1:%d/connect-websocket", cur.Port)
+	dialer := websocket.Dialer{
+		TLSClientConfig:   localtls.ClientConfig(),
+		NetDialTLSContext: localtls.DialTLSContext,
+		HandshakeTimeout:  5 * time.Second,
+		ReadBufferSize:    131072, // 128KB
+		WriteBufferSize:   131072, // 128KB
+		EnableCompression: false,  // PERF: disabled on loopback to eliminate redundant deflate/inflate CPU overhead
+	}
+
+	reqHeader := make(http.Header)
+	reqHeader.Set("x-codeium-csrf-token", cur.CSRFToken)
+
+	upstreamConn, resp, err := dialer.Dial(upstreamURL, reqHeader)
+	if err != nil {
+		slog.Warn(fmt.Sprintf("[WS] Upstream dial failed (%s)", upstreamURL), "err", err)
+		if resp != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			slog.Info(fmt.Sprintf("[WS] Upstream response status: %d", resp.StatusCode))
+		}
+		clientConn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "Upstream connection failed"))
+		return
+	}
+	defer upstreamConn.Close()
+	defer p.trackWSConn(upstreamConn)()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	const wsTimeout = 60 * time.Second
+	const maxWSMessageSize = 32 * 1024 * 1024 // 32MB safety ceiling against memory exhaustion (M-3)
+
+	// Set up read limits, deadlines and pong handlers for both sides
+	clientConn.SetReadLimit(maxWSMessageSize)
+	clientConn.SetReadDeadline(time.Now().Add(wsTimeout))
+	clientConn.SetPongHandler(func(string) error {
+		clientConn.SetReadDeadline(time.Now().Add(wsTimeout))
+		return nil
+	})
+	upstreamConn.SetReadLimit(maxWSMessageSize)
+	upstreamConn.SetReadDeadline(time.Now().Add(wsTimeout))
+	upstreamConn.SetPongHandler(func(string) error {
+		upstreamConn.SetReadDeadline(time.Now().Add(wsTimeout))
+		return nil
+	})
+
+	// Active server-side heartbeat ping to keep connections alive through reverse proxies
+	stopHeartbeat := make(chan struct{})
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			close(stopHeartbeat)
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+		})
+	}
+	defer closeBoth()
+
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-ticker.C:
+				_ = clientConn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+				_ = upstreamConn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+			}
+		}
+	}()
+
+	// Pump: Client -> Upstream (streaming — avoids loading full messages into memory)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		for {
+			msgType, r, err := clientConn.NextReader()
+			if err != nil {
+				break
+			}
+			clientConn.SetReadDeadline(time.Now().Add(wsTimeout))
+			upstreamConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			w, err := upstreamConn.NextWriter(msgType)
+			if err != nil {
+				break
+			}
+			buf := GetLargeBuffer()
+			_, copyErr := io.CopyBuffer(w, r, buf.Bytes()[:cap(buf.Bytes())])
+			PutLargeBuffer(buf)
+			if closeErr := w.Close(); closeErr != nil || copyErr != nil {
+				break
+			}
+		}
+	}()
+
+	// Pump: Upstream -> Client (streaming with smart small-message normalization)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+
+		const maxNormalizeSize = 128 * 1024 // 128KB: only file tree/stat responses ever need FILE_TYPE_ enum normalization
+
+		for {
+			msgType, r, err := upstreamConn.NextReader()
+			if err != nil {
+				break
+			}
+			upstreamConn.SetReadDeadline(time.Now().Add(wsTimeout))
+			clientConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
+			// Fast path for non-text/binary control messages (if any)
+			if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
+				w, err := clientConn.NextWriter(msgType)
+				if err != nil {
+					break
+				}
+				buf := GetLargeBuffer()
+				_, copyErr := io.CopyBuffer(w, r, buf.Bytes()[:cap(buf.Bytes())])
+				PutLargeBuffer(buf)
+				if closeErr := w.Close(); closeErr != nil || copyErr != nil {
+					break
+				}
+				continue
+			}
+
+			// Read up to maxNormalizeSize to determine if message needs normalization
+			peekBuf := GetLargeBuffer()
+			lr := io.LimitReader(r, maxNormalizeSize+1)
+			_, readErr := peekBuf.ReadFrom(lr)
+			if readErr != nil && readErr != io.EOF {
+				PutLargeBuffer(peekBuf)
+				break
+			}
+
+			if peekBuf.Len() <= maxNormalizeSize {
+				// Entire message fit within 128KB — check for FILE_TYPE_ enum strings
+				raw := peekBuf.Bytes()
+				if bytes.Contains(raw, []byte("FILE_TYPE_")) {
+					norm := normalizeFileTypes(raw)
+					PutLargeBuffer(peekBuf)
+					if writeErr := clientConn.WriteMessage(msgType, norm); writeErr != nil {
+						break
+					}
+					continue
+				}
+				// Small message without FILE_TYPE_ — send directly
+				writeErr := clientConn.WriteMessage(msgType, raw)
+				PutLargeBuffer(peekBuf)
+				if writeErr != nil {
+					break
+				}
+				continue
+			}
+
+			// Message is larger than 128KB (e.g. multi-MB conversation trajectory, large files)
+			// It NEVER requires FILE_TYPE_ replacement. Stream it directly to avoid multi-MB memory allocations!
+			streamStart := time.Now()
+			w, err := clientConn.NextWriter(msgType)
+			if err != nil {
+				PutLargeBuffer(peekBuf)
+				break
+			}
+
+			// 1. Write the already-read prefix
+			prefixLen := peekBuf.Len()
+			if _, writeErr := w.Write(peekBuf.Bytes()); writeErr != nil {
+				PutLargeBuffer(peekBuf)
+				w.Close()
+				break
+			}
+			PutLargeBuffer(peekBuf)
+
+			// 2. Stream the rest directly from upstream reader to client writer
+			streamBuf := GetLargeBuffer()
+			streamedBytes, copyErr := io.CopyBuffer(w, r, streamBuf.Bytes()[:cap(streamBuf.Bytes())])
+			PutLargeBuffer(streamBuf)
+
+			totalBytes := int64(prefixLen) + streamedBytes
+			closeErr := w.Close()
+			slog.Info(fmt.Sprintf("[WS] Streamed large message: %d bytes (%.2f MB) in %v", totalBytes, float64(totalBytes) / (1024 * 1024), time.Since(streamStart)))
+			if closeErr != nil || copyErr != nil {
+				break
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+var voiceWriteBufferPool = &sync.Pool{}
+
+// voiceUpgrader handles /voice/ws full-duplex audio WebSocket upgrades.
+// Compression is disabled because 40ms PCM16LE binary frames (1280B) are latency-sensitive
+// and incompressible. Subprotocols negotiates "jetski-voice-proto" required by Antigravity 2.29+.
+var voiceUpgrader = websocket.Upgrader{
+	ReadBufferSize:    32 * 1024,
+	WriteBufferSize:   32 * 1024,
+	WriteBufferPool:   voiceWriteBufferPool,
+	CheckOrigin:       CheckWebSocketOrigin,
+	EnableCompression: false,
+	Subprotocols:      []string{"jetski-voice-proto"},
+}
+
+// stripGatewayAuthQuery removes gateway-specific query authentication parameters
+// and normalizes string plan_model IDs/enums (e.g., "gemini-3.8-flash-high" or "MODEL_PLACEHOLDER_M318")
+// into the integer exa.codeium_common_pb.Model enum (1000 + N) expected by /voice/ws.
+func stripGatewayAuthQuery(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+	q.Del("ticket")
+	q.Del("token")
+	q.Del("auth_token")
+	if pm := strings.TrimSpace(q.Get("plan_model")); pm != "" {
+		if _, err := strconv.Atoi(pm); err != nil {
+			enumStr := resolveModelEnum(pm)
+			if suffix, ok := strings.CutPrefix(enumStr, "MODEL_PLACEHOLDER_M"); ok {
+				if n, err := strconv.Atoi(suffix); err == nil && n > 0 {
+					q.Set("plan_model", strconv.Itoa(1000+n))
+				}
+			}
+		}
+	}
+	return q.Encode()
+}
+
+// handleVoiceHealth proxies GET /voice/health to the active Antigravity language_server.
+func (p *Proxy) handleVoiceHealth(w http.ResponseWriter, r *http.Request) {
+	p.mu.RLock()
+	rp := p.activeProxy
+	p.mu.RUnlock()
+
+	if rp == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"ready":false,"state":"unavailable"}`))
+		return
+	}
+	rp.ServeHTTP(w, r)
+}
+
+// HandleVoiceWebSocket proxies full-duplex binary Protobuf voice streams (/voice/ws)
+// between mobile/web clients and the upstream Antigravity language_server.
+func (p *Proxy) HandleVoiceWebSocket(w http.ResponseWriter, r *http.Request) {
+	port, token := p.ActiveUpstream()
+	if cur := p.insp.Current(); cur != nil && cur.IsHealthy && cur.Port > 0 {
+		port = cur.Port
+		token = cur.CSRFToken
+	}
+	if port <= 0 {
+		http.Error(w, "Antigravity language_server unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	sanitizeWebSocketHeaders(r)
+
+	clientConn, err := voiceUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Warn("[VoiceWS] Upgrade failed", "err", err)
+		return
+	}
+	defer clientConn.Close()
+	defer p.trackWSConn(clientConn)()
+
+	upstreamURL := fmt.Sprintf("wss://127.0.0.1:%d/voice/ws", port)
+	if cleanQuery := stripGatewayAuthQuery(r.URL.RawQuery); cleanQuery != "" {
+		upstreamURL += "?" + cleanQuery
+	}
+
+	dialer := websocket.Dialer{
+		TLSClientConfig:   localtls.ClientConfig(),
+		NetDialTLSContext: localtls.DialTLSContext,
+		HandshakeTimeout:  8 * time.Second,
+		ReadBufferSize:    32 * 1024,
+		WriteBufferSize:   32 * 1024,
+		EnableCompression: false,
+		Subprotocols:      []string{"jetski-voice-proto"},
+	}
+
+	reqHeader := make(http.Header)
+	if token != "" {
+		reqHeader.Set("x-codeium-csrf-token", token)
+	}
+
+	upstreamConn, resp, err := dialer.Dial(upstreamURL, reqHeader)
+	if err != nil {
+		slog.Warn(fmt.Sprintf("[VoiceWS] Upstream dial failed (%s)", upstreamURL), "err", err)
+		if resp != nil {
+			slog.Info(fmt.Sprintf("[VoiceWS] Upstream response status: %d", resp.StatusCode))
+		}
+		_ = clientConn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "Upstream voice connection failed"),
+			time.Now().Add(2*time.Second),
+		)
+		return
+	}
+	defer upstreamConn.Close()
+	defer p.trackWSConn(upstreamConn)()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	const voiceWSTimeout = 60 * time.Second
+	const maxVoiceMessageSize = 4 * 1024 * 1024 // 4MB ceiling for voice protobuf frames
+
+	clientConn.SetReadLimit(maxVoiceMessageSize)
+	clientConn.SetReadDeadline(time.Now().Add(voiceWSTimeout))
+	clientConn.SetPongHandler(func(string) error {
+		clientConn.SetReadDeadline(time.Now().Add(voiceWSTimeout))
+		return nil
+	})
+	upstreamConn.SetReadLimit(maxVoiceMessageSize)
+	upstreamConn.SetReadDeadline(time.Now().Add(voiceWSTimeout))
+	upstreamConn.SetPongHandler(func(string) error {
+		upstreamConn.SetReadDeadline(time.Now().Add(voiceWSTimeout))
+		return nil
+	})
+
+	stopHeartbeat := make(chan struct{})
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			close(stopHeartbeat)
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+		})
+	}
+	defer closeBoth()
+
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-ticker.C:
+				_ = clientConn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+				_ = upstreamConn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+			}
+		}
+	}()
+
+	// Pump: Client -> Upstream (16kHz PCM16LE mic_audio & settings_update binary frames)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		for {
+			msgType, data, err := clientConn.ReadMessage()
+			if err != nil {
+				if ce, ok := err.(*websocket.CloseError); ok {
+					_ = upstreamConn.WriteControl(
+						websocket.CloseMessage,
+						websocket.FormatCloseMessage(ce.Code, ce.Text),
+						time.Now().Add(time.Second),
+					)
+				}
+				break
+			}
+			clientConn.SetReadDeadline(time.Now().Add(voiceWSTimeout))
+			upstreamConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := upstreamConn.WriteMessage(msgType, data); err != nil {
+				break
+			}
+		}
+	}()
+
+	// Pump: Upstream -> Client (24kHz PCM16LE voice_audio, status, transcripts, clear_audio)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		for {
+			msgType, data, err := upstreamConn.ReadMessage()
+			if err != nil {
+				if ce, ok := err.(*websocket.CloseError); ok {
+					_ = clientConn.WriteControl(
+						websocket.CloseMessage,
+						websocket.FormatCloseMessage(ce.Code, ce.Text),
+						time.Now().Add(time.Second),
+					)
+				}
+				break
+			}
+			upstreamConn.SetReadDeadline(time.Now().Add(voiceWSTimeout))
+			clientConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := clientConn.WriteMessage(msgType, data); err != nil {
+				break
+			}
+		}
+	}()
+
+	wg.Wait()
+}

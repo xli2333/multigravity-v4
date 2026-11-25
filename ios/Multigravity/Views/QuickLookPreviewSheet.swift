@@ -1,0 +1,1256 @@
+import SwiftUI
+import QuickLook
+import QuickLookThumbnailing
+import WebKit
+import Photos
+import LinkPresentation
+import AVKit
+import AVFoundation
+import Combine
+
+// MARK: - Native QuickLook Presentation Sheet (PPTX, DOCX, XLSX, PDF, KEY, SVG, Images, Videos)
+
+public struct QuickLookPreviewSheet: View {
+    public let url: URL
+    public let title: String
+    public let onDismiss: () -> Void
+    @State private var isSavingPhoto: Bool = false
+    @State private var isShowingDocumentPicker: Bool = false
+    @State private var toastSuccessMessage: String? = nil
+    @State private var toastErrorMessage: String? = nil
+    
+    public init(url: URL, title: String = "", onDismiss: @escaping () -> Void) {
+        self.url = url
+        let fallback = url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
+        self.title = title.isEmpty ? fallback : title
+        self.onDismiss = onDismiss
+    }
+    
+    @ViewBuilder
+    private var saveButton: some View {
+        if isRasterImage(url: url) {
+            Menu {
+                Button(action: saveToPhotosAlbum) {
+                    Label("保存到相册", systemImage: "photo")
+                }
+                Button(action: {
+                    isShowingDocumentPicker = true
+                }) {
+                    Label("存储到“文件”", systemImage: "folder")
+                }
+            } label: {
+                if isSavingPhoto {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                } else {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+            } primaryAction: {
+                saveToPhotosAlbum()
+            }
+            .disabled(isSavingPhoto)
+            .accessibilityLabel("保存到相册或文件")
+        } else if isSVG(url: url) {
+            Menu {
+                Button(action: {
+                    isShowingDocumentPicker = true
+                }) {
+                    Label("存储到“文件”", systemImage: "folder")
+                }
+                Button(action: saveSVGAsImageToPhotos) {
+                    Label("保存到相册", systemImage: "photo")
+                }
+            } label: {
+                if isSavingPhoto {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                } else {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+            } primaryAction: {
+                isShowingDocumentPicker = true
+            }
+            .disabled(isSavingPhoto)
+            .accessibilityLabel("保存到文件或相册")
+        } else if isWebM(url: url) {
+            Button(action: {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                isShowingDocumentPicker = true
+            }) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 16, weight: .semibold))
+            }
+            .accessibilityLabel("存储 WebM 录屏到“文件”")
+        } else if isVideo(url: url) {
+            Menu {
+                Button(action: saveVideoToPhotosAlbum) {
+                    Label("保存到相册", systemImage: "video")
+                }
+                Button(action: {
+                    isShowingDocumentPicker = true
+                }) {
+                    Label("存储到“文件”", systemImage: "folder")
+                }
+            } label: {
+                if isSavingPhoto {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                } else {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+            } primaryAction: {
+                saveVideoToPhotosAlbum()
+            }
+            .disabled(isSavingPhoto)
+            .accessibilityLabel("保存视频到相册或文件")
+        } else {
+            Button(action: {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                isShowingDocumentPicker = true
+            }) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 16, weight: .semibold))
+            }
+            .accessibilityLabel("存储到“文件”")
+        }
+    }
+    
+    public var body: some View {
+        NavigationStack {
+            Group {
+                if isRasterImage(url: url) {
+                    HighResolutionImageViewer(url: url)
+                        .ignoresSafeArea(edges: .bottom)
+                } else if isVideo(url: url) {
+                    NativeVideoPlayerViewer(url: url)
+                        .ignoresSafeArea(edges: .bottom)
+                } else if isNotebook(url: url) {
+                    NotebookPreviewView(url: url)
+                } else if isPDF(url: url) {
+                    PdfDocumentPreviewView(url: url)
+                        .ignoresSafeArea(edges: .bottom)
+                } else {
+                    QuickLookControllerRepresentable(url: url)
+                        .ignoresSafeArea(edges: .bottom)
+                }
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    saveButton
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    ShareLink(item: url, preview: SharePreview(title)) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                    .accessibilityLabel("分享")
+                }
+            }
+            .sheet(isPresented: $isShowingDocumentPicker) {
+                DocumentExporterRepresentable(url: url) { _ in
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    showSuccessToast(String(localized: "已保存至“文件”"))
+                }
+            }
+            .presentationDragIndicator(.visible)
+        }
+        .presentationDragIndicator(.visible)
+        .overlay(alignment: .center) {
+            toastOverlay
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.78), value: toastSuccessMessage)
+        .animation(.spring(response: 0.3, dampingFraction: 0.78), value: toastErrorMessage)
+    }
+    
+    @ViewBuilder
+    private var toastOverlay: some View {
+        if let msg = toastSuccessMessage {
+            VStack(spacing: 12) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 40, weight: .semibold))
+                    .foregroundColor(.green)
+                Text(msg)
+                    .font(.system(size: 14.5, weight: .medium))
+                    .foregroundColor(.primary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+            )
+            .shadow(color: Color.black.opacity(0.18), radius: 20, x: 0, y: 8)
+            .transition(.scale(scale: 0.85).combined(with: .opacity))
+        } else if let err = toastErrorMessage {
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 40, weight: .semibold))
+                    .foregroundColor(.orange)
+                Text(err)
+                    .font(.system(size: 14.5, weight: .medium))
+                    .foregroundColor(.primary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+            )
+            .shadow(color: Color.black.opacity(0.18), radius: 20, x: 0, y: 8)
+            .transition(.scale(scale: 0.85).combined(with: .opacity))
+        }
+    }
+    
+    private func showSuccessToast(_ msg: String) {
+        toastSuccessMessage = msg
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+            if toastSuccessMessage == msg {
+                toastSuccessMessage = nil
+            }
+        }
+    }
+    
+    private func showErrorToast(_ msg: String) {
+        toastErrorMessage = msg
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            if toastErrorMessage == msg {
+                toastErrorMessage = nil
+            }
+        }
+    }
+    
+    private func isRasterImage(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        let rasterExtensions = ["png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "bmp", "tiff", "tif"]
+        if rasterExtensions.contains(ext) { return true }
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+            let uriExt = (uri as NSString).pathExtension.lowercased()
+            if rasterExtensions.contains(uriExt) { return true }
+        }
+        return false
+    }
+    
+    private func isSVG(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if ext == "svg" { return true }
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+            return (uri as NSString).pathExtension.lowercased() == "svg"
+        }
+        return false
+    }
+
+    private func isNotebook(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if ext == "ipynb" { return true }
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+            return (uri as NSString).pathExtension.lowercased() == "ipynb"
+        }
+        return false
+    }
+
+    private func isPDF(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if ext == "pdf" { return true }
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+            return (uri as NSString).pathExtension.lowercased() == "pdf"
+        }
+        return false
+    }
+    
+    private func isVideo(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        let videoExtensions = ["mp4", "mov", "m4v", "webm", "avi", "mkv", "3gp", "ts", "flv"]
+        if videoExtensions.contains(ext) { return true }
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+            let uriExt = (uri as NSString).pathExtension.lowercased()
+            if videoExtensions.contains(uriExt) { return true }
+        }
+        return false
+    }
+    
+    private func isWebM(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if ext == "webm" { return true }
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+            let uriExt = (uri as NSString).pathExtension.lowercased()
+            if uriExt == "webm" { return true }
+        }
+        return false
+    }
+    
+    private func saveVideoToPhotosAlbum() {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        isSavingPhoto = true
+        
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    self.isSavingPhoto = false
+                    self.showErrorToast(String(localized: "未获得相册权限，请在系统设置中开启"))
+                }
+                return
+            }
+            
+            let performSave: (URL) -> Void = { fileURL in
+                PHPhotoLibrary.shared().performChanges {
+                    let request = PHAssetCreationRequest.forAsset()
+                    request.addResource(with: .video, fileURL: fileURL, options: nil)
+                } completionHandler: { success, error in
+                    DispatchQueue.main.async {
+                        self.isSavingPhoto = false
+                        if success {
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            self.showSuccessToast(String(localized: "视频已保存至相册"))
+                        } else {
+                            UINotificationFeedbackGenerator().notificationOccurred(.error)
+                            self.showErrorToast(String(localized: "保存失败: \(error?.localizedDescription ?? String(localized: "未知错误"))"))
+                        }
+                    }
+                }
+            }
+            
+            if self.url.isFileURL {
+                performSave(self.url)
+            } else {
+                Task {
+                    do {
+                        var request = URLRequest(url: self.url)
+                        request.timeoutInterval = 60
+                        let (tempURL, httpResp) = try await NetworkTransport.shared.download(request: request)
+                        guard (200...299).contains(httpResp.statusCode) else {
+                            try? FileManager.default.removeItem(at: tempURL)
+                            throw APIError.serverError(statusCode: httpResp.statusCode, message: "HTTP \(httpResp.statusCode)")
+                        }
+                        let ext: String = {
+                            if !self.url.pathExtension.isEmpty { return self.url.pathExtension }
+                            if let comps = URLComponents(url: self.url, resolvingAgainstBaseURL: false),
+                               let uri = comps.queryItems?.first(where: { $0.name == "uri" })?.value {
+                                let uriExt = (uri as NSString).pathExtension
+                                if !uriExt.isEmpty { return uriExt }
+                            }
+                            return "mp4"
+                        }()
+                        let destURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
+                        try? FileManager.default.removeItem(at: destURL)
+                        try FileManager.default.moveItem(at: tempURL, to: destURL)
+                        performSave(destURL)
+                    } catch {
+                        DispatchQueue.main.async {
+                            self.isSavingPhoto = false
+                            self.showErrorToast(String(localized: "下载视频失败: \(error.localizedDescription)"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    private func saveToPhotosAlbum() {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        isSavingPhoto = true
+        
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    self.isSavingPhoto = false
+                    self.showErrorToast(String(localized: "未获得相册权限，请在系统设置中开启"))
+                }
+                return
+            }
+            
+            PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, fileURL: self.url, options: nil)
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    self.isSavingPhoto = false
+                    if success {
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        self.showSuccessToast(String(localized: "已保存至系统相册"))
+                    } else {
+                        UINotificationFeedbackGenerator().notificationOccurred(.error)
+                        self.showErrorToast(String(localized: "保存失败: \(error?.localizedDescription ?? String(localized: "未知错误"))"))
+                    }
+                }
+            }
+        }
+    }
+    
+    private func saveSVGAsImageToPhotos() {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        isSavingPhoto = true
+        let targetURL = self.url
+        
+        let request = QLThumbnailGenerator.Request(
+            fileAt: targetURL,
+            size: CGSize(width: 2048, height: 2048),
+            scale: UIScreen.main.scale,
+            representationTypes: .all
+        )
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { thumbnail, _ in
+            DispatchQueue.main.async {
+                if let uiImage = thumbnail?.uiImage {
+                    self.saveUIImageToPhotos(uiImage)
+                } else {
+                    self.saveToPhotosAlbum()
+                }
+            }
+        }
+    }
+    
+    private func saveUIImageToPhotos(_ image: UIImage) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    self.isSavingPhoto = false
+                    self.showErrorToast(String(localized: "未获得相册权限，请在系统设置中开启"))
+                }
+                return
+            }
+            
+            PHPhotoLibrary.shared().performChanges {
+                let req = PHAssetCreationRequest.forAsset()
+                if let pngData = image.pngData() {
+                    req.addResource(with: .photo, data: pngData, options: nil)
+                }
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    self.isSavingPhoto = false
+                    if success {
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        self.showSuccessToast(String(localized: "已保存至系统相册"))
+                    } else {
+                        UINotificationFeedbackGenerator().notificationOccurred(.error)
+                        self.showErrorToast(String(localized: "保存失败: \(error?.localizedDescription ?? String(localized: "未知错误"))"))
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Native Video Player Viewer (With WebM & Error Hardware Acceleration Fallback)
+
+public struct NativeVideoPlayerViewer: View {
+    public let url: URL
+    @State private var player: AVPlayer? = nil
+    @State private var useWebMFallback: Bool = false
+    @State private var statusObserver: NSKeyValueObservation? = nil
+    
+    public init(url: URL) {
+        self.url = url
+        let ext = url.pathExtension.lowercased()
+        let isWebM = ext == "webm" || url.absoluteString.lowercased().contains(".webm")
+        _useWebMFallback = State(initialValue: isWebM)
+    }
+    
+    public var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            
+            if useWebMFallback {
+                WebMVideoPlayerViewer(url: url)
+                    .ignoresSafeArea(edges: .bottom)
+            } else if let player = player {
+                AVPlayerViewControllerRepresentable(player: player)
+                    .ignoresSafeArea(edges: .bottom)
+            } else {
+                ProgressView()
+                    .tint(.white)
+            }
+        }
+        .onAppear {
+            if !useWebMFallback {
+                setupPlayer()
+            }
+        }
+        .onDisappear {
+            tearDownPlayer()
+        }
+    }
+    
+    private func setupPlayer() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Failed to set audio session category: \(error)")
+        }
+        
+        let item = AVPlayerItem(url: url)
+        statusObserver = item.observe(\.status, options: [.new]) { observedItem, _ in
+            if observedItem.status == .failed {
+                DispatchQueue.main.async {
+                    self.useWebMFallback = true
+                }
+            }
+        }
+        
+        let p = AVPlayer(playerItem: item)
+        p.actionAtItemEnd = .pause
+        self.player = p
+        
+        NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak p] _ in
+            p?.seek(to: .zero)
+        }
+        
+        p.play()
+    }
+    
+    private func tearDownPlayer() {
+        statusObserver?.invalidate()
+        statusObserver = nil
+        player?.pause()
+        player = nil
+        NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: nil)
+    }
+}
+
+// MARK: - WebM Screencast Video Player Viewer (WebKit Hardware Accelerated)
+
+public struct WebMVideoPlayerViewer: View {
+    public let url: URL
+    
+    public init(url: URL) {
+        self.url = url
+    }
+    
+    public var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            WebMWebViewRepresentable(url: url)
+                .ignoresSafeArea(edges: .bottom)
+        }
+    }
+}
+
+public struct WebMWebViewRepresentable: UIViewRepresentable {
+    public let url: URL
+    
+    public init(url: URL) {
+        self.url = url
+    }
+    
+    public func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        config.allowsPictureInPictureMediaPlayback = true
+        config.preferences.setValue(false, forKey: "allowFileAccessFromFileURLs")
+        let pagePrefs = WKWebpagePreferences()
+        pagePrefs.allowsContentJavaScript = false
+        config.defaultWebpagePreferences = pagePrefs
+        
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = false
+        webView.backgroundColor = .black
+        webView.scrollView.backgroundColor = .black
+        webView.scrollView.isScrollEnabled = false
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        
+        loadVideo(in: webView)
+        return webView
+    }
+    
+    public func updateUIView(_ uiView: WKWebView, context: Context) {}
+    
+    private func loadVideo(in webView: WKWebView) {
+        let parentDir = url.deletingLastPathComponent()
+        let rawName = url.lastPathComponent
+        let encodedPath = rawName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? rawName
+        let escapedSrc = encodedPath
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body, html { width: 100%; height: 100%; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+          video { width: 100%; height: 100%; max-width: 100vw; max-height: 100vh; object-fit: contain; background: #000; }
+        </style>
+        </head>
+        <body>
+          <video src="\(escapedSrc)" controls playsinline autoplay></video>
+        </body>
+        </html>
+        """
+        webView.loadHTMLString(html, baseURL: parentDir)
+    }
+}
+
+public struct AVPlayerViewControllerRepresentable: UIViewControllerRepresentable {
+    public let player: AVPlayer
+    
+    public init(player: AVPlayer) {
+        self.player = player
+    }
+    
+    public func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.showsPlaybackControls = true
+        controller.allowsPictureInPicturePlayback = true
+        controller.updatesNowPlayingInfoCenter = false
+        controller.videoGravity = .resizeAspect
+        if #available(iOS 16.0, *) {
+            controller.speeds = [
+                AVPlaybackSpeed(rate: 0.5, localizedName: "0.5×"),
+                AVPlaybackSpeed(rate: 0.75, localizedName: "0.75×"),
+                AVPlaybackSpeed(rate: 1.0, localizedName: "1.0×"),
+                AVPlaybackSpeed(rate: 1.25, localizedName: "1.25×"),
+                AVPlaybackSpeed(rate: 1.5, localizedName: "1.5×"),
+                AVPlaybackSpeed(rate: 2.0, localizedName: "2.0×")
+            ]
+        }
+        return controller
+    }
+    
+    public func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        if uiViewController.player !== player {
+            uiViewController.player = player
+        }
+    }
+}
+
+public struct QuickLookControllerRepresentable: UIViewControllerRepresentable {
+    public let url: URL
+    
+    public init(url: URL) {
+        self.url = url
+    }
+    
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(url: url)
+    }
+    
+    public func makeUIViewController(context: Context) -> QuickLookContainerViewController {
+        let container = QuickLookContainerViewController(url: url)
+        container.qlController.dataSource = context.coordinator
+        container.qlController.delegate = context.coordinator
+        return container
+    }
+    
+    public func updateUIViewController(_ uiViewController: QuickLookContainerViewController, context: Context) {
+        context.coordinator.url = url
+        uiViewController.url = url
+    }
+    
+    public final class Coordinator: NSObject, QLPreviewControllerDataSource, QLPreviewControllerDelegate {
+        var url: URL
+        
+        init(url: URL) {
+            self.url = url
+        }
+        
+        public func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+            return 1
+        }
+        
+        public func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            return url as NSURL
+        }
+    }
+}
+
+public final class QuickLookContainerViewController: UIViewController {
+    let qlController = QLPreviewController()
+    var url: URL {
+        didSet {
+            qlController.reloadData()
+        }
+    }
+    
+    init(url: URL) {
+        self.url = url
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    public override func viewDidLoad() {
+        super.viewDidLoad()
+        addChild(qlController)
+        view.addSubview(qlController.view)
+        qlController.view.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            qlController.view.topAnchor.constraint(equalTo: view.topAnchor),
+            qlController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            qlController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            qlController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
+        qlController.didMove(toParent: self)
+    }
+}
+
+// MARK: - Native High-Resolution Image Presentation Sheet (PNG, JPG, WEBP, GIF, etc.)
+
+public struct HighResolutionImageViewer: UIViewControllerRepresentable {
+    public let url: URL
+    
+    public init(url: URL) {
+        self.url = url
+    }
+    
+    public func makeUIViewController(context: Context) -> HighResolutionImageViewController {
+        return HighResolutionImageViewController(url: url)
+    }
+    
+    public func updateUIViewController(_ uiViewController: HighResolutionImageViewController, context: Context) {
+        if uiViewController.url != url {
+            uiViewController.updateURL(url)
+        }
+    }
+}
+
+public final class HighResolutionImageViewController: UIViewController, UIScrollViewDelegate {
+    public private(set) var url: URL
+    private let scrollView = UIScrollView()
+    private let containerView = UIView()
+    private let loadingIndicator = UIActivityIndicatorView(style: .medium)
+    
+    private struct ImageSlice {
+        let image: UIImage
+        let pixelRect: CGRect
+    }
+    
+    private var slices: [ImageSlice] = []
+    private var sliceImageViews: [UIImageView] = []
+    private var originalImageSize: CGSize = .zero
+    private var lastLayoutViewportSize: CGSize = .zero
+    private var isLoaded: Bool = false
+    private var initialScrollDone: Bool = false
+    
+    public init(url: URL) {
+        self.url = url
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    public override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        
+        scrollView.delegate = self
+        scrollView.minimumZoomScale = 1.0
+        scrollView.maximumZoomScale = 5.0
+        scrollView.zoomScale = 1.0
+        scrollView.showsVerticalScrollIndicator = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.alwaysBounceVertical = true
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.backgroundColor = .systemBackground
+        
+        view.addSubview(scrollView)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
+        
+        containerView.backgroundColor = .clear
+        scrollView.addSubview(containerView)
+        
+        loadingIndicator.hidesWhenStopped = true
+        view.addSubview(loadingIndicator)
+        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            loadingIndicator.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            loadingIndicator.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+        ])
+        
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        scrollView.addGestureRecognizer(doubleTap)
+        
+        loadImage()
+    }
+    
+    public func updateURL(_ newURL: URL) {
+        self.url = newURL
+        self.isLoaded = false
+        self.initialScrollDone = false
+        self.lastLayoutViewportSize = .zero
+        scrollView.setZoomScale(1.0, animated: false)
+        loadImage()
+    }
+    
+    private func loadImage() {
+        loadingIndicator.startAnimating()
+        let targetURL = self.url
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            var loadedImage: UIImage? = nil
+            if let data = try? Data(contentsOf: targetURL) {
+                loadedImage = UIImage(data: data)
+            } else if let img = UIImage(contentsOfFile: targetURL.path) {
+                loadedImage = img
+            }
+            
+            guard let rawImage = loadedImage else {
+                DispatchQueue.main.async {
+                    self.loadingIndicator.stopAnimating()
+                }
+                return
+            }
+            
+            let image = self.normalizeOrientation(rawImage)
+            let generatedSlices = self.generateSlices(for: image)
+            
+            DispatchQueue.main.async {
+                guard self.url == targetURL else { return }
+                self.setupWithSlices(generatedSlices, originalSize: image.size)
+            }
+        }
+    }
+    
+    private func normalizeOrientation(_ image: UIImage) -> UIImage {
+        if image.imageOrientation == .up { return image }
+        UIGraphicsBeginImageContextWithOptions(image.size, false, image.scale)
+        image.draw(in: CGRect(origin: .zero, size: image.size))
+        let normalized = UIGraphicsGetImageFromCurrentImageContext() ?? image
+        UIGraphicsEndImageContext()
+        return normalized
+    }
+    
+    private func generateSlices(for image: UIImage) -> [ImageSlice] {
+        guard let cgImage = image.cgImage else {
+            return [ImageSlice(image: image, pixelRect: CGRect(origin: .zero, size: image.size))]
+        }
+        
+        let totalPixelWidth = cgImage.width
+        let totalPixelHeight = cgImage.height
+        guard totalPixelWidth > 0, totalPixelHeight > 0 else { return [] }
+        
+        // Chunk height of 2048 px guarantees zero GPU downsampling and negligible memory overhead
+        let maxSliceHeight = 2048
+        if totalPixelHeight <= maxSliceHeight {
+            return [ImageSlice(image: image, pixelRect: CGRect(x: 0, y: 0, width: totalPixelWidth, height: totalPixelHeight))]
+        }
+        
+        var slices: [ImageSlice] = []
+        var currentY = 0
+        while currentY < totalPixelHeight {
+            let sliceH = min(maxSliceHeight, totalPixelHeight - currentY)
+            let rect = CGRect(x: 0, y: currentY, width: totalPixelWidth, height: sliceH)
+            if let cropped = cgImage.cropping(to: rect) {
+                let sliceImg = UIImage(cgImage: cropped, scale: image.scale, orientation: .up)
+                slices.append(ImageSlice(image: sliceImg, pixelRect: rect))
+            }
+            currentY += sliceH
+        }
+        return slices
+    }
+    
+    private func setupWithSlices(_ slices: [ImageSlice], originalSize: CGSize) {
+        self.slices = slices
+        self.originalImageSize = originalSize
+        self.lastLayoutViewportSize = .zero
+        self.isLoaded = true
+        self.loadingIndicator.stopAnimating()
+        
+        containerView.subviews.forEach { $0.removeFromSuperview() }
+        sliceImageViews.removeAll()
+        
+        for slice in slices {
+            let iv = UIImageView(image: slice.image)
+            iv.contentMode = .scaleToFill
+            iv.clipsToBounds = true
+            containerView.addSubview(iv)
+            sliceImageViews.append(iv)
+        }
+        
+        view.layoutIfNeeded()
+        layoutImageViews()
+    }
+    
+    public override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        if scrollView.zoomScale == 1.0 {
+            layoutImageViews()
+        } else {
+            centerContainerView(in: scrollView.bounds.size)
+        }
+    }
+    
+    private func layoutImageViews() {
+        guard isLoaded, !slices.isEmpty, originalImageSize.width > 0, originalImageSize.height > 0 else { return }
+        let viewportSize = scrollView.bounds.size.width > 0 && scrollView.bounds.size.height > 0
+            ? scrollView.bounds.size
+            : view.bounds.size
+        let viewportWidth = viewportSize.width
+        let viewportHeight = viewportSize.height
+        guard viewportWidth > 0, viewportHeight > 0 else { return }
+        guard viewportSize != lastLayoutViewportSize else { return }
+        lastLayoutViewportSize = viewportSize
+        
+        let scale = viewportWidth / originalImageSize.width
+        let totalDisplayHeight = originalImageSize.height * scale
+        
+        scrollView.contentInset = .zero
+        containerView.transform = .identity
+        containerView.frame = CGRect(x: 0, y: 0, width: viewportWidth, height: totalDisplayHeight)
+        scrollView.contentSize = CGSize(width: viewportWidth, height: totalDisplayHeight)
+        
+        var currentY: CGFloat = 0
+        for (idx, slice) in slices.enumerated() {
+            guard idx < sliceImageViews.count else { break }
+            let iv = sliceImageViews[idx]
+            let sliceDisplayHeight = slice.pixelRect.height * scale
+            iv.frame = CGRect(x: 0, y: currentY, width: viewportWidth, height: sliceDisplayHeight)
+            currentY += sliceDisplayHeight
+        }
+        
+        centerContainerView(in: viewportSize)
+        
+        if !initialScrollDone {
+            scrollView.contentOffset = .zero
+            initialScrollDone = true
+        }
+    }
+    
+    private func centerContainerView(in viewportSize: CGSize) {
+        let contentSize = scrollView.contentSize
+        let offsetX = max((viewportSize.width - contentSize.width) * 0.5, 0)
+        let offsetY = max((viewportSize.height - contentSize.height) * 0.5, 0)
+        containerView.center = CGPoint(
+            x: contentSize.width * 0.5 + offsetX,
+            y: contentSize.height * 0.5 + offsetY
+        )
+    }
+    
+    // MARK: - UIScrollViewDelegate
+    
+    public func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        return containerView
+    }
+    
+    public func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        centerContainerView(in: scrollView.bounds.size)
+    }
+    
+    public func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        if scale <= 1.001 {
+            layoutImageViews()
+        }
+    }
+    
+    @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+        if scrollView.zoomScale > 1.1 {
+            scrollView.setZoomScale(1.0, animated: true)
+        } else {
+            let rawPoint = gesture.location(in: containerView)
+            let pointInContainer = CGPoint(
+                x: min(max(rawPoint.x, 0), containerView.bounds.width),
+                y: min(max(rawPoint.y, 0), containerView.bounds.height)
+            )
+            let targetScale: CGFloat = min(2.5, scrollView.maximumZoomScale)
+            let width = scrollView.bounds.width / targetScale
+            let height = scrollView.bounds.height / targetScale
+            let x = pointInContainer.x - (width / 2.0)
+            let y = pointInContainer.y - (height / 2.0)
+            let zoomRect = CGRect(x: x, y: y, width: width, height: height)
+            scrollView.zoom(to: zoomRect, animated: true)
+        }
+    }
+}
+
+// MARK: - Interactive HTML Presentation Sheet (WKWebView)
+
+public struct HTMLPreviewSheet: View {
+    public let url: URL
+    public let title: String
+    public let onDismiss: () -> Void
+    @State private var isShowingDocumentPicker: Bool = false
+    @State private var toastSuccessMessage: String? = nil
+    @State private var findTrigger: Int = 0
+    
+    public init(url: URL, title: String = "", onDismiss: @escaping () -> Void) {
+        self.url = url
+        let fallback = url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
+        self.title = title.isEmpty ? fallback : title
+        self.onDismiss = onDismiss
+    }
+    
+    public var body: some View {
+        NavigationStack {
+            HTMLWebViewRepresentable(url: url, findTrigger: findTrigger)
+                .ignoresSafeArea(edges: .bottom)
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(action: {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            isShowingDocumentPicker = true
+                        }) {
+                            Image(systemName: "square.and.arrow.down")
+                                .font(.system(size: 16, weight: .semibold))
+                        }
+                        .accessibilityLabel("存储到“文件”")
+                    }
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        Button {
+                            findTrigger &+= 1
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 15, weight: .semibold))
+                        }
+                        .accessibilityLabel("页内查找")
+
+                        ShareLink(item: url, preview: SharePreview(title)) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 16, weight: .semibold))
+                        }
+                        .accessibilityLabel("分享")
+                    }
+                }
+                .sheet(isPresented: $isShowingDocumentPicker) {
+                    DocumentExporterRepresentable(url: url) { _ in
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        toastSuccessMessage = String(localized: "已保存至“文件”")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+                            toastSuccessMessage = nil
+                        }
+                    }
+                }
+        }
+        .presentationDragIndicator(.visible)
+        .overlay(alignment: .center) {
+            if let msg = toastSuccessMessage {
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 40, weight: .semibold))
+                        .foregroundColor(.green)
+                    Text(msg)
+                        .font(.system(size: 14.5, weight: .medium))
+                        .foregroundColor(.primary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                )
+                .shadow(color: Color.black.opacity(0.18), radius: 20, x: 0, y: 8)
+                .transition(.scale(scale: 0.85).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.78), value: toastSuccessMessage)
+    }
+}
+
+// MARK: - Native Document Exporter (Save to Files app)
+
+public struct DocumentExporterRepresentable: UIViewControllerRepresentable {
+    public let url: URL
+    public var onCompletion: ((URL) -> Void)? = nil
+    public var onDismiss: (() -> Void)? = nil
+    
+    public init(url: URL, onCompletion: ((URL) -> Void)? = nil, onDismiss: (() -> Void)? = nil) {
+        self.url = url
+        self.onCompletion = onCompletion
+        self.onDismiss = onDismiss
+    }
+    
+    public func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+        picker.delegate = context.coordinator
+        picker.shouldShowFileExtensions = true
+        return picker
+    }
+    
+    public func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+    
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+    
+    public final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let parent: DocumentExporterRepresentable
+        
+        init(_ parent: DocumentExporterRepresentable) {
+            self.parent = parent
+        }
+        
+        public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let target = urls.first {
+                parent.onCompletion?(target)
+            }
+        }
+        
+        public func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.onDismiss?()
+        }
+    }
+}
+
+
+public struct HTMLWebViewRepresentable: UIViewRepresentable {
+    public let url: URL
+    public var findTrigger: Int = 0
+
+    public final class Coordinator {
+        var lastFindTrigger: Int = 0
+    }
+
+    public func makeCoordinator() -> Coordinator { Coordinator() }
+    
+    public func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.preferences.setValue(false, forKey: "allowFileAccessFromFileURLs")
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = prefs
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.allowsBackForwardNavigationGestures = false
+        webView.isFindInteractionEnabled = true
+        webView.scrollView.contentInsetAdjustmentBehavior = .automatic
+        webView.loadFileURL(url, allowingReadAccessTo: url)
+        return webView
+    }
+    
+    public func updateUIView(_ uiView: WKWebView, context: Context) {
+        if findTrigger != context.coordinator.lastFindTrigger {
+            context.coordinator.lastFindTrigger = findTrigger
+            DispatchQueue.main.async {
+                uiView.becomeFirstResponder()
+                uiView.findInteraction?.presentFindNavigator(showingReplace: false)
+            }
+        }
+    }
+}
+
+// MARK: - Activity View Controller for Sharing files
+
+public struct ShareSheetView: UIViewControllerRepresentable {
+    public let activityItems: [Any]
+    public let onDismiss: (() -> Void)?
+    
+    public init(activityItems: [Any], onDismiss: (() -> Void)? = nil) {
+        self.activityItems = activityItems
+        self.onDismiss = onDismiss
+    }
+    
+    public func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in
+            self.onDismiss?()
+        }
+        return controller
+    }
+    
+    public func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+// MARK: - Safe Image Activity Item Source (Prevent WeChat Extension Jetsam OOM)
+
+public final class ImageActivityItemSource: NSObject, UIActivityItemSource {
+    public let fileURL: URL
+    public let title: String
+    
+    public init(fileURL: URL, title: String) {
+        self.fileURL = fileURL
+        self.title = title
+        super.init()
+    }
+    
+    public func activityViewControllerPlaceholderItem(_ activityViewController: UIActivityViewController) -> Any {
+        return fileURL
+    }
+    
+    public func activityViewController(_ activityViewController: UIActivityViewController, itemForActivityType activityType: UIActivity.ActivityType?) -> Any? {
+        let typeString = activityType?.rawValue.lowercased() ?? ""
+        let isWeChat = typeString.contains("tencent") || typeString.contains("xin")
+        
+        if isWeChat {
+            // Check if image is extremely tall (e.g. > 3000px) which will crash WeChat's 60MB extension sandbox
+            if let data = try? Data(contentsOf: fileURL),
+               let source = CGImageSourceCreateWithData(data as CFData, nil),
+               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+               let height = properties[kCGImagePropertyPixelHeight] as? Int,
+               let width = properties[kCGImagePropertyPixelWidth] as? Int,
+               height > 3000 || width > 3000 {
+                
+                // Downscale proportionally so max dimension is 3000px for safe memory consumption inside WeChat's extension
+                let maxDim = 3000
+                let options: [CFString: Any] = [
+                    kCGImageSourceThumbnailMaxPixelSize: maxDim,
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true
+                ]
+                if let cgDownscaled = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                    let downscaledImg = UIImage(cgImage: cgDownscaled)
+                    if let jpegData = downscaledImg.jpegData(compressionQuality: 0.85) {
+                        let tempPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("wechat_\(fileURL.lastPathComponent).jpg")
+                        let tempURL = URL(fileURLWithPath: tempPath)
+                        try? jpegData.write(to: tempURL)
+                        return tempURL
+                    }
+                }
+            }
+        }
+        
+        // For Save to Photos, AirDrop, Files, Copy, etc., always provide the 100% original full-res file!
+        return fileURL
+    }
+    
+    public func activityViewControllerLinkMetadata(_ activityViewController: UIActivityViewController) -> LPLinkMetadata? {
+        let metadata = LPLinkMetadata()
+        metadata.title = title
+        
+        // Pre-render a lightweight 300px thumbnail so WeChat and system share sheet don't decode the entire huge image for preview
+        if let data = try? Data(contentsOf: fileURL),
+           let source = CGImageSourceCreateWithData(data as CFData, nil) {
+            let options: [CFString: Any] = [
+                kCGImageSourceThumbnailMaxPixelSize: 300,
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            if let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                let thumb = UIImage(cgImage: cgThumb)
+                metadata.iconProvider = NSItemProvider(object: thumb)
+                metadata.imageProvider = NSItemProvider(object: thumb)
+            }
+        }
+        return metadata
+    }
+}

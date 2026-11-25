@@ -1,0 +1,1018 @@
+import Foundation
+
+public struct GetCascadeTrajectoryRequest: Codable, Sendable {
+    public let cascadeId: String
+    
+    public init(cascadeId: String) {
+        self.cascadeId = cascadeId
+    }
+}
+
+public struct GetCascadeTrajectoryResponse: Codable, Sendable {
+    public let trajectory: TrajectoryDetails?
+    public let status: String?
+}
+
+public struct TrajectoryDetails: Codable, Sendable {
+    public let trajectoryId: String?
+    public let cascadeId: String?
+    public let steps: [CortexStep]?
+    public let workspaceUris: [String]?
+    public let annotations: Annotations?
+    public let summary: String?
+    public let hasError: Bool?
+    public let errorMessage: String?
+}
+
+public struct CortexStep: Codable, Sendable {
+    public let type: String?
+    public let status: String?
+    public let metadata: CortexStepMetadata?
+    public let toolCall: ToolCallPayload?
+    public let userInput: UserInputPayload?
+    public let plannerResponse: PlannerResponsePayload?
+    public let errorMessage: ErrorMessagePayload?
+    public let error: ErrorPayload?
+}
+
+public struct ToolCallPayload: Codable, Sendable {
+    public let id: String?
+    public let name: String?
+    public let toolSummary: String?
+    public let toolAction: String?
+}
+
+public struct ErrorMessagePayload: Codable, Sendable {
+    public let message: String?
+    public let shortError: String?
+    public let userErrorMessage: String?
+    public let shouldShowUser: Bool?
+    public let shouldShowModel: Bool?
+}
+
+public struct ErrorPayload: Codable, Sendable {
+    public let message: String?
+    public let detail: String?
+}
+
+public struct CortexStepMetadata: Codable, Sendable {
+    public let createdAt: String?
+    public let toolCall: ToolCallPayload?
+    public let toolSummary: String?
+    public let toolAction: String?
+}
+
+public struct UserInputPayload: Codable, Sendable {
+    public let items: [TextItem]?
+    public let userResponse: String?
+    public let media: [UserMediaItem]?
+    public let images: [UserImageItem]?
+
+    public func extractTextAndSlashCommands() -> (text: String, slashCommands: [SlashCommandMention]) {
+        var slashCommands: [SlashCommandMention] = []
+        var parts: [String] = []
+        for it in items ?? [] {
+            if let scInfo = it.item?.slashCommand?.info,
+               let rawName = scInfo.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawName.isEmpty {
+                let rawType = scInfo.type ?? ""
+                let kind: String = {
+                    if rawType.contains("SKILL") { return "skill" }
+                    if SlashCommandIconCatalog.defaultSystemIcons[rawName] != nil { return "system" }
+                    return "skill"
+                }()
+                let icon = SlashCommandIconCatalog.resolveIcon(name: rawName, icon: scInfo.icon, kind: kind)
+                let defPath = scInfo.definitionPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+                slashCommands.append(SlashCommandMention(name: rawName, icon: icon, kind: kind, definitionPath: defPath?.isEmpty == false ? defPath : nil))
+                parts.append("/" + rawName)
+            } else if let text = it.text, !text.isEmpty {
+                parts.append(text)
+            } else if let chunk = it.item?.chunk?.text, !chunk.isEmpty {
+                parts.append(chunk)
+            }
+        }
+        if let resp = userResponse, !resp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return (resp, slashCommands)
+        }
+        return (parts.joined().trimmingCharacters(in: .whitespacesAndNewlines), slashCommands)
+    }
+}
+
+public struct UserImageItem: Codable, Sendable {
+    public let base64Data: String?
+    public let mimeType: String?
+}
+
+public struct UserMediaItem: Codable, Sendable {
+    public let mimeType: String?
+    public let description: String?
+    public let thumbnail: String?
+    public let inlineData: String?
+    public let uri: String?
+}
+
+public struct TextItem: Codable, Sendable {
+    public let text: String?
+    public let item: UserInputScopeItem?
+
+    public struct UserInputScopeItem: Codable, Sendable {
+        public let slashCommand: UserInputSlashCommand?
+        public let chunk: UserInputChunk?
+    }
+    public struct UserInputSlashCommand: Codable, Sendable {
+        public let info: UserInputSlashCommandInfo?
+    }
+    public struct UserInputSlashCommandInfo: Codable, Sendable {
+        public let name: String?
+        public let type: String?
+        public let icon: String?
+        public let definitionPath: String?
+    }
+    public struct UserInputChunk: Codable, Sendable {
+        public let text: String?
+    }
+}
+
+/// 发送消息时 `items[]` 的一个元素：文本，或带 scope 的条目（目前只用斜杠命令）。两个分支互斥。
+/// 斜杠命令只需带名称，网关会补全权威定义（modelFacingText 等）。
+public struct SendItem: Codable, Sendable {
+    public let text: String?
+    public let item: ScopeItem?
+
+    public struct ScopeItem: Codable, Sendable {
+        public let slashCommand: SlashCommandRef?
+    }
+    public struct SlashCommandRef: Codable, Sendable {
+        public let info: Info
+        public struct Info: Codable, Sendable { public let name: String }
+    }
+
+    public static func text(_ value: String) -> SendItem { SendItem(text: value, item: nil) }
+    public static func slashCommand(_ name: String) -> SendItem {
+        SendItem(text: nil, item: ScopeItem(slashCommand: SlashCommandRef(info: .init(name: name))))
+    }
+}
+
+public struct PlannerResponsePayload: Codable, Sendable {
+    public let response: String?
+    public let thinking: String?
+}
+
+public struct ArtifactCommentPayload: Codable, Sendable {
+    public let artifactUri: String
+    public let fullFile: [String: String]
+    public let approvalStatus: Int
+    public let comment: String
+    
+    public init(artifactUri: String, approvalStatus: Int = 1, comment: String = "") {
+        self.artifactUri = artifactUri
+        self.fullFile = [:]
+        self.approvalStatus = approvalStatus
+        self.comment = comment
+    }
+}
+
+public struct InteractionOption: Codable, Sendable, Identifiable, Hashable {
+    public let id: String
+    public let text: String
+    public let scope: Int?
+    public let isDeny: Bool?
+    
+    public init(id: String, text: String, scope: Int? = nil, isDeny: Bool? = nil) {
+        self.id = id
+        self.text = text
+        self.scope = scope
+        self.isDeny = isDeny
+    }
+}
+
+public struct InteractionQuestion: Codable, Sendable, Identifiable, Hashable {
+    public var id: String { question }
+    public let question: String
+    public let isMultiSelect: Bool?
+    public let options: [InteractionOption]
+    public let defaultOptionId: String?
+    public let hasWriteIn: Bool?
+    public let writeInLabel: String?
+    public let writeInPlaceholder: String?
+    
+    public init(
+        question: String,
+        isMultiSelect: Bool? = nil,
+        options: [InteractionOption] = [],
+        defaultOptionId: String? = nil,
+        hasWriteIn: Bool? = nil,
+        writeInLabel: String? = nil,
+        writeInPlaceholder: String? = nil
+    ) {
+        self.question = question
+        self.isMultiSelect = isMultiSelect
+        self.options = options
+        self.defaultOptionId = defaultOptionId
+        self.hasWriteIn = hasWriteIn
+        self.writeInLabel = writeInLabel
+        self.writeInPlaceholder = writeInPlaceholder
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case question, isMultiSelect, options, defaultOptionId, hasWriteIn, writeInLabel, writeInPlaceholder
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.question = try container.decodeIfPresent(String.self, forKey: .question) ?? ""
+        self.isMultiSelect = try container.decodeIfPresent(Bool.self, forKey: .isMultiSelect)
+        self.options = try container.decodeIfPresent([InteractionOption].self, forKey: .options) ?? []
+        self.defaultOptionId = try container.decodeIfPresent(String.self, forKey: .defaultOptionId)
+        self.hasWriteIn = try container.decodeIfPresent(Bool.self, forKey: .hasWriteIn)
+        self.writeInLabel = try container.decodeIfPresent(String.self, forKey: .writeInLabel)
+        self.writeInPlaceholder = try container.decodeIfPresent(String.self, forKey: .writeInPlaceholder)
+    }
+}
+
+public struct QuestionResponse: Codable, Sendable, Hashable {
+    public let questionIndex: Int
+    public let selectedOptionIds: [String]
+    public let writeInResponse: String?
+    public let skipped: Bool?
+    
+    public init(
+        questionIndex: Int,
+        selectedOptionIds: [String] = [],
+        writeInResponse: String? = nil,
+        skipped: Bool? = nil
+    ) {
+        self.questionIndex = questionIndex
+        self.selectedOptionIds = selectedOptionIds
+        self.writeInResponse = writeInResponse
+        self.skipped = skipped
+    }
+}
+
+public struct PermissionGrantDetails: Codable, Sendable, Hashable {
+    public let protocolName: String
+    public let binary: String
+    public let action: String
+    public let org: String?
+    public let repo: String?
+    public let branch: String?
+    public let pr: String?
+    public let path: String?
+    public let ref: String?
+    public let rawScope: String?
+    
+    enum CodingKeys: String, CodingKey {
+        case protocolName = "protocol"
+        case binary, action, org, repo, branch, pr, path, ref, rawScope
+    }
+}
+
+public struct WorkflowApprovalDetails: Codable, Sendable, Hashable {
+    public let description: String?
+    public let script: String?
+    public let scriptPath: String?
+    public let estimatedPhases: [String]?
+    public let maxConcurrency: Int?
+    
+    public init(
+        description: String? = nil,
+        script: String? = nil,
+        scriptPath: String? = nil,
+        estimatedPhases: [String]? = nil,
+        maxConcurrency: Int? = nil
+    ) {
+        self.description = description
+        self.script = script
+        self.scriptPath = scriptPath
+        self.estimatedPhases = estimatedPhases
+        self.maxConcurrency = maxConcurrency
+    }
+}
+
+public struct PendingInteraction: Codable, Sendable, Identifiable, Hashable {
+    public var id: String { "\(trajectoryId):\(stepIndex)" }
+    public let type: String
+    public let trajectoryId: String
+    public let stepIndex: Int
+    public let title: String
+    public let target: String?
+    public let action: String?
+    public let description: String?
+    public let permissionGrant: PermissionGrantDetails?
+    public let workflowApproval: WorkflowApprovalDetails?
+    public let options: [InteractionOption]
+    public let isMultiSelect: Bool?
+    public let defaultOptionId: String?
+    public let hasWriteIn: Bool?
+    public let writeInLabel: String?
+    public let writeInPlaceholder: String?
+    public let questions: [InteractionQuestion]?
+    
+    public init(
+        type: String,
+        trajectoryId: String,
+        stepIndex: Int,
+        title: String,
+        target: String? = nil,
+        action: String? = nil,
+        description: String? = nil,
+        permissionGrant: PermissionGrantDetails? = nil,
+        workflowApproval: WorkflowApprovalDetails? = nil,
+        options: [InteractionOption] = [],
+        isMultiSelect: Bool? = nil,
+        defaultOptionId: String? = nil,
+        hasWriteIn: Bool? = nil,
+        writeInLabel: String? = nil,
+        writeInPlaceholder: String? = nil,
+        questions: [InteractionQuestion]? = nil
+    ) {
+        self.type = type
+        self.trajectoryId = trajectoryId
+        self.stepIndex = stepIndex
+        self.title = title
+        self.target = target
+        self.action = action
+        self.description = description
+        self.permissionGrant = permissionGrant
+        self.workflowApproval = workflowApproval
+        self.options = options
+        self.isMultiSelect = isMultiSelect
+        self.defaultOptionId = defaultOptionId
+        self.hasWriteIn = hasWriteIn
+        self.writeInLabel = writeInLabel
+        self.writeInPlaceholder = writeInPlaceholder
+        self.questions = questions
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case type, trajectoryId, stepIndex, title, target, action, description, permissionGrant, workflowApproval
+        case options, isMultiSelect, defaultOptionId, hasWriteIn, writeInLabel, writeInPlaceholder, questions
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = try container.decodeIfPresent(String.self, forKey: .type) ?? ""
+        self.trajectoryId = try container.decodeIfPresent(String.self, forKey: .trajectoryId) ?? ""
+        self.stepIndex = try container.decodeIfPresent(Int.self, forKey: .stepIndex) ?? 0
+        self.title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        self.target = try container.decodeIfPresent(String.self, forKey: .target)
+        self.action = try container.decodeIfPresent(String.self, forKey: .action)
+        self.description = try container.decodeIfPresent(String.self, forKey: .description)
+        self.permissionGrant = try container.decodeIfPresent(PermissionGrantDetails.self, forKey: .permissionGrant)
+        self.workflowApproval = try container.decodeIfPresent(WorkflowApprovalDetails.self, forKey: .workflowApproval)
+        self.options = try container.decodeIfPresent([InteractionOption].self, forKey: .options) ?? []
+        self.isMultiSelect = try container.decodeIfPresent(Bool.self, forKey: .isMultiSelect)
+        self.defaultOptionId = try container.decodeIfPresent(String.self, forKey: .defaultOptionId)
+        self.hasWriteIn = try container.decodeIfPresent(Bool.self, forKey: .hasWriteIn)
+        self.writeInLabel = try container.decodeIfPresent(String.self, forKey: .writeInLabel)
+        self.writeInPlaceholder = try container.decodeIfPresent(String.self, forKey: .writeInPlaceholder)
+        self.questions = try container.decodeIfPresent([InteractionQuestion].self, forKey: .questions)
+    }
+}
+
+public struct InteractionSubmitRequest: Codable, Sendable {
+    public let cascadeId: String
+    public let trajectoryId: String
+    public let stepIndex: Int
+    public let type: String
+    public let optionId: String?
+    public let scope: Int?
+    public let allow: Bool
+    public let writeInResponse: String?
+    public let skipped: Bool
+    public let target: String?
+    public let questionResponses: [QuestionResponse]?
+    
+    public init(
+        cascadeId: String,
+        trajectoryId: String,
+        stepIndex: Int,
+        type: String,
+        optionId: String? = nil,
+        scope: Int? = 1,
+        allow: Bool = true,
+        writeInResponse: String? = "",
+        skipped: Bool = false,
+        target: String? = nil,
+        questionResponses: [QuestionResponse]? = nil
+    ) {
+        self.cascadeId = cascadeId
+        self.trajectoryId = trajectoryId
+        self.stepIndex = stepIndex
+        self.type = type
+        self.optionId = optionId
+        self.scope = scope
+        self.allow = allow
+        self.writeInResponse = writeInResponse
+        self.skipped = skipped
+        self.target = target
+        self.questionResponses = questionResponses
+    }
+}
+
+public struct ImageDataPayload: Codable, Sendable {
+    public let base64Data: String
+    public let mimeType: String
+    
+    public init(base64Data: String, mimeType: String = "image/jpeg") {
+        self.base64Data = base64Data
+        self.mimeType = mimeType
+    }
+}
+
+public struct MediaDataPayload: Codable, Sendable {
+    public let inlineData: String
+    public let mimeType: String
+    
+    public init(inlineData: String, mimeType: String = "image/jpeg") {
+        self.inlineData = inlineData
+        self.mimeType = mimeType
+    }
+}
+
+// Request to send a message
+public struct SendUserCascadeMessageRequest: Codable, Sendable {
+    public let cascadeId: String
+    public let model: String?
+    public let items: [SendItem]
+    public let images: [ImageDataPayload]?
+    public let media: [MediaDataPayload]?
+    public let cascadeConfigRaw: String?
+    public let artifactComments: [ArtifactCommentPayload]?
+    public let deliveryStrategy: Int?
+    public let attachments: [AttachmentRef]?
+    public let contextItems: [ContextMentionItem]?
+    
+    public init(cascadeId: String, text: String, model: String? = nil, images: [ImageDataPayload]? = nil, media: [MediaDataPayload]? = nil, deliveryStrategy: Int? = nil, cascadeConfigRaw: String? = nil, attachments: [AttachmentRef]? = nil, slashCommand: String? = nil, contextItems: [ContextMentionItem]? = nil) {
+        self.cascadeId = cascadeId
+        self.model = model
+        if let slash = slashCommand, !slash.isEmpty {
+            // 命令条目在前；文本前补一个空格，让服务端生成的显示文本是 "/plan 内容"
+            self.items = [.slashCommand(slash)] + (text.isEmpty ? [] : [.text(" " + text)])
+        } else {
+            self.items = text.isEmpty ? [] : [.text(text)]
+        }
+        self.images = images
+        self.media = media
+        self.cascadeConfigRaw = cascadeConfigRaw
+        self.artifactComments = nil
+        self.deliveryStrategy = deliveryStrategy
+        self.attachments = attachments
+        self.contextItems = (contextItems?.isEmpty == false) ? contextItems : nil
+    }
+    
+    public init(cascadeId: String, items: [SendItem] = [], model: String? = nil, images: [ImageDataPayload]? = nil, media: [MediaDataPayload]? = nil, deliveryStrategy: Int? = nil, cascadeConfigRaw: String? = nil, artifactComments: [ArtifactCommentPayload]? = nil, contextItems: [ContextMentionItem]? = nil) {
+        self.cascadeId = cascadeId
+        self.model = model
+        self.items = items
+        self.images = images
+        self.media = media
+        self.cascadeConfigRaw = cascadeConfigRaw
+        self.artifactComments = artifactComments
+        self.deliveryStrategy = deliveryStrategy
+        self.attachments = nil
+        self.contextItems = (contextItems?.isEmpty == false) ? contextItems : nil
+    }
+}
+
+// Request to delete a queued agent message
+public struct DeleteAgentMessageRequest: Codable, Sendable {
+    public let messageId: String
+    public let recipient: String
+    
+    public init(messageId: String, recipient: String) {
+        self.messageId = messageId
+        self.recipient = recipient
+    }
+}
+
+// Request to cancel a task
+public struct CancelCascadeInvocationRequest: Codable, Sendable {
+    public let cascadeId: String
+    public let killBackgroundTasks: Bool?
+    
+    public init(cascadeId: String, killBackgroundTasks: Bool? = nil) {
+        self.cascadeId = cascadeId
+        self.killBackgroundTasks = killBackgroundTasks
+    }
+}
+
+public struct ArtifactItem: Hashable, Sendable, Codable {
+    public let uri: String
+    public let title: String
+    public let summary: String?
+    public let requestFeedback: Bool?
+    public let userFacing: Bool?
+    
+    public init(uri: String, title: String, summary: String? = nil, requestFeedback: Bool? = nil, userFacing: Bool? = nil) {
+        self.uri = uri
+        self.title = title
+        self.summary = summary
+        self.requestFeedback = requestFeedback
+        self.userFacing = userFacing
+    }
+}
+
+public struct WorkflowPhaseItem: Codable, Sendable, Hashable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let logs: [String]
+    public let subagents: [SubagentItem]
+    public let status: String
+    
+    public init(name: String, logs: [String] = [], subagents: [SubagentItem] = [], status: String = "done") {
+        self.name = name
+        self.logs = logs
+        self.subagents = subagents
+        self.status = status
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, logs, subagents, status
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        self.logs = try c.decodeIfPresent([String].self, forKey: .logs) ?? []
+        self.subagents = try c.decodeIfPresent([SubagentItem].self, forKey: .subagents) ?? []
+        self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? "done"
+    }
+}
+
+public struct WorkflowItem: Codable, Sendable, Hashable {
+    public let description: String?
+    public let scriptPath: String?
+    public let script: String?
+    public let phases: [WorkflowPhaseItem]
+    public let logs: [String]
+    public let output: String?
+    public let resultJson: String?
+    public let status: String
+    public let duration: String?
+    public let error: String?
+    
+    public init(
+        description: String? = nil,
+        scriptPath: String? = nil,
+        script: String? = nil,
+        phases: [WorkflowPhaseItem] = [],
+        logs: [String] = [],
+        output: String? = nil,
+        resultJson: String? = nil,
+        status: String = "done",
+        duration: String? = nil,
+        error: String? = nil
+    ) {
+        self.description = description
+        self.scriptPath = scriptPath
+        self.script = script
+        self.phases = phases
+        self.logs = logs
+        self.output = output
+        self.resultJson = resultJson
+        self.status = status
+        self.duration = duration
+        self.error = error
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case description, scriptPath, script, phases, logs, output, resultJson, status, duration, error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.description = try c.decodeIfPresent(String.self, forKey: .description)
+        self.scriptPath = try c.decodeIfPresent(String.self, forKey: .scriptPath)
+        self.script = try c.decodeIfPresent(String.self, forKey: .script)
+        self.phases = try c.decodeIfPresent([WorkflowPhaseItem].self, forKey: .phases) ?? []
+        self.logs = try c.decodeIfPresent([String].self, forKey: .logs) ?? []
+        self.output = try c.decodeIfPresent(String.self, forKey: .output)
+        self.resultJson = try c.decodeIfPresent(String.self, forKey: .resultJson)
+        self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? "done"
+        self.duration = try c.decodeIfPresent(String.self, forKey: .duration)
+        self.error = try c.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+public struct StepPlanItemEntry: Codable, Sendable, Hashable, Identifiable {
+    public var id: String { key.isEmpty ? title : key }
+    public let key: String
+    public let title: String
+    public let status: String // "pending" | "in_progress" | "done" | "skipped" | "failed"
+
+    public init(key: String = "", title: String, status: String = "pending") {
+        self.key = key.isEmpty ? title.lowercased() : key
+        self.title = title
+        self.status = status
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key, title, status
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        self.title = title
+        self.key = try c.decodeIfPresent(String.self, forKey: .key) ?? title.lowercased()
+        self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
+    }
+}
+
+public struct StepPlanItem: Codable, Sendable, Hashable {
+    public let anchorStepIndex: Int
+    public let items: [StepPlanItemEntry]
+    public let doneCount: Int
+    public let totalCount: Int
+    public let skippedCount: Int
+    public let failedCount: Int
+
+    public init(
+        anchorStepIndex: Int = 0,
+        items: [StepPlanItemEntry] = [],
+        doneCount: Int? = nil,
+        totalCount: Int? = nil,
+        skippedCount: Int? = nil,
+        failedCount: Int? = nil
+    ) {
+        self.anchorStepIndex = anchorStepIndex
+        self.items = items
+        let computedDone = items.filter { $0.status == "done" }.count
+        let computedSkipped = items.filter { $0.status == "skipped" }.count
+        let computedFailed = items.filter { $0.status == "failed" }.count
+        self.doneCount = doneCount ?? computedDone
+        self.skippedCount = skippedCount ?? computedSkipped
+        self.failedCount = failedCount ?? computedFailed
+        self.totalCount = totalCount ?? max(0, items.count - (skippedCount ?? computedSkipped))
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case anchorStepIndex, items, doneCount, totalCount, skippedCount, failedCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.anchorStepIndex = try c.decodeIfPresent(Int.self, forKey: .anchorStepIndex) ?? 0
+        let decodedItems = try c.decodeIfPresent([StepPlanItemEntry].self, forKey: .items) ?? []
+        self.items = decodedItems
+        let computedDone = decodedItems.filter { $0.status == "done" }.count
+        let computedSkipped = decodedItems.filter { $0.status == "skipped" }.count
+        let computedFailed = decodedItems.filter { $0.status == "failed" }.count
+        self.doneCount = try c.decodeIfPresent(Int.self, forKey: .doneCount) ?? computedDone
+        self.skippedCount = try c.decodeIfPresent(Int.self, forKey: .skippedCount) ?? computedSkipped
+        self.failedCount = try c.decodeIfPresent(Int.self, forKey: .failedCount) ?? computedFailed
+        self.totalCount = try c.decodeIfPresent(Int.self, forKey: .totalCount) ?? max(0, decodedItems.count - self.skippedCount)
+    }
+}
+
+// Clean model for SwiftUI chat view
+public struct ChatMessage: Identifiable, Hashable, Sendable, Codable {
+    public let id: String
+    public let sender: MessageSender
+    public let content: String
+    public let thinking: String?
+    public let toolCount: Int
+    public let toolNames: [String]
+    public let imageDataList: [Data]
+    public let imageUrls: [String]
+    public let artifacts: [ArtifactItem]
+    public let stepIndex: Int?
+    public let attemptCount: Int?
+    public let maxAttempts: Int?
+    /// 生成这条回复的模型 id 与展示名（仅 Agent 消息；未知时为 nil）。
+    public let model: String?
+    public let modelName: String?
+    /// sender == .subagent 时的子代理信息；卡片内联在「调用子代理」的位置。
+    public let subagent: SubagentItem?
+    /// sender == .workflow 时的动态工作流信息 (Antigravity 2.26+)。
+    public let workflow: WorkflowItem?
+    /// sender == .stepPlan 时的实时步骤清单卡片 (update_steps)。
+    public let stepPlan: StepPlanItem?
+    /// 工具组实时焦点摘要 (update_focus)。
+    public let focusText: String?
+    /// 工具组起始时间 (RFC3339，用于驱动实时计时器)。
+    public let startedAt: String?
+    /// 消息/步骤创建时间戳 (RFC3339)
+    public let timestamp: String?
+    /// 用户消息里引用的斜杠命令 / 技能（可选，兼容旧版缓存解码）
+    public let slashCommands: [SlashCommandMention]?
+    /// 客户端发送时生成的幂等标识（Antigravity 2.30+ 原生字段或网关 tags 还原）
+    public let clientMessageId: String?
+    public let errorKind: String?
+    public let isOverflow: Bool?
+    public let thinkingDuration: String?
+    public let toolDetails: [ToolDetailItem]?
+    
+    public enum MessageSender: Hashable, Sendable, Codable {
+        case user
+        case agent
+        case toolBatch(count: Int, tools: [String])
+        case error
+        case subagent
+        case workflow
+        case stepPlan
+        
+        private enum CodingKeys: String, CodingKey {
+            case type, count, tools
+        }
+        
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .user:
+                try container.encode("user", forKey: .type)
+            case .agent:
+                try container.encode("agent", forKey: .type)
+            case .toolBatch(let count, let tools):
+                try container.encode("toolBatch", forKey: .type)
+                try container.encode(count, forKey: .count)
+                try container.encode(tools, forKey: .tools)
+            case .error:
+                try container.encode("error", forKey: .type)
+            case .subagent:
+                try container.encode("subagent", forKey: .type)
+            case .workflow:
+                try container.encode("workflow", forKey: .type)
+            case .stepPlan:
+                try container.encode("stepPlan", forKey: .type)
+            }
+        }
+        
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let type = try container.decode(String.self, forKey: .type)
+            switch type {
+            case "agent":
+                self = .agent
+            case "error":
+                self = .error
+            case "subagent":
+                self = .subagent
+            case "workflow":
+                self = .workflow
+            case "stepPlan", "step_plan":
+                self = .stepPlan
+            case "toolBatch":
+                let count = try container.decodeIfPresent(Int.self, forKey: .count) ?? 1
+                let tools = try container.decodeIfPresent([String].self, forKey: .tools) ?? []
+                self = .toolBatch(count: count, tools: tools)
+            default:
+                self = .user
+            }
+        }
+    }
+    
+    public init(
+        id: String = UUID().uuidString,
+        sender: MessageSender,
+        content: String,
+        thinking: String? = nil,
+        toolCount: Int = 0,
+        toolNames: [String] = [],
+        imageDataList: [Data] = [],
+        imageUrls: [String] = [],
+        artifacts: [ArtifactItem] = [],
+        stepIndex: Int? = nil,
+        attemptCount: Int? = nil,
+        maxAttempts: Int? = nil,
+        model: String? = nil,
+        modelName: String? = nil,
+        subagent: SubagentItem? = nil,
+        workflow: WorkflowItem? = nil,
+        stepPlan: StepPlanItem? = nil,
+        focusText: String? = nil,
+        startedAt: String? = nil,
+        timestamp: String? = nil,
+        slashCommands: [SlashCommandMention]? = nil,
+        clientMessageId: String? = nil,
+        errorKind: String? = nil,
+        isOverflow: Bool? = nil,
+        thinkingDuration: String? = nil,
+        toolDetails: [ToolDetailItem]? = nil
+    ) {
+        self.model = model
+        self.modelName = modelName
+        self.subagent = subagent
+        self.workflow = workflow
+        self.stepPlan = stepPlan
+        self.focusText = focusText
+        self.startedAt = startedAt
+        self.timestamp = timestamp
+        self.slashCommands = slashCommands
+        self.clientMessageId = clientMessageId
+        self.errorKind = errorKind
+        self.isOverflow = isOverflow
+        self.thinkingDuration = thinkingDuration
+        self.toolDetails = toolDetails
+        self.id = id
+        self.sender = sender
+        self.content = content
+        self.thinking = thinking
+        self.toolCount = toolCount
+        self.toolNames = toolNames
+        self.imageDataList = imageDataList
+        self.imageUrls = imageUrls
+        self.artifacts = artifacts
+        self.attemptCount = attemptCount
+        self.maxAttempts = maxAttempts
+        if let stepIndex = stepIndex {
+            self.stepIndex = stepIndex
+        } else if id.hasPrefix("step-"), let val = Int(id.dropFirst(5)) {
+            self.stepIndex = val
+        } else {
+            self.stepIndex = nil
+        }
+    }
+    
+    public var effectiveStepIndex: Int? {
+        if let stepIndex = stepIndex { return stepIndex }
+        if id.hasPrefix("step-"), let val = Int(id.dropFirst(5)) { return val }
+        return nil
+    }
+    
+    public var isUser: Bool {
+        if case .user = sender { return true }
+        return false
+    }
+
+    public var isAgent: Bool {
+        if case .agent = sender { return true }
+        return false
+    }
+
+    public var isToolBatch: Bool {
+        if case .toolBatch = sender { return true }
+        return false
+    }
+
+    public var isError: Bool {
+        if case .error = sender { return true }
+        return false
+    }
+
+    public var isContextOverflow: Bool {
+        if isOverflow == true || errorKind == "context_overflow" { return true }
+        let lower = content.lowercased()
+        return lower.contains("context window") ||
+            lower.contains("context length") ||
+            lower.contains("prompt is too long")
+    }
+
+    public var isSubagent: Bool {
+        if case .subagent = sender { return true }
+        return false
+    }
+
+    public var isWorkflow: Bool {
+        if case .workflow = sender { return true }
+        return workflow != nil
+    }
+
+    public var isStepPlan: Bool {
+        if case .stepPlan = sender { return true }
+        return stepPlan != nil
+    }
+
+    public var localizedToolNames: [String] {
+        toolNames.map { ToolLocalization.localizedName(for: $0) }
+    }
+}
+
+// MARK: - Tool Localization
+
+public enum ToolLocalization {
+    public static func localizedName(for toolName: String?) -> String {
+        guard let raw = toolName?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return String(localized: "工具操作")
+        }
+
+        switch raw.lowercased() {
+        // 命令与任务
+        case "run_command": return String(localized: "运行终端命令")
+        case "manage_task": return String(localized: "管理后台任务")
+        case "schedule": return String(localized: "定时调度")
+        case "shell_command", "command": return String(localized: "运行命令")
+
+        // 文件与代码
+        case "view_file": return String(localized: "查看文件")
+        case "write_to_file", "write_file": return String(localized: "写入文件")
+        case "replace_file_content": return String(localized: "编辑文件")
+        case "edit_file": return String(localized: "编辑文件")
+        case "create_file": return String(localized: "创建文件")
+        case "delete_file": return String(localized: "删除文件")
+        case "read_file": return String(localized: "读取文件")
+        case "list_dir", "list_directory": return String(localized: "浏览目录")
+        case "search_code", "grep_search": return String(localized: "搜索代码")
+        case "file_search", "find_by_name": return String(localized: "搜索文件")
+
+        // 网络与搜索
+        case "search_web": return String(localized: "搜索网络")
+        case "read_url_content": return String(localized: "读取网页")
+
+        // 子代理与协作
+        case "invoke_subagent": return String(localized: "调用子代理")
+        case "define_subagent": return String(localized: "定义子代理")
+        case "manage_subagents": return String(localized: "管理子代理")
+        case "send_message": return String(localized: "发送消息")
+        case "browser_subagent": return String(localized: "浏览器代理")
+        case "run_workflow": return String(localized: "运行工作流")
+        case "swarm": return String(localized: "蜂群协同")
+        case "post_message": return String(localized: "发布公告")
+        case "read_board": return String(localized: "查看公告板")
+        case "swarm_wait": return String(localized: "等待协作")
+        case "checkpoint": return String(localized: "检查点")
+
+        // 人机交互与生成
+        case "ask_question": return String(localized: "询问用户")
+        case "generate_image": return String(localized: "生成图片")
+
+        // MCP 协议工具
+        case "call_mcp_tool": return String(localized: "调用 MCP 工具")
+        case "list_resources": return String(localized: "列出 MCP 资源")
+        case "read_resource": return String(localized: "读取 MCP 资源")
+
+        // 通用兜底
+        case "thinking": return String(localized: "思考中")
+        case "tool_call": return String(localized: "工具操作")
+        case "action": return String(localized: "操作")
+
+        default:
+            if raw.hasPrefix("mcp_") {
+                let stripped = String(raw.dropFirst(4))
+                return "MCP: \(stripped)"
+            }
+            return raw
+        }
+    }
+}
+
+
+// MARK: - Revert / Undo Models
+
+public struct RevertDiffLine: Codable, Sendable, Hashable {
+    public let text: String
+    public let type: String // "INSERT", "DELETE", "UNCHANGED"
+    
+    public init(text: String, type: String) {
+        self.text = text
+        self.type = type
+    }
+}
+
+public struct RevertPreviewFile: Codable, Sendable, Identifiable, Hashable {
+    public var id: String { fileUri }
+    public let fileUri: String
+    public let fileName: String
+    public let actionType: String // "MODIFY", "CREATE", "DELETE"
+    public let additions: Int
+    public let deletions: Int
+    public let diffLines: [RevertDiffLine]
+    
+    public init(fileUri: String, fileName: String, actionType: String, additions: Int, deletions: Int, diffLines: [RevertDiffLine]) {
+        self.fileUri = fileUri
+        self.fileName = fileName
+        self.actionType = actionType
+        self.additions = additions
+        self.deletions = deletions
+        self.diffLines = diffLines
+    }
+}
+
+public struct RevertPreviewResponse: Codable, Sendable {
+    public let cascadeId: String
+    public let stepIndex: Int
+    public let targetStepIndex: Int
+    public let files: [RevertPreviewFile]
+    public let hasCodeChanges: Bool
+    
+    public init(cascadeId: String, stepIndex: Int, targetStepIndex: Int, files: [RevertPreviewFile], hasCodeChanges: Bool) {
+        self.cascadeId = cascadeId
+        self.stepIndex = stepIndex
+        self.targetStepIndex = targetStepIndex
+        self.files = files
+        self.hasCodeChanges = hasCodeChanges
+    }
+}
+
+public struct RevertPreviewRequest: Codable, Sendable {
+    public let cascadeId: String
+    public let stepIndex: Int
+    
+    public init(cascadeId: String, stepIndex: Int) {
+        self.cascadeId = cascadeId
+        self.stepIndex = stepIndex
+    }
+}
+
+public struct RevertExecuteRequest: Codable, Sendable {
+    public let cascadeId: String
+    public let stepIndex: Int
+    public let conversationOnly: Bool
+    
+    public init(cascadeId: String, stepIndex: Int, conversationOnly: Bool = false) {
+        self.cascadeId = cascadeId
+        self.stepIndex = stepIndex
+        self.conversationOnly = conversationOnly
+    }
+}

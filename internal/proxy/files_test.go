@@ -1,0 +1,703 @@
+package proxy
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestResolveLocalFilePath(t *testing.T) {
+	home, _ := os.UserHomeDir()
+
+	// 1. Static artifact path
+	p, err := ResolveLocalFilePath("/static/artifacts/test-casc-1/plan.md", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := filepath.Join(home, ".gemini/antigravity/brain/test-casc-1/plan.md")
+	if p != expected {
+		t.Errorf("expected %s, got %s", expected, p)
+	}
+
+	// 2. file:// protocol
+	p, err = ResolveLocalFilePath("file://"+expected, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p != expected {
+		t.Errorf("expected %s, got %s", expected, p)
+	}
+
+	// 3. Bare filename with cascadeID
+	p, err = ResolveLocalFilePath("implementation_plan.md", "my-casc-42")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected = filepath.Join(home, ".gemini/antigravity/brain/my-casc-42/implementation_plan.md")
+	if p != expected {
+		t.Errorf("expected %s, got %s", expected, p)
+	}
+}
+
+func TestIsSafeFilePath(t *testing.T) {
+	resetWorkspaceRootsForTest()
+	t.Cleanup(resetWorkspaceRootsForTest)
+	home, _ := os.UserHomeDir()
+
+	if IsSafeFilePath(filepath.Join(home, ".ssh/id_rsa")) {
+		t.Errorf("expected sensitive ssh key to be rejected")
+	}
+
+	if IsSafeFilePath("/etc/passwd") {
+		t.Errorf("expected /etc/passwd to be rejected")
+	}
+
+	if !IsSafeFilePath(filepath.Join(home, ".gemini/antigravity/brain/abc/plan.md")) {
+		t.Errorf("expected artifact file to be safe")
+	}
+
+	if !IsSafeFilePath(filepath.Join(home, "Downloads/sample.png")) {
+		t.Errorf("expected Downloads files to be safe by default")
+	}
+
+	if IsSafeFilePath(filepath.Join(home, "Downloads/.env")) {
+		t.Errorf("expected Downloads .env to be blocked")
+	}
+
+	if !IsSafeFilePath(filepath.Join(home, ".agents/skills/xueqiu-radar/data/discovered_cubes_full.json")) {
+		t.Errorf("expected .agents skill output to be safe")
+	}
+	if !IsSafeFilePath(filepath.Join(home, "Websites/Persia-Live/report.pdf")) {
+		t.Errorf("expected home project documents to be safe")
+	}
+	if !IsSafeFilePath(filepath.Join(home, "Desktop/客户清单.xlsx")) {
+		t.Errorf("expected Desktop documents to be safe")
+	}
+	if !IsSafeFilePath(filepath.Join(home, "Projects/demo/deck.key")) {
+		t.Errorf("expected Keynote .key under Projects to be safe")
+	}
+	if IsSafeFilePath(filepath.Join(home, "Library/Application Support/Antigravity/User/globalStorage/storage.json")) {
+		t.Errorf("expected Application Support to be blocked")
+	}
+	if !IsSafeFilePath(filepath.Join(home, ".gemini/config/skills/my-skill/SKILL.md")) {
+		t.Errorf("expected .gemini/config skill file to be safe")
+	}
+	if !IsSafeFilePath(filepath.Join(home, "Projects/demo/readme.md")) {
+		t.Errorf("expected Projects files to be safe")
+	}
+
+	// M-2: Check server.key, domain.key, and acme.sh
+	if IsSafeFilePath(filepath.Join(home, "Projects/demo/server.key")) {
+		t.Errorf("expected server.key to be rejected")
+	}
+	if IsSafeFilePath(filepath.Join(home, "Projects/demo/domain.key")) {
+		t.Errorf("expected domain.key to be rejected")
+	}
+	if IsSafeFilePath(filepath.Join(home, "Projects/demo/tls.key")) {
+		t.Errorf("expected tls.key to be rejected")
+	}
+	if IsSafeFilePath(filepath.Join(home, ".acme.sh/example.com/fullchain.cer")) {
+		t.Errorf("expected .acme.sh directory to be rejected")
+	}
+
+	// Verify sensitive auth files are blocked even in allowed dirs
+	if IsSafeFilePath(filepath.Join(home, ".gemini/oauth_creds.json")) {
+		t.Errorf("expected oauth_creds.json to be blocked")
+	}
+	if IsSafeFilePath(filepath.Join(home, ".gemini/jetski-standalone-oauth-token")) {
+		t.Errorf("expected jetski-standalone-oauth-token to be blocked")
+	}
+	if IsSafeFilePath(filepath.Join(home, ".antigravity-mobile/auth_store.json")) {
+		t.Errorf("expected auth_store.json to be blocked")
+	}
+	if IsSafeFilePath(filepath.Join(home, ".multigravity/auth_store.json")) {
+		t.Errorf("expected .multigravity/auth_store.json to be blocked")
+	}
+}
+
+func TestResolveLocalFilePathUnsafePathsRejected(t *testing.T) {
+	resetWorkspaceRootsForTest()
+	t.Cleanup(resetWorkspaceRootsForTest)
+	home, _ := os.UserHomeDir()
+
+	// M-1: ResolveLocalFilePath must reject /etc/passwd and ~/.ssh/id_rsa directly
+	if _, err := ResolveLocalFilePath("/etc/passwd", ""); err == nil {
+		t.Errorf("expected error resolving /etc/passwd")
+	}
+	if _, err := ResolveLocalFilePath(filepath.Join(home, ".ssh/id_rsa"), ""); err == nil {
+		t.Errorf("expected error resolving ~/.ssh/id_rsa")
+	}
+	if _, err := ResolveLocalFilePath(filepath.Join(home, ".antigravity-mobile/auth_store.json"), ""); err == nil {
+		t.Errorf("expected error resolving auth_store.json")
+	}
+	if _, err := ResolveLocalFilePath(filepath.Join(home, ".multigravity/auth_store.json"), ""); err == nil {
+		t.Errorf("expected error resolving .multigravity/auth_store.json")
+	}
+}
+
+func TestPrivateKeyHeaderDetection(t *testing.T) {
+	// Create a temporary .key file containing private key banner
+	tmpDir := t.TempDir()
+	keyFile := filepath.Join(tmpDir, "presentation.key")
+	if err := os.WriteFile(keyFile, []byte("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n"), 0600); err != nil {
+		t.Fatalf("failed to write dummy key file: %v", err)
+	}
+
+	f, err := os.Open(keyFile)
+	if err != nil {
+		t.Fatalf("failed to open dummy key file: %v", err)
+	}
+	defer f.Close()
+
+	if !isPrivateKeyFileHeader(f) {
+		t.Errorf("expected isPrivateKeyFileHeader to detect PEM private key banner")
+	}
+
+	// Normal text / binary should not trigger
+	normFile := filepath.Join(tmpDir, "normal.key")
+	if err := os.WriteFile(normFile, []byte("Keynote dummy slide data"), 0600); err != nil {
+		t.Fatalf("failed to write dummy file: %v", err)
+	}
+	fNorm, err := os.Open(normFile)
+	if err != nil {
+		t.Fatalf("failed to open dummy file: %v", err)
+	}
+	defer fNorm.Close()
+
+	if isPrivateKeyFileHeader(fNorm) {
+		t.Errorf("expected isPrivateKeyFileHeader to be false for non-key data")
+	}
+}
+
+func TestGetFileContentAndHandler(t *testing.T) {
+	// Create temporary test artifact within the whitelisted brain directory
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	brainBase := filepath.Join(home, ".gemini", "antigravity", "brain")
+	if err := os.MkdirAll(brainBase, 0755); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir, err := os.MkdirTemp(brainBase, "antigravity-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	testMD := filepath.Join(tmpDir, "implementation_plan.md")
+	testMeta := filepath.Join(tmpDir, "implementation_plan.md.metadata.json")
+
+	if err := os.WriteFile(testMD, []byte("# Test Plan\nHello world"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	metaData := `{"summary":"Test Plan Summary","requestFeedback":true,"userFacing":true}`
+	if err := os.WriteFile(testMeta, []byte(metaData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test GetFileContent
+	res, err := GetFileContent(testMD, "")
+	if err != nil {
+		t.Fatalf("GetFileContent failed: %v", err)
+	}
+	if res.Filename != "implementation_plan.md" {
+		t.Errorf("expected filename implementation_plan.md, got %s", res.Filename)
+	}
+	if res.Summary != "Test Plan Summary" {
+		t.Errorf("expected summary 'Test Plan Summary', got %s", res.Summary)
+	}
+	if !res.RequestFeedback {
+		t.Errorf("expected RequestFeedback true")
+	}
+
+	// Test HTTP Handler
+	proxy := &Proxy{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/content?uri="+testMD, nil)
+	rr := httptest.NewRecorder()
+	proxy.HandleFileContent(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var jsonRes FileContentResult
+	if err := json.Unmarshal(rr.Body.Bytes(), &jsonRes); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if jsonRes.Content != "# Test Plan\nHello world" {
+		t.Errorf("expected content match, got %s", jsonRes.Content)
+	}
+
+	// Test HandleFileRaw
+	rawReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+testMD, nil)
+	rawRR := httptest.NewRecorder()
+	proxy.HandleFileRaw(rawRR, rawReq)
+
+	if rawRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 for raw file, got %d: %s", rawRR.Code, rawRR.Body.String())
+	}
+	if !strings.Contains(rawRR.Header().Get("Content-Disposition"), "implementation_plan.md") {
+		t.Errorf("expected Content-Disposition header with filename, got: %s", rawRR.Header().Get("Content-Disposition"))
+	}
+	if rawRR.Header().Get("Cache-Control") != "private, max-age=604800, must-revalidate" {
+		t.Errorf("expected Cache-Control header, got: %s", rawRR.Header().Get("Cache-Control"))
+	}
+	etag := rawRR.Header().Get("ETag")
+	if etag == "" {
+		t.Errorf("expected non-empty ETag header")
+	}
+	if rawRR.Body.String() != "# Test Plan\nHello world" {
+		t.Errorf("expected raw body '# Test Plan\\nHello world', got %s", rawRR.Body.String())
+	}
+
+	// Test 304 Not Modified with If-None-Match
+	req304 := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+testMD, nil)
+	req304.Header.Set("If-None-Match", etag)
+	rr304 := httptest.NewRecorder()
+	proxy.HandleFileRaw(rr304, req304)
+	if rr304.Code != http.StatusNotModified {
+		t.Errorf("expected 304 Not Modified, got: %d", rr304.Code)
+	}
+}
+
+func TestHandleFileRawChineseFilename(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use ~/Projects/ which is in the whitelist
+	projectsBase := filepath.Join(home, "Projects")
+	if err := os.MkdirAll(projectsBase, 0755); err != nil {
+		t.Fatal(err)
+	}
+	tempDir, err := os.MkdirTemp(projectsBase, "antigravity-filetest-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+	chineseFileName := "五矿证券转训课件测试.pptx"
+	filePath := filepath.Join(tempDir, chineseFileName)
+	content := []byte("PK\x03\x04test_zip_content")
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	proxy := &Proxy{}
+	// Test with percent-encoded URI
+	uri := "file://" + filepath.ToSlash(filepath.Join(tempDir, "五矿证券转训课件测试.pptx"))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+uri, nil)
+	rr := httptest.NewRecorder()
+	proxy.HandleFileRaw(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	disp := rr.Header().Get("Content-Disposition")
+	if !strings.Contains(disp, "filename*=UTF-8''") {
+		t.Errorf("expected RFC 5987 UTF-8 Content-Disposition header, got: %s", disp)
+	}
+	if rr.Body.String() != string(content) {
+		t.Errorf("expected body to match written content")
+	}
+}
+
+func TestIsSafeFilePath_SymlinkAndSensitiveFiles(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Check direct sensitive files rejection
+	sensitiveFiles := []string{
+		filepath.Join(home, ".bash_history"),
+		filepath.Join(home, ".zsh_history"),
+		filepath.Join(home, ".git-credentials"),
+		filepath.Join(home, ".netrc"),
+		filepath.Join(home, ".docker", "config.json"),
+		filepath.Join(home, ".config", "gcloud", "credentials.db"),
+		filepath.Join(home, ".ssh", "id_ed25519"),
+		"/etc/passwd",
+		"/etc/shadow",
+	}
+
+	for _, sf := range sensitiveFiles {
+		if IsSafeFilePath(sf) {
+			t.Errorf("expected sensitive file to be rejected: %s", sf)
+		}
+	}
+
+	// 2. Test Symlink escape attempt from inside whitelisted dir
+	projectsBase := filepath.Join(home, "Projects")
+	if err := os.MkdirAll(projectsBase, 0755); err == nil {
+		tempDir, err := os.MkdirTemp(projectsBase, "symlink-test-*")
+		if err == nil {
+			defer os.RemoveAll(tempDir)
+			targetFile := "/etc/hosts"
+			linkPath := filepath.Join(tempDir, "evil_symlink_hosts")
+			if os.Symlink(targetFile, linkPath) == nil {
+				if IsSafeFilePath(linkPath) {
+					t.Errorf("expected symlink pointing outside whitelist to be rejected: %s -> %s", linkPath, targetFile)
+				}
+			}
+		}
+	}
+}
+
+func TestJoinUnderRejectsDotDot(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	root := filepath.Join(home, ".gemini", "antigravity", "brain")
+	if _, err := joinUnder(root, "../../../.ssh/id_rsa"); err == nil {
+		t.Fatalf("expected joinUnder to reject .. escape")
+	}
+}
+
+func TestAllowedWorkspaceRootsEnv(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", filepath.Join(home, "Downloads"))
+	resetWorkspaceRootsForTest()
+	t.Cleanup(resetWorkspaceRootsForTest)
+
+	if !IsSafeFilePath(filepath.Join(home, "Downloads/sample.png")) {
+		t.Errorf("expected Downloads to be allowed when listed in ALLOWED_WORKSPACE_ROOTS")
+	}
+	if IsSafeFilePath(filepath.Join(home, "Movies/secret.mov")) {
+		t.Errorf("expected Movies to remain blocked")
+	}
+}
+
+func TestHandleFileRaw_JSONAndLog(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectsBase := filepath.Join(home, "Projects")
+	tempDir, err := os.MkdirTemp(projectsBase, "antigravity-jsonlogtest-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// 1. Test JSON file
+	jsonFile := filepath.Join(tempDir, "discovered_cubes_full.json")
+	jsonContent := `[{"symbol":"ZH123","name":"Test Cube"}]`
+	if err := os.WriteFile(jsonFile, []byte(jsonContent), 0644); err != nil {
+		t.Fatalf("failed to write json: %v", err)
+	}
+
+	proxy := &Proxy{}
+	uriJSON := "file://" + filepath.ToSlash(jsonFile)
+	reqJSON := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+uriJSON, nil)
+	rrJSON := httptest.NewRecorder()
+	proxy.HandleFileRaw(rrJSON, reqJSON)
+
+	if rrJSON.Code != http.StatusOK {
+		t.Fatalf("expected 200 for json download, got %d: %s", rrJSON.Code, rrJSON.Body.String())
+	}
+	if ct := rrJSON.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("expected application/json, got: %s", ct)
+	}
+	disp := rrJSON.Header().Get("Content-Disposition")
+	if !strings.Contains(disp, `filename="discovered_cubes_full.json"`) {
+		t.Errorf("expected filename in Content-Disposition, got: %s", disp)
+	}
+
+	// 2. Test Log file
+	logFile := filepath.Join(tempDir, "scanner.log")
+	logContent := "2026-09-15 00:00:01 INFO: scan progress 92%"
+	if err := os.WriteFile(logFile, []byte(logContent), 0644); err != nil {
+		t.Fatalf("failed to write log: %v", err)
+	}
+
+	uriLog := "file://" + filepath.ToSlash(logFile)
+	reqLog := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+uriLog, nil)
+	rrLog := httptest.NewRecorder()
+	proxy.HandleFileRaw(rrLog, reqLog)
+
+	if rrLog.Code != http.StatusOK {
+		t.Fatalf("expected 200 for log download, got %d: %s", rrLog.Code, rrLog.Body.String())
+	}
+	if ct := rrLog.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Errorf("expected text/plain, got: %s", ct)
+	}
+}
+
+func TestIsSafeFilePath_CaseInsensitiveSensitiveDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, p := range []string{".aws/credentials", ".AWS/credentials", ".SSH/config", "Library/Application Support/x", "library/application support/x"} {
+		if IsSafeFilePath(filepath.Join(home, p)) {
+			t.Errorf("%s must be restricted", p)
+		}
+	}
+}
+
+func TestIsSafeFilePath_MoreCredentialStores(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetWorkspaceRootsForTest()
+	t.Cleanup(resetWorkspaceRootsForTest)
+	for _, p := range []string{".config/gh/hosts.yml", ".zshrc", ".pgpass", ".vault-token", ".azure/accessTokens.json", ".cargo/credentials.toml", ".mozilla/firefox/x/logins.json"} {
+		if IsSafeFilePath(filepath.Join(home, p)) {
+			t.Errorf("%s must be restricted", p)
+		}
+	}
+	if !IsSafeFilePath(filepath.Join(home, "Desktop", "report.pdf")) {
+		t.Error("ordinary Desktop file must stay readable")
+	}
+}
+
+func TestGetFileContent_RejectsBinaryFiles(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	brainBase := filepath.Join(home, ".gemini", "antigravity", "brain")
+	if err := os.MkdirAll(brainBase, 0755); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir, err := os.MkdirTemp(brainBase, "antigravity-bin-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	jpgFile := filepath.Join(tmpDir, "sample.jpg")
+	// Write dummy JPEG magic bytes
+	if err := os.WriteFile(jpgFile, []byte("\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. GetFileContent must reject .jpg
+	_, err = GetFileContent(jpgFile, "")
+	if err == nil {
+		t.Fatalf("expected GetFileContent to reject binary .jpg file, got nil error")
+	}
+	if !strings.Contains(err.Error(), "binary file") {
+		t.Errorf("expected error mentioning binary file, got: %v", err)
+	}
+
+	// 2. HandleFileContent HTTP handler must return 404/error instead of 200
+	proxy := &Proxy{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/content?uri="+jpgFile, nil)
+	rr := httptest.NewRecorder()
+	proxy.HandleFileContent(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("expected HTTP error for binary file content request, got 200: %s", rr.Body.String())
+	}
+
+	// 3. HandleFileRaw must still succeed and stream the image
+	rawReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+jpgFile, nil)
+	rawRR := httptest.NewRecorder()
+	proxy.HandleFileRaw(rawRR, rawReq)
+	if rawRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 for HandleFileRaw on .jpg, got %d", rawRR.Code)
+	}
+	if ct := rawRR.Header().Get("Content-Type"); ct != "image/jpeg" {
+		t.Errorf("expected Content-Type image/jpeg, got: %s", ct)
+	}
+}
+
+func TestIsSafeFilePath_CockpitAndToolCredentialsAndXmlSandbox(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	resetWorkspaceRootsForTest()
+	t.Cleanup(resetWorkspaceRootsForTest)
+
+	blocked := []string{
+		".antigravity_cockpit/secure-account-storage.key",
+		".cockpit-tools/accounts.json",
+		".hal9000/cf_tunnel.json",
+		".claude/credentials.json",
+		".codex/auth.json",
+		".cursor/state.vscdb",
+		".gemini/antigravity/mcp_config.json",
+		".gemini/settings.json",
+		".gemini/config/config.json",
+		".gitconfig",
+		"Library/Cookies/Cookies.binarycookies",
+		"Library/Safari/History.db",
+		"Library/Messages/chat.db",
+		"Desktop/release.keystore",
+		"Desktop/admin_token",
+		"Desktop/private.key",
+	}
+	for _, rel := range blocked {
+		if IsSafeFilePath(filepath.Join(home, rel)) {
+			t.Errorf("expected %s to be blocked by IsSafeFilePath", rel)
+		}
+	}
+
+	// Ordinary presentation .key file without sensitive keywords must remain allowed.
+	if !IsSafeFilePath(filepath.Join(home, "Desktop", "deck.key")) {
+		t.Error("expected ordinary presentation Desktop/deck.key to remain allowed")
+	}
+
+	// Verify HandleFileRaw forces attachment + sandbox CSP on .xml files (SEC-04).
+	desktopDir := filepath.Join(home, "Desktop")
+	if err := os.MkdirAll(desktopDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	xmlFile := filepath.Join(desktopDir, "payload.xml")
+	if err := os.WriteFile(xmlFile, []byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Proxy{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+xmlFile, nil)
+	rr := httptest.NewRecorder()
+	p.HandleFileRaw(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for HandleFileRaw on .xml, got %d", rr.Code)
+	}
+	if cd := rr.Header().Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment") {
+		t.Errorf("expected Content-Disposition attachment for .xml, got %q", cd)
+	}
+	if csp := rr.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "sandbox") {
+		t.Errorf("expected Content-Security-Policy containing 'sandbox' for .xml, got %q", csp)
+	}
+}
+
+func TestTempDirReadableFilesAndWorkspaceConfinement(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", "")
+	t.Setenv("MULTIGRAVITY_ALLOWED_WORKSPACE_ROOTS", "")
+	resetWorkspaceRootsForTest()
+	t.Cleanup(resetWorkspaceRootsForTest)
+
+	// Prepare temp directories to test: os.TempDir() (via t.TempDir()) and /tmp on Unix.
+	tmpDirs := []string{t.TempDir()}
+	if runtime.GOOS != "windows" {
+		slashTmpDir, err := os.MkdirTemp("/tmp", "mgy-tmp-readable-*")
+		if err != nil {
+			t.Fatalf("failed to create dir in /tmp: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(slashTmpDir) })
+		tmpDirs = append(tmpDirs, slashTmpDir)
+	}
+
+	p := &Proxy{}
+	videoBytes := []byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+
+	for _, dir := range tmpDirs {
+		mp4Path := filepath.Join(dir, "minimax_h3_preview.mp4")
+		if err := os.WriteFile(mp4Path, videoBytes, 0o644); err != nil {
+			t.Fatalf("failed to write temp mp4: %v", err)
+		}
+
+		// Temp dirs remain outside workspace roots (validateWorkspaceDir / IsSafeFilePath must reject them).
+		if IsSafeFilePath(mp4Path) {
+			t.Errorf("expected temp file %s to remain outside workspace roots", mp4Path)
+		}
+		if _, err := validateWorkspaceDir(dir, true); err == nil {
+			t.Errorf("expected validateWorkspaceDir to reject temp dir %s", dir)
+		}
+
+		// Read-only file preview/download must allow regular non-sensitive files in temp dirs.
+		if !IsSafeReadableFilePath(mp4Path) {
+			t.Fatalf("expected temp video %s to be readable", mp4Path)
+		}
+
+		for _, rawURI := range []string{mp4Path, "file://" + filepath.ToSlash(mp4Path)} {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+url.QueryEscape(rawURI), nil)
+			rr := httptest.NewRecorder()
+			p.HandleFileRaw(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200 downloading %s, got %d: %s", rawURI, rr.Code, rr.Body.String())
+			}
+			if ct := rr.Header().Get("Content-Type"); ct != "video/mp4" {
+				t.Errorf("expected Content-Type video/mp4 for %s, got %q", rawURI, ct)
+			}
+			if rr.Body.String() != string(videoBytes) {
+				t.Errorf("downloaded bytes mismatch for %s", rawURI)
+			}
+		}
+
+		// Verify HTTP Range requests work cleanly for video streaming.
+		rangeReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+url.QueryEscape(mp4Path), nil)
+		rangeReq.Header.Set("Range", "bytes=4-11")
+		rangeRR := httptest.NewRecorder()
+		p.HandleFileRaw(rangeRR, rangeReq)
+		if rangeRR.Code != http.StatusPartialContent {
+			t.Fatalf("expected 206 Partial Content for range request on %s, got %d", mp4Path, rangeRR.Code)
+		}
+		if rangeRR.Body.String() != "ftypmp42" {
+			t.Errorf("expected range body ftypmp42, got %q", rangeRR.Body.String())
+		}
+
+		// Text content preview should also work for non-sensitive files in temp dir.
+		txtPath := filepath.Join(dir, "notes.txt")
+		if err := os.WriteFile(txtPath, []byte("verify ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := GetFileContent(txtPath, "")
+		if err != nil {
+			t.Fatalf("expected GetFileContent to allow temp text file %s: %v", txtPath, err)
+		}
+		if res.Content != "verify ok" {
+			t.Errorf("unexpected GetFileContent body: %q", res.Content)
+		}
+
+		// Sensitive filenames inside temp dir must still be rejected.
+		for _, badName := range []string{".env", "server.key", "id_rsa", "secrets.json", "cert.pem"} {
+			badPath := filepath.Join(dir, badName)
+			if err := os.WriteFile(badPath, []byte("secret"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if IsSafeReadableFilePath(badPath) {
+				t.Errorf("expected sensitive temp file %s to be rejected", badPath)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+url.QueryEscape(badPath), nil)
+			rr := httptest.NewRecorder()
+			p.HandleFileRaw(rr, req)
+			if rr.Code != http.StatusForbidden {
+				t.Errorf("expected 403 for sensitive temp file %s, got %d", badPath, rr.Code)
+			}
+		}
+
+		// Symlink inside temp dir pointing outside allowed roots must be rejected.
+		if runtime.GOOS != "windows" {
+			linkPath := filepath.Join(dir, "escape.mp4")
+			if err := os.Symlink("/etc/hosts", linkPath); err == nil {
+				if IsSafeReadableFilePath(linkPath) {
+					t.Errorf("expected temp symlink %s -> /etc/hosts to be rejected", linkPath)
+				}
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+url.QueryEscape(linkPath), nil)
+				rr := httptest.NewRecorder()
+				p.HandleFileRaw(rr, req)
+				if rr.Code != http.StatusForbidden {
+					t.Errorf("expected 403 for temp symlink escape %s, got %d", linkPath, rr.Code)
+				}
+			}
+		}
+	}
+
+	// Explicit ALLOWED_WORKSPACE_ROOTS must override default temp dir access.
+	downloadsDir := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", downloadsDir)
+	resetWorkspaceRootsForTest()
+
+	mp4InTmp := filepath.Join(tmpDirs[0], "minimax_h3_preview.mp4")
+	if IsSafeReadableFilePath(mp4InTmp) {
+		t.Errorf("expected temp file %s to be blocked when ALLOWED_WORKSPACE_ROOTS is explicitly set", mp4InTmp)
+	}
+	reqBlocked := httptest.NewRequest(http.MethodGet, "/api/v1/files/raw?uri="+url.QueryEscape(mp4InTmp), nil)
+	rrBlocked := httptest.NewRecorder()
+	p.HandleFileRaw(rrBlocked, reqBlocked)
+	if rrBlocked.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when ALLOWED_WORKSPACE_ROOTS excludes temp dir, got %d", rrBlocked.Code)
+	}
+}

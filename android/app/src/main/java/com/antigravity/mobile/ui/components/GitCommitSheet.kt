@@ -1,0 +1,571 @@
+package com.antigravity.mobile.ui.components
+
+import com.antigravity.mobile.ui.util.loc
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.antigravity.mobile.data.model.GitBranchesResponse
+import com.antigravity.mobile.data.model.GitFileStatus
+import com.antigravity.mobile.data.model.GitPullRequestItem
+import com.antigravity.mobile.data.model.GitStatusResponse
+import com.antigravity.mobile.data.service.ApiClient
+import com.antigravity.mobile.data.service.gitCheckoutBranch
+import com.antigravity.mobile.data.service.gitDiscardFile
+import com.antigravity.mobile.data.service.gitListBranches
+import com.antigravity.mobile.ui.theme.AntigravityTheme
+import com.antigravity.mobile.ui.viewmodel.GitSheetState
+import kotlinx.coroutines.launch
+
+/** 默认提交信息：只列文件名，让用户在此基础上改写；真正有语义的信息交给用户或 Agent。 */
+internal fun suggestCommitMessage(files: List<GitFileStatus>): String {
+    if (files.isEmpty()) return ""
+    val names = files.map { it.path.substringAfterLast('/') }
+    return if (names.size <= 3) "update ${names.joinToString(", ")}" else "update ${names.size} files"
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GitCommitSheet(
+    state: GitSheetState,
+    cascadeId: String = "",
+    onRefreshGit: (() -> Unit)? = null,
+    onCommit: (message: String, paths: List<String>, push: Boolean) -> Unit,
+    onRetryPush: () -> Unit,
+    onDelegateToAgent: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val colors = AntigravityTheme.colors
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val status = state.status
+    val scope = rememberCoroutineScope()
+    var showBranchDialog by remember { mutableStateOf(false) }
+    var branchesResp by remember { mutableStateOf<GitBranchesResponse?>(null) }
+    var newBranchInput by remember { mutableStateOf("") }
+    var discardTargetPath by remember { mutableStateOf<String?>(null) }
+
+    // 以文件路径为键保存勾选；状态刷新后保留仍存在的勾选，新增文件默认勾选。
+    var unchecked by remember { mutableStateOf(setOf<String>()) }
+    var message by remember { mutableStateOf("") }
+    var messageEdited by remember { mutableStateOf(false) }
+
+    val selectedPaths = status?.files?.map { it.path }?.filter { it !in unchecked }.orEmpty()
+    LaunchedEffect(status?.files, unchecked) {
+        if (!messageEdited && status != null) {
+            message = suggestCommitMessage(status.files.filter { it.path !in unchecked })
+        }
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        sheetMaxWidth = Dp.Unspecified,
+        containerColor = Color.Transparent,
+        shape = RectangleShape,
+        tonalElevation = 0.dp,
+        dragHandle = null,
+        contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
+        modifier = modifier
+            .fillMaxWidth()
+            .fillMaxHeight()
+    ) {
+        TallSheetBody(containerColor = colors.surface, onDismiss = onDismiss) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight()
+            ) {
+                // Floating grab handle hinting pull-down dismissal (matching iOS Capsule 38x5 / NewConversationSheet)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp, bottom = 18.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(width = 38.dp, height = 5.dp)
+                            .clip(CircleShape)
+                            .background(colors.textMuted.copy(alpha = 0.35f))
+                    )
+                }
+
+                // Header title: Centered, no icon, aligned with NewConversationSheet
+                Text(
+                    text = "提交改动".loc,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = colors.textPrimary,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp)
+                )
+
+                HorizontalDivider(thickness = 0.5.dp, color = colors.border)
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .navigationBarsPadding()
+                        .imePadding()
+                        .padding(horizontal = 20.dp)
+                        .padding(top = 14.dp, bottom = 24.dp)
+                ) {
+
+            val result = state.result
+            when {
+                state.isLoading && status == null -> LoadingRow("正在读取 Git 状态...".loc)
+                state.error != null && status == null -> {
+                    NoticeRow(state.error, isError = true)
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = onDelegateToAgent,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) { Text("改为让 Agent 提交".loc) }
+                }
+                result != null && result.committed -> CommitDone(result.commitId, result.pushed, result.pushError, state, onRetryPush, onDismiss)
+                status != null -> {
+                    BranchHeader(
+                        status = status,
+                        onOpenBranches = if (cascadeId.isNotBlank()) {
+                            {
+                                showBranchDialog = true
+                                scope.launch {
+                                    ApiClient.defaultInstance?.gitListBranches(cascadeId)?.onSuccess {
+                                        branchesResp = it
+                                    }
+                                }
+                            }
+                        } else null
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    if (status.pullRequests.isNotEmpty()) {
+                        PullRequestsSection(status.pullRequests)
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    if (status.clean) {
+                        NoticeRow("工作区没有可提交的改动".loc, isError = false)
+                        if (status.ahead > 0 && status.upstream != null) {
+                            Spacer(Modifier.height(12.dp))
+                            Button(
+                                onClick = onRetryPush,
+                                enabled = !state.isWorking,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp)
+                            ) { Text(if (state.isWorking) "推送中...".loc else "推送 ${status.ahead} 个未推送的提交".loc) }
+                        }
+                        state.actionError?.let { Spacer(Modifier.height(8.dp)); NoticeRow(it, isError = true) }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            items(status.files, key = { it.path }) { f ->
+                                GitFileRow(
+                                    file = f,
+                                    checked = f.path !in unchecked,
+                                    onToggle = { unchecked = if (f.path in unchecked) unchecked - f.path else unchecked + f.path },
+                                    onDiscard = if (cascadeId.isNotBlank()) { { discardTargetPath = f.path } } else null
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        // 主操作：让 Agent 提交，居中显示在变更文件区下方
+                        Button(
+                            onClick = onDelegateToAgent,
+                            enabled = !state.isWorking,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
+                        ) { Text("让 Agent 提交".loc, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = message,
+                            onValueChange = { message = it; messageEdited = true },
+                            label = { Text("提交信息".loc) },
+                            minLines = 2,
+                            maxLines = 5,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        state.actionError?.let { Spacer(Modifier.height(8.dp)); NoticeRow(it, isError = true) }
+                        Spacer(Modifier.height(12.dp))
+                        val canCommit = !state.isWorking && message.isNotBlank() && selectedPaths.isNotEmpty()
+                        // 全选时传空列表 = 提交全部（含之后新出现的），部分选择时才传明确路径
+                        val pathsArg = if (selectedPaths.size == status.files.size) emptyList() else selectedPaths
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            OutlinedButton(
+                                onClick = { onCommit(message, pathsArg, false) },
+                                enabled = canCommit,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp)
+                            ) { Text("提交".loc) }
+                            FilledTonalButton(
+                                onClick = { onCommit(message, pathsArg, true) },
+                                enabled = canCommit,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp)
+                            ) { Text(if (state.isWorking) "处理中...".loc else "提交并推送".loc) }
+                        }
+                    }
+                }
+            }
+                }
+            }
+        }
+    }
+
+    if (showBranchDialog && status != null && cascadeId.isNotBlank()) {
+        AlertDialog(
+            onDismissRequest = { showBranchDialog = false },
+            title = { Text("切换 / 新建分支".loc, fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val list = branchesResp?.branches.orEmpty()
+                    if (list.isEmpty()) {
+                        Text("正在加载分支...".loc, fontSize = 13.sp, color = colors.textMuted)
+                    } else {
+                        Column(
+                            modifier = Modifier.heightIn(max = 220.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            list.forEach { b ->
+                                val isCurrent = b == status.branch
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(if (isCurrent) colors.accentIndigo.copy(alpha = 0.14f) else Color.Transparent)
+                                        .clickable(enabled = !isCurrent) {
+                                            showBranchDialog = false
+                                            scope.launch {
+                                                ApiClient.defaultInstance?.gitCheckoutBranch(cascadeId, b, create = false)
+                                                onRefreshGit?.invoke()
+                                            }
+                                        }
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        b,
+                                        fontSize = 13.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = if (isCurrent) colors.accentIndigo else colors.textPrimary,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (isCurrent) {
+                                        Text("当前".loc, fontSize = 11.sp, color = colors.accentIndigo)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = newBranchInput,
+                        onValueChange = { newBranchInput = it },
+                        label = { Text("新建分支名".loc) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = newBranchInput.isNotBlank(),
+                    onClick = {
+                        val b = newBranchInput.trim()
+                        showBranchDialog = false
+                        newBranchInput = ""
+                        scope.launch {
+                            ApiClient.defaultInstance?.gitCheckoutBranch(cascadeId, b, create = true)
+                            onRefreshGit?.invoke()
+                        }
+                    }
+                ) { Text("新建并切换".loc) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBranchDialog = false }) { Text("关闭".loc) }
+            }
+        )
+    }
+
+    discardTargetPath?.let { path ->
+        AlertDialog(
+            onDismissRequest = { discardTargetPath = null },
+            title = { Text("丢弃文件改动？".loc, fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+            text = { Text("确定丢弃 $path 的工作区改动？未跟踪文件也会被清理，此操作不可撤销。".loc, fontSize = 13.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val target = path
+                    discardTargetPath = null
+                    scope.launch {
+                        ApiClient.defaultInstance?.gitDiscardFile(cascadeId, target)
+                        onRefreshGit?.invoke()
+                    }
+                }) { Text("丢弃".loc, color = Color(0xFFF44336)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { discardTargetPath = null }) { Text("取消".loc) }
+            }
+        )
+    }
+}
+
+@Composable
+private fun BranchHeader(status: GitStatusResponse, onOpenBranches: (() -> Unit)? = null) {
+    val colors = AntigravityTheme.colors
+    val repoLabel = status.githubTarget?.takeIf { it.owner.isNotBlank() && it.repo.isNotBlank() }
+        ?.let { "${it.owner}/${it.repo}" }
+        ?: status.repoName
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(repoLabel, fontSize = 13.sp, color = colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .background(colors.accentIndigo.copy(alpha = 0.14f))
+                .then(if (onOpenBranches != null) Modifier.clickable(onClick = onOpenBranches) else Modifier)
+                .padding(horizontal = 8.dp, vertical = 2.dp)
+        ) {
+            Text(
+                text = if (onOpenBranches != null) "${status.branch} ▾" else status.branch,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                color = colors.accentIndigo,
+                maxLines = 1
+            )
+        }
+        if (status.ahead > 0) Text("↑${status.ahead}", fontSize = 12.sp, color = colors.textSecondary, fontFamily = FontFamily.Monospace)
+        if (status.behind > 0) Text("↓${status.behind}", fontSize = 12.sp, color = colors.accentOrange, fontFamily = FontFamily.Monospace)
+        if (status.upstream == null && !status.detached) Text("未设置上游".loc, fontSize = 11.sp, color = colors.textMuted)
+    }
+}
+
+@Composable
+private fun PullRequestsSection(prs: List<GitPullRequestItem>) {
+    val colors = AntigravityTheme.colors
+    val uriHandler = LocalUriHandler.current
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = "GitHub Pull Requests",
+            fontSize = 11.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = colors.textMuted
+        )
+        prs.forEach { pr ->
+            val stateUpper = pr.state.uppercase()
+            val stateColor = when (stateUpper) {
+                "MERGED" -> colors.accentBlue
+                "DRAFT" -> colors.textSecondary
+                "CLOSED" -> Color(0xFFEF5350)
+                else -> Color(0xFF4CAF50)
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(colors.surfaceVariant.copy(alpha = 0.7f))
+                    .border(0.5.dp, colors.border.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                    .clickable(enabled = pr.url.isNotBlank()) {
+                        runCatching { uriHandler.openUri(pr.url) }
+                    }
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(stateColor.copy(alpha = 0.16f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = stateUpper,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        color = stateColor
+                    )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (pr.number > 0) {
+                            Text(
+                                text = "#${pr.number}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = FontFamily.Monospace,
+                                color = colors.textSecondary
+                            )
+                        }
+                        Text(
+                            text = pr.title,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = colors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (!pr.headRefName.isNullOrBlank() && !pr.baseRefName.isNullOrBlank()) {
+                        Text(
+                            text = "${pr.headRefName} → ${pr.baseRefName}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = colors.textMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                if (pr.url.isNotBlank()) {
+                    Icon(
+                        imageVector = Icons.Default.OpenInNew,
+                        contentDescription = "Open PR",
+                        tint = colors.textMuted,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GitFileRow(
+    file: GitFileStatus,
+    checked: Boolean,
+    onToggle: () -> Unit,
+    onDiscard: (() -> Unit)? = null
+) {
+    val colors = AntigravityTheme.colors
+    val (label, tint) = when (file.status) {
+        "ADDED" -> "A" to Color(0xFF4CAF50)
+        "UNTRACKED" -> "U" to Color(0xFF4CAF50)
+        "DELETED" -> "D" to Color(0xFFF44336)
+        "RENAMED" -> "R" to Color(0xFF2196F3)
+        "CONFLICT" -> "!" to Color(0xFFF44336)
+        else -> "M" to Color(0xFFFF9800)
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onToggle)
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Checkbox(checked = checked, onCheckedChange = { onToggle() })
+        Text(label, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, color = tint, modifier = Modifier.width(18.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(file.path.substringAfterLast('/'), fontSize = 13.5.sp, color = colors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val dir = file.path.substringBeforeLast('/', "")
+            if (dir.isNotEmpty()) Text(dir, fontSize = 11.sp, color = colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis, fontFamily = FontFamily.Monospace)
+        }
+        if (onDiscard != null) {
+            TextButton(
+                onClick = onDiscard,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+            ) {
+                Text("丢弃".loc, fontSize = 11.5.sp, color = Color(0xFFF44336))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.CommitDone(
+    commitId: String?,
+    pushed: Boolean,
+    pushError: String?,
+    state: GitSheetState,
+    onRetryPush: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val colors = AntigravityTheme.colors
+    NoticeRow(
+        buildString {
+            append("已提交".loc)
+            if (!commitId.isNullOrBlank()) append(" $commitId")
+            if (pushed) append("，已推送".loc)
+        },
+        isError = false
+    )
+    val err = pushError ?: state.actionError
+    if (err != null) {
+        Spacer(Modifier.height(8.dp))
+        NoticeRow("推送失败：$err".loc, isError = true)
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = onRetryPush, enabled = !state.isWorking, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+            Text(if (state.isWorking) "推送中...".loc else "重试推送".loc)
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+    TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+        Text("完成".loc, color = colors.accentIndigo)
+    }
+}
+
+@Composable
+private fun LoadingRow(text: String) {
+    val colors = AntigravityTheme.colors
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = colors.accentIndigo)
+        Spacer(Modifier.width(10.dp))
+        Text(text, fontSize = 13.sp, color = colors.textMuted)
+    }
+}
+
+@Composable
+private fun NoticeRow(text: String, isError: Boolean) {
+    val colors = AntigravityTheme.colors
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(colors.surfaceVariant)
+            .border(0.5.dp, colors.border, RoundedCornerShape(10.dp))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Icon(
+            imageVector = if (isError) Icons.Default.ErrorOutline else Icons.Default.CheckCircle,
+            contentDescription = null,
+            tint = if (isError) colors.accentOrange else Color(0xFF4CAF50),
+            modifier = Modifier.size(18.dp)
+        )
+        Text(text, fontSize = 13.sp, color = colors.textSecondary)
+    }
+}

@@ -1,0 +1,952 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// CancelCascadeStep invokes Antigravity LanguageServer's CancelCascadeSteps RPC to terminate a specific background step.
+func (p *Proxy) CancelCascadeStep(cascadeID string, stepIndex int, port int, token string) error {
+	if port == 0 {
+		return fmt.Errorf("no active Antigravity upstream")
+	}
+
+	buf := GetSmallBuffer()
+	defer PutSmallBuffer(buf)
+	buf.WriteString(`{"cascadeId":`)
+	buf.WriteString(strconv.Quote(cascadeID))
+	buf.WriteString(`,"stepIndices":[`)
+	buf.WriteString(strconv.Itoa(stepIndex))
+	buf.WriteString(`]}`)
+
+	url := fmt.Sprintf("https://127.0.0.1:%d/exa.language_server_pb.LanguageServerService/CancelCascadeSteps", port)
+	req, err := http.NewRequest(http.MethodPost, url, buf)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	if token != "" {
+		req.Header.Set("x-codeium-csrf-token", token)
+	}
+
+	resp, err := p.mediumClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("CancelCascadeSteps returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
+func (p *Proxy) fetchUpstreamTrajectory(cascadeID string, port int, token string) (*upstreamTrajectoryResp, error) {
+	return p.fetchUpstreamTrajectoryWithContext(context.Background(), cascadeID, port, token)
+}
+
+func (p *Proxy) fetchUpstreamTrajectoryWithContext(ctx context.Context, cascadeID string, port int, token string) (*upstreamTrajectoryResp, error) {
+	if IsDeletedCascade(cascadeID) {
+		return nil, fmt.Errorf("cascade trajectory %s has been deleted", cascadeID)
+	}
+
+	tc := defaultTrajCache
+	// Status-aware TTL: completed sessions rarely change, so cache them longer.
+	// But if title is missing or session has few/no steps, keep TTL short (1.5s)
+	// so newly generated titles/summaries are quickly discovered.
+	maxAge := 800 * time.Millisecond
+	tc.trajCacheMu.RLock()
+	if cached, ok := tc.trajCache[cascadeID]; ok && cached.port == port {
+		if cached.data.Status != "" && cached.data.Status != "CASCADE_RUN_STATUS_RUNNING" {
+			hasTitle := (cached.data.Trajectory.Annotations != nil && cached.data.Trajectory.Annotations.Title != "") ||
+				cached.data.Trajectory.Summary != ""
+			if hasTitle && len(cached.data.Trajectory.Steps) > 0 {
+				maxAge = 60 * time.Second
+			} else {
+				maxAge = 5 * time.Second
+			}
+		}
+	}
+	tc.trajCacheMu.RUnlock()
+
+	resp, err := p.fetchUpstreamTrajectoryWithMaxAgeContext(ctx, cascadeID, port, token, maxAge)
+	// Fallback: If not found or empty steps, try loading from disk via LoadTrajectory and retry once
+	if (err != nil || (resp != nil && len(resp.Trajectory.Steps) == 0)) && port > 0 {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if loadErr := p.LoadTrajectory(cascadeID, port, token); loadErr == nil {
+			tc.trajCacheMu.Lock()
+			delete(tc.trajCache, cascadeID)
+			tc.trajCacheMu.Unlock()
+			trajFlights.forget(cascadeID)
+			if retryResp, retryErr := p.fetchUpstreamTrajectoryWithMaxAgeContext(ctx, cascadeID, port, token, 0); retryErr == nil && retryResp != nil {
+				return retryResp, nil
+			}
+		}
+	}
+	return resp, err
+}
+
+func (p *Proxy) lookupCascadeTitle(cascadeID string, port int, token string) string {
+	if cascadeID == "" {
+		return ""
+	}
+
+	defaultTrajCache.cascadeTitlesMu.RLock()
+	cachedTitle, ok := defaultTrajCache.cascadeTitles[cascadeID]
+	isFallback := defaultTrajCache.cascadeTitleFallback[cascadeID]
+	defaultTrajCache.cascadeTitlesMu.RUnlock()
+
+	if ok && !isFallback && cachedTitle != "" && cachedTitle != "未命名会话" {
+		return cachedTitle
+	}
+
+	if t := readAnnotationTitle(cascadeID); t != "" && t != "未命名会话" {
+		setCachedCascadeTitle(cascadeID, t)
+		return t
+	}
+
+	if port > 0 {
+		defaultTrajCache.cascadeTitlesMu.RLock()
+		lastFetch := defaultTrajCache.lastTitlesFetchTime
+		defaultTrajCache.cascadeTitlesMu.RUnlock()
+
+		// Rate limit: do not re-scan all trajectories if checked within the last 5 seconds
+		if time.Since(lastFetch) >= 5*time.Second {
+			summaries, err := p.fetchTrajectoriesSummaryWithTitles(port, token)
+			defaultTrajCache.cascadeTitlesMu.Lock()
+			defaultTrajCache.lastTitlesFetchTime = time.Now()
+			if err == nil && len(summaries) > 0 {
+				if defaultTrajCache.cascadeTitleFallback == nil {
+					defaultTrajCache.cascadeTitleFallback = make(map[string]bool)
+				}
+				if len(defaultTrajCache.cascadeTitles) > maxMetadataMapSize {
+					count := 0
+					for k := range defaultTrajCache.cascadeTitles {
+						delete(defaultTrajCache.cascadeTitles, k)
+						delete(defaultTrajCache.cascadeTitleFallback, k)
+						count++
+						if count >= maxMetadataMapSize/2 {
+							break
+						}
+					}
+				}
+				for cid, t := range summaries {
+					if t != "" && t != "未命名会话" {
+						defaultTrajCache.cascadeTitles[cid] = t
+						delete(defaultTrajCache.cascadeTitleFallback, cid)
+					}
+				}
+				newTitle := defaultTrajCache.cascadeTitles[cascadeID]
+				newIsFallback := defaultTrajCache.cascadeTitleFallback[cascadeID]
+				defaultTrajCache.cascadeTitlesMu.Unlock()
+				if !newIsFallback && newTitle != "" && newTitle != "未命名会话" {
+					return newTitle
+				}
+			} else {
+				defaultTrajCache.cascadeTitlesMu.Unlock()
+			}
+		}
+	}
+
+	// Fallback to cached trajectory first user prompt (never overwrites an authoritative title).
+	defaultTrajCache.trajCacheMu.RLock()
+	entry, hasEntry := defaultTrajCache.trajCache[cascadeID]
+	defaultTrajCache.trajCacheMu.RUnlock()
+	if hasEntry && entry != nil && entry.data != nil {
+		for _, s := range entry.data.Trajectory.Steps {
+			if s.Type == "CORTEX_STEP_TYPE_USER_INPUT" {
+				if t := extractTitleFromUserInput(s); t != "" && t != "未命名会话" {
+					setCachedCascadeTitleFallback(cascadeID, t)
+					return t
+				}
+			}
+		}
+	}
+
+	if ok && cachedTitle != "" && cachedTitle != "未命名会话" {
+		return cachedTitle
+	}
+	return ""
+}
+
+// LoadTrajectory asks upstream language_server to load a historical cascade into memory.
+func (p *Proxy) LoadTrajectory(cascadeID string, port int, token string) error {
+	if cascadeID == "" || port == 0 {
+		return fmt.Errorf("invalid cascadeId or port")
+	}
+
+	url := fmt.Sprintf("https://127.0.0.1:%d/exa.language_server_pb.LanguageServerService/LoadTrajectory", port)
+	payload, _ := json.Marshal(map[string]string{"cascadeId": cascadeID})
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	if token != "" {
+		req.Header.Set("x-codeium-csrf-token", token)
+	}
+
+	client := p.shortClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upstream LoadTrajectory returned %d: %s", resp.StatusCode, string(b))
+	}
+
+	return nil
+}
+
+// SyncHistoricalTrajectories scans ~/.gemini/antigravity/conversations for historical session DBs
+// and loads valid sessions into upstream language_server memory so GetAllCascadeTrajectories returns them.
+func (p *Proxy) SyncHistoricalTrajectories(port int, token string) error {
+	if port == 0 {
+		return fmt.Errorf("upstream port not set")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	convDir := filepath.Join(home, ".gemini", "antigravity", "conversations")
+	entries, err := os.ReadDir(convDir)
+	if err != nil {
+		return err
+	}
+
+	var candidates []string
+	defaultTrajCache.loadedCascadesMu.Lock()
+	if port != defaultTrajCache.lastSyncedPort {
+		defaultTrajCache.loadedCascades = make(map[string]bool)
+		defaultTrajCache.lastSyncedPort = port
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		cascadeID := strings.TrimSuffix(name, ".db")
+		if defaultTrajCache.loadedCascades[cascadeID] || IsDeletedCascade(cascadeID) {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		if info.Size() == 0 {
+			continue
+		}
+
+		// Empty session schemas are exactly 48KB (49152 bytes) with 0 steps.
+		// If older than 15 minutes and <= 49152 bytes, skip loading old empty drafts.
+		if info.Size() <= 49152 && time.Since(info.ModTime()) > 15*time.Minute {
+			defaultTrajCache.loadedCascades[cascadeID] = true
+			continue
+		}
+
+		candidates = append(candidates, cascadeID)
+	}
+	defaultTrajCache.loadedCascadesMu.Unlock()
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	if verboseRPC {
+		slog.Info(fmt.Sprintf("[Proxy] Syncing %d historical trajectories into upstream language_server...", len(candidates)))
+	}
+
+	concurrency := 2
+	if concurrency > len(candidates) {
+		concurrency = len(candidates)
+	}
+
+	workCh := make(chan string, len(candidates))
+	for _, cid := range candidates {
+		workCh <- cid
+	}
+	close(workCh)
+
+	// Collect successful loads via a buffered channel to batch-write under a single lock.
+	successCh := make(chan string, len(candidates))
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for cid := range workCh {
+				err := p.LoadTrajectory(cid, port, token)
+				if err == nil {
+					successCh <- cid
+				} else if verboseRPC {
+					slog.Warn(fmt.Sprintf("[Proxy] Failed to load historical trajectory %s", cid), "err", err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(successCh)
+
+	// Batch-write all successes under a single lock acquisition instead of per-item locking.
+	defaultTrajCache.loadedCascadesMu.Lock()
+	for cid := range successCh {
+		defaultTrajCache.loadedCascades[cid] = true
+	}
+	defaultTrajCache.loadedCascadesMu.Unlock()
+
+	if verboseRPC {
+		slog.Info("[Proxy] Finished syncing historical trajectories")
+	}
+	return nil
+}
+
+func (p *Proxy) fetchTrajectoriesSummaryWithTitles(port int, token string) (map[string]string, error) {
+	raw, err := p.fetchAllTrajectoriesRaw(context.Background(), port, token)
+	if err != nil {
+		return nil, err
+	}
+
+	var data struct {
+		TrajectorySummaries map[string]struct {
+			Summary     string `json:"summary"`
+			Annotations *struct {
+				Title string `json:"title"`
+			} `json:"annotations"`
+		} `json:"trajectorySummaries"`
+	}
+
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]string)
+	for id, sum := range data.TrajectorySummaries {
+		t := ""
+		if sum.Annotations != nil && sum.Annotations.Title != "" {
+			t = sum.Annotations.Title
+		} else if sum.Summary != "" {
+			t = sum.Summary
+		}
+		if t != "" {
+			result[id] = t
+		}
+	}
+	return result, nil
+}
+
+func (p *Proxy) fetchUpstreamTrajectoryWithMaxAge(cascadeID string, port int, token string, maxAge time.Duration) (*upstreamTrajectoryResp, error) {
+	return p.fetchUpstreamTrajectoryWithMaxAgeContext(context.Background(), cascadeID, port, token, maxAge)
+}
+
+func (p *Proxy) fetchUpstreamTrajectoryWithMaxAgeContext(ctx context.Context, cascadeID string, port int, token string, maxAge time.Duration) (*upstreamTrajectoryResp, error) {
+	if IsDeletedCascade(cascadeID) {
+		return nil, fmt.Errorf("cascade trajectory %s has been deleted", cascadeID)
+	}
+
+	defaultTrajCache.trajCacheMu.RLock()
+	if cached, ok := defaultTrajCache.trajCache[cascadeID]; ok && cached.port == port {
+		if time.Since(cached.fetchedAt) < maxAge {
+			defaultTrajCache.trajCacheMu.RUnlock()
+			return cached.data, nil
+		}
+	}
+	defaultTrajCache.trajCacheMu.RUnlock()
+
+	// Coalesce concurrent cache misses for the same cascade into one upstream request,
+	// using a detached 10s upstream context so a short-deadline caller (e.g. 500ms probe)
+	// cannot cancel a shared in-flight fetch for stream subscribers.
+	return trajFlights.doCtx(ctx, cascadeID, func(upCtx context.Context) (*upstreamTrajectoryResp, error) {
+		return p.fetchUpstreamTrajectoryUncached(upCtx, cascadeID, port, token)
+	})
+}
+
+// trajFlightGroup is a minimal singleflight keyed by cascade ID.
+type trajFlightGroup struct {
+	mu    sync.Mutex
+	calls map[string]*trajFlightCall
+}
+
+type trajFlightCall struct {
+	done chan struct{}
+	data *upstreamTrajectoryResp
+	err  error
+}
+
+var trajFlights = &trajFlightGroup{calls: make(map[string]*trajFlightCall)}
+
+// forget detaches any in-flight call for key so later callers start a fresh upstream request.
+// Callers already waiting on the old call still receive its result.
+func (g *trajFlightGroup) forget(key string) {
+	g.mu.Lock()
+	delete(g.calls, key)
+	g.mu.Unlock()
+}
+
+func (g *trajFlightGroup) do(key string, fn func() (*upstreamTrajectoryResp, error)) (*upstreamTrajectoryResp, error) {
+	return g.doCtx(context.Background(), key, func(context.Context) (*upstreamTrajectoryResp, error) {
+		return fn()
+	})
+}
+
+func (g *trajFlightGroup) doCtx(ctx context.Context, key string, fn func(context.Context) (*upstreamTrajectoryResp, error)) (*upstreamTrajectoryResp, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	g.mu.Lock()
+	c, ok := g.calls[key]
+	if !ok {
+		c = &trajFlightCall{done: make(chan struct{})}
+		g.calls[key] = c
+		go func() {
+			upCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer func() {
+				cancel()
+				g.mu.Lock()
+				if g.calls[key] == c {
+					delete(g.calls, key)
+				}
+				g.mu.Unlock()
+				close(c.done)
+			}()
+			c.data, c.err = fn(upCtx)
+		}()
+	}
+	g.mu.Unlock()
+
+	if ctx == nil {
+		<-c.done
+		return c.data, c.err
+	}
+	select {
+	case <-c.done:
+		return c.data, c.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *Proxy) fetchUpstreamTrajectoryUncached(ctx context.Context, cascadeID string, port int, token string) (*upstreamTrajectoryResp, error) {
+	defaultTrajCache.trajCacheMu.RLock()
+	gen := defaultTrajCache.cascadeGenLocked(cascadeID)
+	defaultTrajCache.trajCacheMu.RUnlock()
+
+	buf := GetSmallBuffer()
+	defer PutSmallBuffer(buf)
+	buf.WriteString(`{"cascadeId":`)
+	buf.WriteString(strconv.Quote(cascadeID))
+	buf.WriteString(`}`)
+	url := fmt.Sprintf("https://127.0.0.1:%d/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory", port)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	if token != "" {
+		req.Header.Set("x-codeium-csrf-token", token)
+	}
+
+	resp, err := p.mediumClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, string(b))
+	}
+
+	var reader io.Reader = resp.Body
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gzReader, err := GetGzipReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("gzip reader failed: %w", err)
+		}
+		defer PutGzipReader(gzReader)
+		reader = gzReader
+	}
+
+	const maxRawCacheBytes = 8 * 1024 * 1024
+	const maxUpstreamTrajectoryBytes = 64 * 1024 * 1024
+	rawBuf := GetHugeBuffer()
+	defer PutHugeBuffer(rawBuf)
+	if _, err := rawBuf.ReadFrom(io.LimitReader(reader, maxUpstreamTrajectoryBytes)); err != nil {
+		return nil, fmt.Errorf("failed to read upstream response: %w", err)
+	}
+
+	var data upstreamTrajectoryResp
+	if err := json.Unmarshal(rawBuf.Bytes(), &data); err != nil {
+		return nil, fmt.Errorf("failed to decode upstream response: %w", err)
+	}
+	var preservedRaw []byte
+	if rawBuf.Len() > 0 && rawBuf.Len() <= maxRawCacheBytes {
+		preservedRaw = make([]byte, rawBuf.Len())
+		copy(preservedRaw, rawBuf.Bytes())
+	}
+	compactTrajectoryMedia(&data)
+
+	defaultTrajCache.trajCacheMu.Lock()
+	if defaultTrajCache.cascadeGenLocked(cascadeID) == gen {
+		defaultTrajCache.trajCache[cascadeID] = &trajectoryCacheEntry{
+			fetchedAt: time.Now(),
+			port:      port,
+			data:      &data,
+			rawJSON:   preservedRaw,
+		}
+		defaultTrajCache.evictTrajCacheLocked()
+	}
+	defaultTrajCache.trajCacheMu.Unlock()
+
+	return &data, nil
+}
+
+// ParseTrajectoryDetailsCached returns a shallow copy of cached TrajectoryDetails if rawResp
+// matches the cached trajectory entry, avoiding redundant regex/JSON scans across concurrent
+// WebSocket stream subscribers, HTTP message polls, and the background Watcher.
+func (p *Proxy) ParseTrajectoryDetailsCached(rawResp *upstreamTrajectoryResp) TrajectoryDetails {
+	if rawResp == nil {
+		return TrajectoryDetails{}
+	}
+	cid := rawResp.Trajectory.CascadeID
+	sig := rawTrajectorySignature(rawResp)
+	if cid != "" && sig != "" {
+		defaultTrajCache.trajCacheMu.RLock()
+		if cached, ok := defaultTrajCache.trajCache[cid]; ok && cached.data == rawResp && cached.parsed != nil && cached.parsedSig == sig {
+			cp := *cached.parsed
+			defaultTrajCache.trajCacheMu.RUnlock()
+			return cp
+		}
+		defaultTrajCache.trajCacheMu.RUnlock()
+	}
+
+	details := p.ParseTrajectoryDetails(rawResp)
+	if cid != "" && sig != "" {
+		stored := details
+		defaultTrajCache.trajCacheMu.Lock()
+		if cached, ok := defaultTrajCache.trajCache[cid]; ok && cached.data == rawResp {
+			cached.parsedSig = sig
+			cached.parsed = &stored
+		}
+		defaultTrajCache.trajCacheMu.Unlock()
+	}
+	return details
+}
+
+// FetchTrajectoryDetails fetches and parses full trajectory details for a cascade.
+func (p *Proxy) FetchTrajectoryDetails(cascadeID string, maxAge time.Duration) (*TrajectoryDetails, error) {
+	port, token := p.ActiveUpstream()
+	if port == 0 {
+		return nil, fmt.Errorf("antigravity upstream not connected")
+	}
+	rawResp, err := p.fetchUpstreamTrajectoryWithMaxAge(cascadeID, port, token, maxAge)
+	if err != nil {
+		return nil, err
+	}
+	details := p.ParseTrajectoryDetailsCached(rawResp)
+	if details.Title == "" || details.Title == "未命名会话" {
+		if t := p.lookupCascadeTitle(cascadeID, port, token); t != "" {
+			details.Title = t
+		}
+	}
+	return &details, nil
+}
+
+// FetchRawCascadeSummaries queries upstream GetAllCascadeTrajectories and returns non-subagent summaries
+// along with a map of parent conversation IDs that currently have active running subagents.
+func (p *Proxy) FetchRawCascadeSummaries() (map[string]map[string]interface{}, map[string]bool, error) {
+	return p.FetchRawCascadeSummariesWithMaxAge(0)
+}
+
+// FetchRawCascadeSummariesWithMaxAge queries GetAllCascadeTrajectories allowing reuse of recent list snapshots.
+func (p *Proxy) FetchRawCascadeSummariesWithMaxAge(maxAge time.Duration) (map[string]map[string]interface{}, map[string]bool, error) {
+	port, token := p.ActiveUpstream()
+	if port == 0 {
+		return nil, nil, fmt.Errorf("antigravity upstream not connected")
+	}
+
+	raw, err := p.fetchAllTrajectoriesRawMaxAge(context.Background(), port, token, maxAge)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var envelope struct {
+		TrajectorySummaries map[string]map[string]interface{} `json:"trajectorySummaries"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, nil, err
+	}
+
+	summaries := envelope.TrajectorySummaries
+	if summaries == nil {
+		summaries = make(map[string]map[string]interface{})
+	}
+
+	filterDeletedZombieSummaries(summaries)
+
+	runningSubagents := make(map[string]bool)
+	// Filter out internal subagent sessions while tracking parents of actively running subagents
+	for id, s := range summaries {
+		if IsDeletedCascade(id) {
+			delete(summaries, id)
+			continue
+		}
+		if isSubagentTrajectoryMap(s, id) {
+			status, _ := s["status"].(string)
+			if status == "CASCADE_RUN_STATUS_RUNNING" {
+				if meta, ok := s["trajectoryMetadata"].(map[string]interface{}); ok {
+					if parent, ok := meta["parentConversationId"].(string); ok && strings.TrimSpace(parent) != "" {
+						runningSubagents[strings.TrimSpace(parent)] = true
+					}
+				}
+			}
+			delete(summaries, id)
+		} else if isSideQuestionTrajectoryMap(s, id) {
+			delete(summaries, id)
+		}
+	}
+
+	return summaries, runningSubagents, nil
+}
+
+type contextMeterCacheEntry struct {
+	item       *ContextMeterItem
+	at         time.Time
+	nextOffset int
+}
+
+var (
+	contextMeterCacheMu sync.Mutex
+	contextMeterCache   = make(map[string]contextMeterCacheEntry)
+)
+
+// fetchUpstreamGeneratorMetadata queries GetCascadeTrajectoryGeneratorMetadata from LanguageServer
+func (p *Proxy) fetchUpstreamGeneratorMetadata(cascadeID string, port int, token string) *ContextMeterItem {
+	if port <= 0 || cascadeID == "" {
+		return nil
+	}
+
+	reqOffset := 0
+	var prevItem *ContextMeterItem
+	contextMeterCacheMu.Lock()
+	if entry, ok := contextMeterCache[cascadeID]; ok {
+		if time.Since(entry.at) < 1200*time.Millisecond {
+			cached := entry.item
+			contextMeterCacheMu.Unlock()
+			return p.overlayLiveContextUsage(cascadeID, cached)
+		}
+		reqOffset = entry.nextOffset
+		prevItem = entry.item
+	}
+	contextMeterCacheMu.Unlock()
+
+	doQuery := func(offset int) (*ContextMeterItem, generatorMetaSummary, bool) {
+		buf := GetSmallBuffer()
+		defer PutSmallBuffer(buf)
+		buf.WriteString(`{"cascadeId":`)
+		buf.WriteString(strconv.Quote(cascadeID))
+		buf.WriteString(`,"generatorMetadataOffset":`)
+		buf.WriteString(strconv.Itoa(offset))
+		buf.WriteString(`,"includeMessages":false}`)
+
+		url := fmt.Sprintf("https://127.0.0.1:%d/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata", port)
+		req, err := http.NewRequest(http.MethodPost, url, buf)
+		if err != nil {
+			return nil, generatorMetaSummary{}, false
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Connect-Protocol-Version", "1")
+		if token != "" {
+			req.Header.Set("x-codeium-csrf-token", token)
+		}
+
+		resp, err := p.shortClient.Do(req)
+		if err != nil {
+			return nil, generatorMetaSummary{}, false
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, generatorMetaSummary{}, false
+		}
+		item, sum := parseGeneratorMetadataDetailed(resp.Body)
+		return item, sum, true
+	}
+
+	item, sum, ok := doQuery(reqOffset)
+	if !ok {
+		return p.overlayLiveContextUsage(cascadeID, prevItem)
+	}
+	// If trajectory reverted or tail slice had no chat model metrics, fall back to full offset=0 once.
+	if reqOffset > 0 && (item == nil || (!sum.hasMetrics && prevItem != nil)) {
+		reqOffset = 0
+		item, sum, ok = doQuery(0)
+		if !ok {
+			return p.overlayLiveContextUsage(cascadeID, prevItem)
+		}
+	}
+	if item == nil {
+		return p.overlayLiveContextUsage(cascadeID, nil)
+	}
+
+	if !sum.explicitMax && sum.model != "" {
+		if liveMax := liveModels.maxTokensFor(sum.model); liveMax > 0 {
+			item.MaxTokens = liveMax
+			pct := 0.0
+			if item.UsedTokens > 0 {
+				pct = float64(item.UsedTokens) / float64(liveMax) * 100.0
+				if pct > 100.0 {
+					pct = 100.0
+				}
+			}
+			item.Percentage = float64(int(pct*10+0.5)) / 10
+		}
+	}
+
+	totalCount := reqOffset + sum.count
+	nextOffset := 0
+	if totalCount > 5 {
+		nextOffset = totalCount - 5
+	}
+
+	contextMeterCacheMu.Lock()
+	if len(contextMeterCache) > 200 {
+		contextMeterCache = make(map[string]contextMeterCacheEntry)
+	}
+	contextMeterCache[cascadeID] = contextMeterCacheEntry{
+		item:       item,
+		at:         time.Now(),
+		nextOffset: nextOffset,
+	}
+	contextMeterCacheMu.Unlock()
+
+	return p.overlayLiveContextUsage(cascadeID, item)
+}
+
+func (p *Proxy) overlayLiveContextUsage(cascadeID string, base *ContextMeterItem) *ContextMeterItem {
+	used, maxTok, ok := p.agentStateHub.LiveContextUsage(cascadeID, 30*time.Second)
+	if !ok {
+		return base
+	}
+	var out ContextMeterItem
+	if base != nil {
+		out = *base
+	}
+	if used > 0 {
+		out.UsedTokens = used
+	}
+	if maxTok > 0 {
+		out.MaxTokens = maxTok
+	}
+	if out.MaxTokens > 0 && out.UsedTokens > 0 {
+		pct := float64(out.UsedTokens) / float64(out.MaxTokens) * 100.0
+		if pct > 100.0 {
+			pct = 100.0
+		}
+		out.Percentage = float64(int(pct*10+0.5)) / 10
+		out.IsOverflow = out.UsedTokens >= out.MaxTokens
+	}
+	return &out
+}
+
+// flexInt64 decodes ProtoJSON int64 fields encoded as either JSON numbers or quoted strings.
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "null" || s == `""` {
+		*f = 0
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		unquoted, err := strconv.Unquote(s)
+		if err != nil {
+			return err
+		}
+		s = strings.TrimSpace(unquoted)
+		if s == "" {
+			*f = 0
+			return nil
+		}
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexInt64(v)
+	return nil
+}
+
+type generatorMetaSummary struct {
+	count       int
+	model       string
+	explicitMax bool
+	hasMetrics  bool
+}
+
+func parseGeneratorMetadata(r io.Reader) *ContextMeterItem {
+	item, _ := parseGeneratorMetadataDetailed(r)
+	return item
+}
+
+func parseGeneratorMetadataDetailed(r io.Reader) (*ContextMeterItem, generatorMetaSummary) {
+	var metaResp struct {
+		GeneratorMetadata []struct {
+			ChatModel struct {
+				Model             string `json:"model"`
+				ModelDisplayName  string `json:"modelDisplayName"`
+				TimeToFirstToken  string `json:"timeToFirstToken"`
+				StreamingDuration string `json:"streamingDuration"`
+				ChatStartMetadata *struct {
+					ContextWindowMetadata *struct {
+						MaxContextTokens    flexInt64 `json:"maxContextTokens"`
+						EstimatedTokensUsed flexInt64 `json:"estimatedTokensUsed"`
+					} `json:"contextWindowMetadata"`
+				} `json:"chatStartMetadata"`
+				Usage *struct {
+					InputTokens              flexInt64 `json:"inputTokens"`
+					OutputTokens             flexInt64 `json:"outputTokens"`
+					CacheCreationTokens      flexInt64 `json:"cacheCreationTokens"`
+					CacheCreationInputTokens flexInt64 `json:"cacheCreationInputTokens"`
+					CacheReadTokens          flexInt64 `json:"cacheReadTokens"`
+					ThinkingOutputTokens     flexInt64 `json:"thinkingOutputTokens"`
+				} `json:"usage"`
+				RetryInfos []struct {
+					Error string `json:"error"`
+				} `json:"retryInfos"`
+			} `json:"chatModel"`
+		} `json:"generatorMetadata"`
+	}
+
+	if err := json.NewDecoder(r).Decode(&metaResp); err != nil || len(metaResp.GeneratorMetadata) == 0 {
+		return nil, generatorMetaSummary{}
+	}
+
+	selected := metaResp.GeneratorMetadata[len(metaResp.GeneratorMetadata)-1]
+	hasMetrics := false
+	for i := len(metaResp.GeneratorMetadata) - 1; i >= 0; i-- {
+		cm := metaResp.GeneratorMetadata[i].ChatModel
+		if cm.Usage != nil || cm.ChatStartMetadata != nil || cm.Model != "" {
+			selected = metaResp.GeneratorMetadata[i]
+			hasMetrics = cm.Usage != nil || cm.ChatStartMetadata != nil
+			break
+		}
+	}
+	cm := selected.ChatModel
+
+	var maxTokens, usedTokens int64
+	if cm.ChatStartMetadata != nil && cm.ChatStartMetadata.ContextWindowMetadata != nil {
+		maxTokens = int64(cm.ChatStartMetadata.ContextWindowMetadata.MaxContextTokens)
+		usedTokens = int64(cm.ChatStartMetadata.ContextWindowMetadata.EstimatedTokensUsed)
+	}
+	explicitMax := maxTokens > 0
+
+	var inp, outp, capTokens, thinking int64
+	if cm.Usage != nil {
+		inp = int64(cm.Usage.InputTokens)
+		cacheCreate := int64(cm.Usage.CacheCreationTokens)
+		if cacheCreate == 0 {
+			cacheCreate = int64(cm.Usage.CacheCreationInputTokens)
+		}
+		if cacheCreate > 0 {
+			inp += cacheCreate
+		}
+		outp = int64(cm.Usage.OutputTokens)
+		capTokens = int64(cm.Usage.CacheReadTokens)
+		thinking = int64(cm.Usage.ThinkingOutputTokens)
+		if usedTokens == 0 {
+			usedTokens = inp + capTokens + outp
+		}
+	}
+
+	if maxTokens <= 0 {
+		maxTokens = 200000
+	}
+
+	percentage := 0.0
+	if maxTokens > 0 && usedTokens > 0 {
+		percentage = float64(usedTokens) / float64(maxTokens) * 100.0
+		if percentage > 100.0 {
+			percentage = 100.0
+		}
+	}
+
+	ttftSec := parseDurationToSec(cm.TimeToFirstToken)
+	streamSec := parseDurationToSec(cm.StreamingDuration)
+	var tps float64
+	if outp > 0 && streamSec > 0.05 {
+		tps = float64(outp) / streamSec
+	}
+
+	lastErr := ""
+	if len(cm.RetryInfos) > 0 {
+		lastErr = cm.RetryInfos[len(cm.RetryInfos)-1].Error
+	}
+	errKind := ClassifyErrorKind(lastErr)
+
+	return &ContextMeterItem{
+			UsedTokens:        usedTokens,
+			MaxTokens:         maxTokens,
+			Percentage:        float64(int(percentage*10+0.5)) / 10,
+			InputTokens:       inp,
+			OutputTokens:      outp,
+			CacheReadTokens:   capTokens,
+			ThinkingTokens:    thinking,
+			TimeToFirstToken:  ttftSec,
+			StreamingDuration: streamSec,
+			TokensPerSecond:   float64(int(tps*10+0.5)) / 10,
+			IsOverflow:        errKind == "context_overflow",
+			ErrorKind:         errKind,
+		}, generatorMetaSummary{
+			count:       len(metaResp.GeneratorMetadata),
+			model:       cm.Model,
+			explicitMax: explicitMax,
+			hasMetrics:  hasMetrics,
+		}
+}
+
+func parseDurationToSec(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	s = strings.TrimSuffix(s, "s")
+	if val, err := strconv.ParseFloat(s, 64); err == nil {
+		return val
+	}
+	return 0
+}
+

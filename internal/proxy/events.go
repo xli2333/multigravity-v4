@@ -1,0 +1,373 @@
+package proxy
+
+import (
+	"compress/flate"
+	"context"
+	"encoding/json"
+	"hash/fnv"
+	"log/slog"
+	"net/http"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+// Conversation-list change events (GET /gateway/events, WebSocket).
+//
+// Clients used to poll GetAllCascadeTrajectories every 4-10s to notice status changes. This channel
+// only tells them *when* to refetch: frames carry a revision number, never list data, so the list
+// endpoint (filtering, title enrichment, tombstones) stays the single source of truth.
+//
+//	server -> client: {"type":"hello","rev":N}    on connect (client should fetch once)
+//	                  {"type":"changed","rev":N}  the list changed since the last frame
+//	                  {"type":"beat","rev":N,"ts":ms,"desktop":"ok|down|unknown"}  app-level heartbeat
+//
+// WebSocket Ping/Pong is invisible to client code, so "beat" (every eventsBeatInterval, and at once when
+// the desktop state flips) lets clients show a live "connected to the computer" indicator.
+//
+// Change detection runs only while at least one client is subscribed, so an idle gateway does no
+// extra work, and all subscribers share one detector.
+// eventsPollInterval and eventsNudgeSpacing are variables only so tests can shorten them.
+var (
+	eventsPollInterval = 1500 * time.Millisecond
+	// eventsNudgeSpacing bounds how often mutating RPCs (the desktop UI fires bursts of them) can force a re-check.
+	eventsNudgeSpacing = 400 * time.Millisecond
+	// eventsBeatInterval is how often a heartbeat frame is sent; clients treat 2 missed beats as unstable.
+	eventsBeatInterval = 5 * time.Second
+	// eventsDesktopCheckInterval is how often the desktop state is sampled to push flips immediately.
+	eventsDesktopCheckInterval = 1 * time.Second
+)
+
+const (
+	eventsPingInterval = 20 * time.Second // below typical tunnel/proxy idle timeouts
+	eventsReadTimeout  = 45 * time.Second
+	eventsWriteTimeout = 5 * time.Second
+)
+
+type eventsFrame struct {
+	Type      string `json:"type"`
+	Rev       uint64 `json:"rev"`
+	TS        int64  `json:"ts,omitempty"`        // server unix ms (beat/hello)
+	Desktop   string `json:"desktop,omitempty"`   // ok | down | unknown (beat/hello)
+	Unchanged bool   `json:"unchanged,omitempty"` // true on hello when client's sinceRev matches current rev
+}
+
+// desktopState reports whether the desktop language_server is reachable: "ok", "down" or "unknown"
+// (no inspector wired in).
+func (p *Proxy) desktopState() string {
+	if p.insp == nil {
+		return "unknown"
+	}
+	if cur := p.insp.Current(); cur != nil && cur.IsHealthy && cur.Port > 0 {
+		return "ok"
+	}
+	return "down"
+}
+
+type eventSub struct {
+	wake chan struct{} // capacity 1: bursts of changes coalesce into one frame
+}
+
+// eventsHub fans change notifications out to subscribers. The zero value is ready to use.
+type eventsHub struct {
+	mu              sync.Mutex
+	subs            map[*eventSub]struct{}
+	rev             uint64
+	sig             uint64
+	hasSig          bool
+	lastKnownSig    uint64
+	hasLastKnownSig bool
+	cancel          context.CancelFunc
+	nudge           chan struct{}
+}
+
+func (h *eventsHub) currentRev() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rev
+}
+
+func (h *eventsHub) currentRevAndHasSig() (uint64, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rev, h.hasSig
+}
+
+// subscribe registers a subscriber; the first one starts the detector via start.
+func (h *eventsHub) subscribe(start func(ctx context.Context, nudge <-chan struct{})) (*eventSub, func()) {
+	s := &eventSub{wake: make(chan struct{}, 1)}
+	h.mu.Lock()
+	if h.subs == nil {
+		h.subs = make(map[*eventSub]struct{})
+	}
+	h.subs[s] = struct{}{}
+	if len(h.subs) == 1 {
+		ctx, cancel := context.WithCancel(context.Background())
+		h.cancel = cancel
+		h.nudge = make(chan struct{}, 1)
+		h.hasSig = false // re-baseline: do not report changes that happened while nobody listened
+		go start(ctx, h.nudge)
+	}
+	h.mu.Unlock()
+
+	return s, func() {
+		h.mu.Lock()
+		delete(h.subs, s)
+		if len(h.subs) == 0 && h.cancel != nil {
+			h.cancel()
+			h.cancel = nil
+			h.nudge = nil
+		}
+		h.mu.Unlock()
+	}
+}
+
+// observe records a new list signature and notifies subscribers when it differs from the last one.
+// The first observation after the detector starts only sets the baseline (advancing rev without wake
+// if the list mutated while zero subscribers were connected).
+func (h *eventsHub) observe(sig uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.hasSig {
+		h.sig, h.hasSig = sig, true
+		if h.hasLastKnownSig && h.lastKnownSig != sig {
+			h.rev++
+		}
+		h.lastKnownSig, h.hasLastKnownSig = sig, true
+		return
+	}
+	if sig == h.sig {
+		return
+	}
+	h.sig = sig
+	h.lastKnownSig, h.hasLastKnownSig = sig, true
+	h.rev++
+	for s := range h.subs {
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// requestCheck asks a running detector to re-check immediately (e.g. right after a mutating RPC).
+func (h *eventsHub) requestCheck() {
+	h.mu.Lock()
+	n := h.nudge
+	h.mu.Unlock()
+	if n == nil {
+		return
+	}
+	select {
+	case n <- struct{}{}:
+	default:
+	}
+}
+
+// listSignature hashes the visible-relevant state of every non-deleted cascade in a raw
+// GetAllCascadeTrajectories body. Any change to an entry (status, step count, timestamps,
+// title, ...) changes the signature; over-notifying is harmless, missing a change is not.
+func listSignature(raw []byte) (uint64, bool) {
+	var env struct {
+		TrajectorySummaries map[string]json.RawMessage `json:"trajectorySummaries"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return 0, false
+	}
+	ids := make([]string, 0, len(env.TrajectorySummaries))
+	for id := range env.TrajectorySummaries {
+		if IsDeletedCascade(id) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	h := fnv.New64a()
+	for _, id := range ids {
+		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(env.TrajectorySummaries[id])
+		_, _ = h.Write([]byte{1})
+	}
+	return h.Sum64(), true
+}
+
+// cascadeSummarySignature hashes one cascade's entry in the shared GetAllCascadeTrajectories snapshot.
+// ok is false when the snapshot is unavailable or does not list the cascade.
+func (p *Proxy) cascadeSummarySignature(cascadeID string, port int, token string) (uint64, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	idx, err := p.fetchAllTrajectoriesIndex(ctx, port, token)
+	if err != nil || idx == nil {
+		return 0, false
+	}
+	sig, ok := idx.sigByID[cascadeID]
+	return sig, ok
+}
+
+func (p *Proxy) checkEventsOnce(ctx context.Context) {
+	port, token := p.ActiveUpstream()
+	if port == 0 {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	// The snapshot's own TTL keeps this from adding upstream load beyond what list polls already cause.
+	idx, err := p.fetchAllTrajectoriesIndex(cctx, port, token)
+	if err != nil || idx == nil {
+		return
+	}
+	if sig, ok := idx.computeListSignature(); ok {
+		p.events.observe(sig)
+	}
+}
+
+// runEventsDetector subscribes to live JetboxSubscribeToSummaries updates and polls the shared
+// list snapshot as fallback while subscribers exist.
+func (p *Proxy) runEventsDetector(ctx context.Context, nudge <-chan struct{}) {
+	sumWake, unsubSum := p.SubscribeSummaryUpdates()
+	defer unsubSum()
+
+	pollInterval := eventsPollInterval
+	nudgeSpacing := eventsNudgeSpacing
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	lastCheck := time.Time{}
+	run := func() {
+		p.checkEventsOnce(ctx)
+		lastCheck = time.Now()
+		if pollInterval >= time.Second && p.IsReactiveSummariesLive() {
+			ticker.Reset(4 * time.Second)
+		} else {
+			ticker.Reset(pollInterval)
+		}
+	}
+	run()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sumWake:
+			if pollInterval >= time.Second && p.IsReactiveSummariesLive() {
+				ticker.Reset(4 * time.Second)
+			}
+		case <-ticker.C:
+			run()
+		case <-nudge:
+			if wait := nudgeSpacing - time.Since(lastCheck); wait > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
+			run()
+		}
+	}
+}
+
+// HandleEvents serves GET /gateway/events.
+func (p *Proxy) HandleEvents(w http.ResponseWriter, r *http.Request) {
+	hasSinceRev := r.URL.Query().Has("sinceRev")
+	sinceRev, sinceRevErr := strconv.ParseUint(r.URL.Query().Get("sinceRev"), 10, 64)
+
+	sanitizeWebSocketHeaders(r)
+	conn, err := streamUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Warn("[Events] WS upgrade failed", "err", err)
+		return
+	}
+	_ = conn.SetCompressionLevel(flate.BestSpeed)
+	defer conn.Close()
+	defer p.trackWSConn(conn)()
+
+	sub, unsubscribe := p.events.subscribe(p.runEventsDetector)
+	defer unsubscribe()
+
+	var writeMu sync.Mutex
+	write := func(f eventsFrame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		_ = conn.SetWriteDeadline(time.Now().Add(eventsWriteTimeout))
+		return conn.WriteJSON(f)
+	}
+
+	closed := make(chan struct{})
+	conn.SetReadLimit(64 * 1024)
+	_ = conn.SetReadDeadline(time.Now().Add(eventsReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(eventsReadTimeout))
+	})
+	go func() {
+		defer close(closed)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(eventsReadTimeout))
+		}
+	}()
+
+	helloUnchanged := false
+	if hasSinceRev && sinceRevErr == nil {
+		if _, hasSig := p.events.currentRevAndHasSig(); !hasSig {
+			p.checkEventsOnce(r.Context())
+		}
+		select {
+		case <-sub.wake:
+		default:
+		}
+		if curRev, hasSig := p.events.currentRevAndHasSig(); hasSig && curRev == sinceRev {
+			helloUnchanged = true
+		}
+	}
+
+	desktop := p.desktopState()
+	beat := func(typ string, unchanged bool) error {
+		return write(eventsFrame{Type: typ, Rev: p.events.currentRev(), TS: time.Now().UnixMilli(), Desktop: desktop, Unchanged: unchanged})
+	}
+	if err := beat("hello", helloUnchanged); err != nil {
+		return
+	}
+	beatTick := time.NewTicker(eventsBeatInterval)
+	defer beatTick.Stop()
+	desktopTick := time.NewTicker(eventsDesktopCheckInterval)
+	defer desktopTick.Stop()
+
+	ping := time.NewTicker(eventsPingInterval)
+	defer ping.Stop()
+	for {
+		select {
+		case <-closed:
+			return
+		case <-sub.wake:
+			if err := write(eventsFrame{Type: "changed", Rev: p.events.currentRev()}); err != nil {
+				return
+			}
+		case <-beatTick.C:
+			desktop = p.desktopState()
+			if err := beat("beat", false); err != nil {
+				return
+			}
+		case <-desktopTick.C:
+			if now := p.desktopState(); now != desktop {
+				desktop = now
+				if err := beat("beat", false); err != nil {
+					return
+				}
+			}
+		case <-ping.C:
+			writeMu.Lock()
+			_ = conn.SetWriteDeadline(time.Now().Add(eventsWriteTimeout))
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}
+}

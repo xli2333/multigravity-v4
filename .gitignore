@@ -1,0 +1,104 @@
+# ====================================================================
+# Antigravity Mobile - Comprehensive Git Ignore
+# Covers Go Gateway, iOS SwiftUI App, Web/PWA, and Security Secrets
+# ====================================================================
+
+# --- Go Binaries & Build Artifacts ---
+bin/
+dist/
+build/
+/gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+!web/js/vendor/
+
+# --- Logs & Runtime Output ---
+logs/*.log
+*.log
+!logs/.gitkeep
+
+# --- OS Specific Files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- Xcode & iOS Development Artifacts ---
+xcuserdata/
+*.xcuserdatad
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+DerivedData/
+*.ipa
+*.app
+*.dSYM.zip
+*.dSYM
+profile/
+*.mobileprovision
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# --- Secrets, Credentials & Environment ---
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.p8
+*.cer
+*.crt
+*.jks
+*.keystore
+certs/
+credentials.json
+client_secret*.json
+
+# --- Temporary & Swap Files ---
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+*.bak
+
+# --- Internal Docs & Notes ---
+AGENTS.md
+Agent.md
+!docs/*.md
+private-docs/
+
+# --- IDE & Editor Settings ---
+.idea/
+android/.idea/
+*.iml
+.iml
+
+# --- Android & Gradle Artifacts ---
+.gradle/
+android/.gradle/
+android/**/build/
+android/local.properties
+android/**/.cxx/
+*.apk
+*.aab
+android/*.zip
+android/*.hprof
+android/.idea/
+android/gradle/gradle-daemon-jvm.properties
+
+
+# --- 介绍视频生成工具与素材（仅本机使用，不入库；成品输出在 dist/）---
+scripts/video/

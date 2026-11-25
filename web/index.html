@@ -1,0 +1,1134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="color-scheme" content="light dark" />
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("antigravity_theme") || "system";
+        if (t === "nord") {
+          t = "dark";
+          localStorage.setItem("antigravity_theme", "dark");
+        }
+        var m = document.querySelector('meta[name="color-scheme"]');
+        if (t === "dark" || t === "light") {
+          document.documentElement.setAttribute("data-theme", t);
+          if (m) m.setAttribute("content", t);
+        }
+      } catch (_) {}
+      try {
+        localStorage.removeItem("antigravity_language");
+        var navLangs = (navigator.languages && navigator.languages.length)
+          ? navigator.languages
+          : [navigator.language || navigator.userLanguage || ""];
+        var primary = (navLangs[0] || "").toLowerCase().trim();
+        var lang = primary.indexOf("zh") === 0 ? "zh-CN" : (primary.indexOf("ja") === 0 ? "ja" : "en");
+        document.documentElement.setAttribute("lang", lang);
+        document.documentElement.setAttribute("data-lang", lang);
+        var manifestLink = document.querySelector('link[rel="manifest"]');
+        if (manifestLink) {
+          var manifestHref = lang === "zh-CN" ? "/manifest.json" : (lang === "ja" ? "/manifest-ja.json" : "/manifest-en.json");
+          manifestLink.setAttribute("href", manifestHref);
+        }
+      } catch (_) {}
+    })();
+  </script>
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f2f2f7" />
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f172a" />
+  <meta name="theme-color" id="meta-theme-color" content="#0f172a" />
+  <title>Multigravity</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico?v=4" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png?v=4" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png?v=4" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png?v=4" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="stylesheet" href="/style.css?v=57" />
+</head>
+<body>
+  <div id="app">
+    <!-- iOS Navigation Bar -->
+    <header class="ios-navbar" id="ios-navbar">
+      <div class="nav-left">
+        <!-- In List View: Settings Button -->
+        <button id="btn-settings" class="nav-btn" aria-label="设置">
+          <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        <!-- In Chat View: Back Button with Chevron -->
+        <button id="btn-back" class="nav-btn nav-back-btn hidden" aria-label="返回" type="button">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
+        </button>
+      </div>
+
+      <div class="nav-center">
+        <div id="nav-brand-header" class="nav-brand-header">
+          <span class="nav-brand-title">Multigravity</span>
+        </div>
+        <div id="nav-inline-title" class="nav-inline-title hidden">
+          <div class="chat-title-row">
+            <span id="chat-title-text" class="title-text">会话详情</span>
+            <div id="chat-context-ring-btn" class="context-ring-capsule hidden" title="查看上下文与生成速度">
+              <svg class="context-ring-svg" width="20" height="20" viewBox="0 0 36 36">
+                <path class="context-ring-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-width="3.5" opacity="0.25"/>
+                <path id="context-ring-circle" class="context-ring-val" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-width="3.5"/>
+              </svg>
+              <span id="context-ring-text" class="context-ring-text">0%</span>
+              <span id="context-speed-badge" class="context-speed-badge hidden">⚡ 0 t/s</span>
+            </div>
+          </div>
+          <span id="chat-workspace-text" class="subtitle-text"></span>
+        </div>
+      </div>
+
+      <div class="nav-right">
+        <!-- In List View: Plus Button -->
+        <button id="btn-new" class="nav-btn nav-action-btn" aria-label="新建会话" type="button">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </button>
+        <!-- In Chat View: Single Tools & Tasks Button (tap: 5-tab board, long-press/context: permissions) -->
+        <button id="btn-chat-tools" class="nav-btn nav-action-btn hidden p3-tools-nav-btn" aria-label="工具与任务" title="工具与任务（长按切换权限）" type="button">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Views Container -->
+    <main class="content-container">
+      <!-- View 1: iOS Conversation List -->
+      <section id="view-conversations" class="view active">
+        <!-- 升级自检：核心功能缺失时的提示条（见 core.js applyGatewayCompat） -->
+        <div id="compat-banner" class="compat-banner hidden" role="alert">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line>
+          </svg>
+          <span id="compat-banner-text"></span>
+        </div>
+
+        <!-- Large Title (iOS NavigationStack Style) -->
+        <div class="ios-large-title-bar">
+          <div class="large-title-brand">
+            <h1 class="large-title">Multigravity</h1>
+          </div>
+        </div>
+
+        <!-- iOS .searchable Search Bar -->
+        <div class="ios-search-bar">
+          <div class="search-capsule">
+            <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input type="search" id="conv-search" placeholder="搜索会话或工作区..." autocomplete="off" />
+            <button id="btn-search-clear" class="search-clear-btn hidden" aria-label="清空搜索">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="15" y1="9" x2="9" y2="15" stroke="var(--ios-bg)" stroke-width="2" stroke-linecap="round"></line>
+                <line x1="9" y1="9" x2="15" y2="15" stroke="var(--ios-bg)" stroke-width="2" stroke-linecap="round"></line>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Cockpit Gemini 5h Quota Status Bar -->
+        <div id="quota-status-bar" class="quota-status-bar" role="button" aria-label="查看全账号额度" style="display: none;">
+          <div class="quota-status-capsule">
+            <div class="quota-capsule-left">
+              <svg id="quota-bolt-icon" class="quota-bolt-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13.5 2 4 13.5h6.5L9.5 22 20 9.5h-6.7z"></path></svg>
+              <span class="quota-metric-name">Gemini 5h</span>
+              <span id="quota-status-percent" class="quota-status-percent">--%</span>
+            </div>
+            <div class="quota-progress-track">
+              <div id="quota-status-fill" class="quota-progress-fill" style="width: 0%;"></div>
+            </div>
+            <div class="quota-capsule-right">
+              <span id="quota-status-desc" class="quota-status-desc">同步中...</span>
+              <span id="link-health-dot" class="link-health-dot link-unknown" role="img" aria-label="正在连接电脑"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Global Background Tasks Status Bar (Antigravity 2.30.0 ListBackgroundTasks) -->
+        <div id="global-tasks-bar" class="quota-status-bar" role="button" aria-label="查看全局后台任务" style="display: none;">
+          <div class="quota-status-capsule global-tasks-capsule">
+            <div class="quota-capsule-left">
+              <span class="global-tasks-icon">&gt;_</span>
+              <span id="global-tasks-label" class="quota-metric-name">1 个后台任务运行中</span>
+            </div>
+            <div class="quota-capsule-right">
+              <span class="global-tasks-manage">管理 ›</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- iOS Pull to Refresh Bar -->
+        <div id="pull-refresh-bar" class="pull-refresh-bar">
+          <div class="pull-refresh-spinner ios-spinner"></div>
+        </div>
+
+        <!-- Conversations List (iOS Inset Plain List) -->
+        <div id="conversations-list" class="conversations-list">
+          <div class="loading-state">
+            <div class="ios-spinner"></div>
+            <p>正在连接 Agent...</p>
+          </div>
+        </div>
+
+        <!-- 对话内容全文搜索命中（language_server SearchConversations），见 nav.js -->
+        <div id="content-hits" class="content-hits hidden" data-feature="search"></div>
+      </section>
+
+      <!-- View 2: iOS Chat View -->
+      <section id="view-chat" class="view">
+        <div id="workspace-trust-banner" class="workspace-trust-banner hidden" role="status">
+          <div class="wtb-main">
+            <span class="wtb-icon" aria-hidden="true">🛡️</span>
+            <div class="wtb-text">
+              <div class="wtb-title">当前工作区尚未设为完全信任</div>
+              <div class="wtb-desc" id="wtb-workspace-path">信任后可完整开放终端执行与项目分析能力</div>
+            </div>
+          </div>
+          <div class="wtb-actions">
+            <button id="btn-trust-workspace" class="wtb-btn primary" type="button">信任工作区</button>
+            <button id="btn-dismiss-trust" class="wtb-btn" type="button" aria-label="忽略">✕</button>
+          </div>
+        </div>
+        <div id="messages-stream" class="messages-container">
+          <div class="loading-state">
+            <div class="ios-spinner"></div>
+            <p>正在同步会话历史与步骤...</p>
+          </div>
+        </div>
+
+        <!-- 浮动跳跃双钮导航条 (Prompt Jump Stepper) -->
+        <div id="prompt-jump-stepper" class="prompt-jump-stepper hidden">
+          <button id="pjs-btn-up" class="pjs-btn" title="上一轮提问" aria-label="上一轮提问">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
+          </button>
+          <button id="pjs-btn-down" class="pjs-btn" title="下一轮提问" aria-label="下一轮提问">
+            <svg id="pjs-icon-down" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            <svg id="pjs-icon-bottom" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 6 12 11 17 6"></polyline><polyline points="7 13 12 18 17 13"></polyline></svg>
+          </button>
+        </div>
+
+        <!-- 底部悬浮栈：浮层卡片 + 输入栏，消息从它下面滑过（玻璃层，见 style.css） -->
+        <div id="chat-bottom-stack" class="chat-bottom-stack">
+        <!-- Floating Interaction Card (Permissions / Choices) -->
+        <div id="interaction-card-container" class="interaction-card-container hidden"></div>
+
+        <!-- Floating Running Tasks Card (Desktop Antigravity Parity) -->
+        <div id="running-tasks-card" class="running-tasks-card hidden" data-testid="running-tasks-card">
+          <div class="tasks-header">
+            <div class="tasks-header-left">
+              <svg class="tasks-icon-spin" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 -960 960 960" fill="currentColor">
+                <path d="M332.55-129.9q-69.29-29.9-121.02-81.63T129.9-332.55T100-480.35t29.96-147.5t81.58-120.61t121.04-81.58T480-860q12.75,0 21.37,8.63T510-829.99t-8.62,21.37T480-800q-133,0-226.5,93.5T160-480t93.5,226.5T480-160t226.5-93.5T800-480q0-12.77 8.63-21.38T830.01-510t21.37,8.62T860-480q0,77.99-29.96,147.42T748.46-211.54T627.85-129.96T480.35-100t-147.8-29.9Z"></path>
+              </svg>
+              <span id="tasks-header-title" class="tasks-title">1 个任务正在执行</span>
+              <span id="tasks-badge-count" class="tasks-badge">1</span>
+            </div>
+            <div class="tasks-header-right">
+              <span id="tasks-header-quick-stop"></span>
+              <button id="btn-tasks-expand" class="tasks-icon-btn" aria-label="折叠/展开任务" title="折叠/展开任务" data-testid="running-tasks-expand-button">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" fill="currentColor" class="expand-arrow">
+                  <path d="M480-345 240-585l43-43 197 197 197-197 43 43-240 240Z"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div id="tasks-content-wrapper" class="tasks-content-wrapper">
+            <div id="tasks-items-list" class="tasks-items-list"></div>
+          </div>
+        </div>
+
+        <!-- 运行中的子代理（js/subagents.js）：结束或关停后自动收起 -->
+        <div id="subagents-card" class="subagents-card hidden"></div>
+
+        <!-- Floating Queued Messages Card (Desktop Parity) -->
+        <div id="queued-messages-card" class="queued-messages-card hidden" data-testid="queued-messages-card">
+          <div class="queued-header">
+            <div class="queued-header-left">
+              <span class="queued-title">队列</span>
+              <span id="queued-badge-count" class="queued-badge">0</span>
+              <span class="queued-subtitle">当前任务完成后自动发送</span>
+            </div>
+            <div class="queued-header-right">
+              <button id="btn-queued-expand" class="queued-icon-btn" aria-label="折叠队列" title="折叠/展开队列" data-testid="queued-messages-expand-button">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" fill="currentColor" class="expand-arrow">
+                  <path d="M480-345 240-585l43-43 197 197 197-197 43 43-240 240Z"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div id="queued-content-wrapper" class="queued-content-wrapper">
+            <div id="queued-items-list" class="queued-items-list"></div>
+          </div>
+        </div>
+
+        <!-- 子代理会话只读提示条（替代输入栏） -->
+        <div id="subagent-bar" class="subagent-bar hidden"></div>
+
+        <!-- 语音连接失败排查气泡 -->
+        <div id="voice-troubleshoot-bubble" class="voice-troubleshoot-bubble hidden" data-testid="voice-troubleshoot-bubble">
+          <div class="vtb-title">⚠️ 当前无法连接语音</div>
+          <div class="vtb-sub">请先在电脑上依次检查：</div>
+          <ol class="vtb-list">
+            <li><b>重新登录</b>：退出 Antigravity 登录，完全关闭后重新打开并登录，授权页勾选全部权限</li>
+            <li><b>开启代理 TUN 模式</b>：确保 <code>*.googleapis.com</code> 长连接（HTTP/2、gRPC）正常转发</li>
+            <li><b>检查电脑麦克风</b>：系统麦克风权限已开启，默认录音设备正常且未被占用</li>
+          </ol>
+          <div class="vtb-ask">如果都不行，是否让智能体自动排查？</div>
+          <div class="vtb-actions">
+            <button type="button" id="btn-vtb-retry" class="vtb-btn">我再试试</button>
+            <button type="button" id="btn-vtb-troubleshoot" class="vtb-btn vtb-btn-primary">一键排查</button>
+          </div>
+        </div>
+
+        <!-- 实时双工语音通话浮条 -->
+        <div id="voice-call-card" class="voice-call-card hidden" data-testid="voice-call-card">
+          <div id="voice-live-subtitle-row" class="voice-live-subtitle-row hidden">
+            <span id="voice-subtitle-badge" class="voice-subtitle-badge">我</span>
+            <span id="voice-subtitle-text" class="voice-subtitle-text"></span>
+          </div>
+          <div class="voice-controls-row">
+            <div class="voice-status-box">
+              <span id="voice-status-dot" class="voice-status-dot listening"></span>
+              <span id="voice-timer-text" class="voice-timer-text">00:00</span>
+            </div>
+            <div id="voice-waveform-bars" class="voice-waveform-bars"></div>
+            <div class="voice-action-btns">
+              <button id="btn-voice-speed" class="voice-pill-btn" type="button" title="切换语速">1.0x</button>
+              <button id="btn-voice-mic" class="voice-circle-btn" type="button" title="静音麦克风" aria-label="静音麦克风">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                  <line x1="12" y1="19" x2="12" y2="22"></line>
+                </svg>
+              </button>
+              <button id="btn-voice-speaker" class="voice-circle-btn" type="button" title="静音AI外放" aria-label="静音AI外放">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                </svg>
+              </button>
+              <button id="btn-voice-stop-task" class="voice-circle-btn stop-task hidden" type="button" title="停止当前任务" aria-label="停止当前任务">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2"></rect>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sticky iOS Chat Input Bar -->
+        <div class="ios-input-bar">
+          <!-- 斜杠命令：键入 "/" 弹出的列表（见 js/slash.js） -->
+          <div id="slash-picker" class="slash-picker hidden" data-feature="slash"></div>
+
+          <!-- Quick Action Chips (Add Image, Model Switch, Slash Command, Commit & Push, Proceed) -->
+          <div class="quick-actions-chips" id="quick-actions-bar">
+            <button id="btn-add-image" class="chip-pill chip-add-image" type="button" title="添加图片或附件 (音视频最高 200 MB)" aria-label="添加图片或附件">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+              </svg>
+            </button>
+            <input type="file" id="image-file-input" accept="image/*,audio/*,video/*,.amr,.ogg,.oga,.opus,.m4a,.mp3,.wav,.flac,.aac,.caf,.r,.rmd,.rmarkdown,.pdf,.txt,.md,.json,.csv,.zip" multiple style="display: none;" />
+
+            <button id="btn-model-switch" class="chip-pill chip-model-switch chip-gemini" type="button" title="短按快切首选与次选模型，长按或右键选择全部模型">
+              <span id="model-switch-text" class="model-switch-text">Gemini</span>
+            </button>
+
+            <button id="btn-workflow-templates" class="chip-pill" type="button" title="单击打开 Workflow 模板，长按上滑快捷输入">
+              <span>Workflow</span>
+            </button>
+
+            <div id="slash-chip" class="slash-chip hidden" data-feature="slash"></div>
+
+            <button id="btn-changes" class="chip-pill hidden" type="button" data-feature="changes" title="本会话改动">
+              <span>Changes</span>
+            </button>
+            <button id="btn-commit-push" class="chip-pill hidden" type="button" title="Git 提交">
+              <span>Commit</span>
+            </button>
+            <button id="btn-continue" class="chip-pill chip-continue hidden" type="button">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span>Continue</span>
+            </button>
+            <button id="btn-proceed" class="chip-pill chip-proceed hidden" type="button">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span>Proceed</span>
+            </button>
+          </div>
+
+          <!-- Phase 3: Suggested Responses Strip (auto-hidden on input focus) & @ Context Chips -->
+          <div id="suggested-responses-bar" class="p3-suggest-bar hidden"></div>
+          <div id="context-chips-bar" class="p3-context-chips-bar hidden"></div>
+
+          <!-- Image Attachment Previews Container -->
+          <div id="image-previews-bar" class="image-previews-bar hidden"></div>
+
+          <!-- Input Row: Capsule Textfield + 44x44 Circle Send/Stop Button -->
+          <div class="input-row">
+            <div class="textfield-wrapper">
+              <textarea id="chat-input" placeholder="发送对 Agent 的指令..." rows="1"></textarea>
+            </div>
+            <button id="btn-send" class="btn-action-circle send-mode" aria-label="发送">
+              <svg class="icon-send" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"></line>
+                <polyline points="5 12 12 5 19 12"></polyline>
+              </svg>
+              <svg class="icon-stop hidden" width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="5" y="5" width="14" height="14" rx="2"></rect>
+              </svg>
+              <svg class="icon-voice hidden" width="18" height="18" viewBox="0 -960 960 960" fill="none" aria-hidden="true">
+                <g transform="translate(34, -48)">
+                  <rect x="167.8" y="-575.2" width="82" height="350" rx="41" fill="currentColor"></rect>
+                  <rect x="359.8" y="-662.7" width="82" height="525" rx="41" fill="currentColor"></rect>
+                  <rect x="551.8" y="-512.7" width="82" height="225" rx="41" fill="currentColor"></rect>
+                  <g transform="translate(724, -718) scale(0.96) translate(-729.61, 729.61)">
+                    <path d="M729.61-557.69q-6,0-8-6Q706.38-622 664.19-664.19t-100.5-57.42q-6-2-6-8q0-7 6-8q58.31-15.23 100.5-57.42t57.42-100.5q2-6 8-6q7,0 8,6q15.85,58.31 57.8,100.53t100.12,57.4q6,1 6,8q0,6-6,8q-58.31,15.23-100.5,57.42t-57.42,100.5q-1,6-8,6Z" fill="currentColor"></path>
+                  </g>
+                </g>
+              </svg>
+              <svg class="icon-hangup hidden" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+            </button>
+          </div>
+        </div>
+      
+        </div>
+      </section>
+    </main>
+
+    <!-- iOS Bottom Sheet: New Conversation (Aligned with NewConversationSheet.swift) -->
+    <div id="sheet-new" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <button id="btn-clone-repo" class="sheet-header-btn" type="button" title="克隆 GitHub 仓库" aria-label="克隆 GitHub 仓库" style="display:inline-flex;align-items:center;gap:4px;">
+            <svg width="18" height="18" viewBox="0 0 25 24" fill="currentColor" aria-hidden="true">
+              <path fill-rule="evenodd" clip-rule="evenodd" d="M12.3364 2.2467C6.81143 2.2467 2.33643 6.7217 2.33643 12.2467C2.33643 16.6717 5.19893 20.4092 9.17393 21.7342C9.67393 21.8217 9.86143 21.5217 9.86143 21.2592C9.86143 21.0217 9.84893 20.2342 9.84893 19.3967C7.33643 19.8592 6.68643 18.7842 6.48643 18.2217C6.37393 17.9342 5.88643 17.0467 5.46143 16.8092C5.11143 16.6217 4.61143 16.1592 5.44893 16.1467C6.23643 16.1342 6.79893 16.8717 6.98643 17.1717C7.88643 18.6842 9.32393 18.2592 9.89893 17.9967C9.98643 17.3467 10.2489 16.9092 10.5364 16.6592C8.31143 16.4092 5.98643 15.5467 5.98643 11.7217C5.98643 10.6342 6.37393 9.7342 7.01143 9.0342C6.91143 8.7842 6.56143 7.7592 7.11143 6.3842C7.11143 6.3842 7.94893 6.1217 9.86143 7.4092C10.6614 7.1842 11.5114 7.0717 12.3614 7.0717C13.2114 7.0717 14.0614 7.1842 14.8614 7.4092C16.7739 6.1092 17.6114 6.3842 17.6114 6.3842C18.1614 7.7592 17.8114 8.7842 17.7114 9.0342C18.3489 9.7342 18.7364 10.6217 18.7364 11.7217C18.7364 15.5592 16.3989 16.4092 14.1739 16.6592C14.5364 16.9717 14.8489 17.5717 14.8489 18.5092C14.8489 19.8467 14.8364 20.9217 14.8364 21.2592C14.8364 21.5217 15.0239 21.8342 15.5239 21.7342C17.5091 21.064 19.2341 19.7882 20.4562 18.0862C21.6783 16.3843 22.3359 14.342 22.3364 12.2467C22.3364 6.7217 17.8614 2.2467 12.3364 2.2467Z"/>
+            </svg>
+          </button>
+          <h2 class="sheet-title">新建会话</h2>
+          <div style="display:inline-flex;align-items:center;gap:10px;">
+            <button id="btn-add-workspace" class="sheet-header-btn primary" type="button" title="添加本地工作区" aria-label="添加本地工作区" style="font-size:20px;line-height:1;">+</button>
+            <button id="btn-sheet-new-close" class="sheet-header-btn primary" type="button">完成</button>
+          </div>
+        </div>
+        <div class="sheet-description-row">
+          <span class="sheet-description-text">选择模式或工作区发起新会话</span>
+          <span id="new-projects-count" class="sheet-description-count">正在探测...</span>
+        </div>
+        <div id="new-projects-list" class="new-projects-list">
+          <div class="loading-state" style="padding: 24px 0;">
+            <div class="ios-spinner"></div>
+            <p>正在拉取工作区列表...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Long-press / Context-menu: All-Models 2-Level Picker -->
+    <div id="model-picker-overlay" class="model-picker-overlay hidden"></div>
+    <!-- Long-press / Context-menu: Workflow Quick Slide Picker -->
+    <div id="workflow-picker-overlay" class="model-picker-overlay wf-picker-overlay hidden"></div>
+
+    <!-- iOS Bottom Sheet: Settings & Gateway Status (Aligned with SettingsSheet.swift) -->
+    <div id="sheet-settings" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div id="settings-header-main" class="sheet-header">
+          <div style="width: 48px;"></div>
+          <h2 class="sheet-title">设置</h2>
+          <button id="btn-sheet-settings-close" class="sheet-header-btn primary" type="button">完成</button>
+        </div>
+        <div id="settings-header-sub" class="sheet-header hidden">
+          <button id="btn-settings-sub-back" class="sheet-header-btn settings-sub-back-btn" type="button">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+            <span>设置</span>
+          </button>
+          <h2 id="settings-sub-title" class="sheet-title">外观配色</h2>
+          <button id="btn-sheet-settings-close-sub" class="sheet-header-btn primary" type="button">完成</button>
+        </div>
+        <div id="settings-main-body" class="sheet-body">
+          <!-- Section 1: 设备配对鉴权 -->
+          <div class="ios-grouped-section">
+            <div class="ios-cell between">
+              <span class="cell-label">设备配对鉴权</span>
+              <span id="settings-auth-status" class="status-badge disconnected">未配对</span>
+            </div>
+            <div id="settings-device-id-row" class="ios-cell between hidden">
+              <span class="cell-label">设备 ID</span>
+              <span id="settings-device-id" class="cell-value monospaced">-</span>
+            </div>
+            <button id="btn-open-pairing" class="ios-cell-button">
+              <span>输入配对码 / 配对链接</span>
+            </button>
+            <button id="btn-unpair-device" class="ios-cell-button destructive hidden">
+              <span>解除此设备配对 (清除凭据)</span>
+            </button>
+          </div>
+
+          <!-- Section 2: 网关与服务状态 -->
+          <div class="ios-grouped-section">
+            <div class="ios-cell between">
+              <span class="cell-label">网关状态</span>
+              <span id="settings-status-pill" class="status-badge connected">已连接</span>
+            </div>
+            <div class="ios-cell between">
+              <span class="cell-label">上游端口</span>
+              <span id="settings-upstream-port" class="cell-value monospaced">-</span>
+            </div>
+            <div class="ios-cell between">
+              <span class="cell-label">进程 PID</span>
+              <span id="settings-upstream-pid" class="cell-value monospaced">-</span>
+            </div>
+            <button id="btn-rescan-gateway" class="ios-cell-button">
+              <span>重新嗅探 Antigravity 实例</span>
+            </button>
+          </div>
+
+          <!-- 模型：新会话默认使用首选模型，已有会话同步电脑端最新模型；短按切换首选/次选，长按/右键任选 -->
+          <div class="quota-section-header" style="margin: 14px 4px 6px;">模型</div>
+          <div class="ios-grouped-section">
+            <div class="ios-cell between">
+              <span class="cell-label">首选模型</span>
+              <select id="settings-favorite-1" class="settings-select" aria-label="首选模型"></select>
+            </div>
+            <div class="ios-cell between">
+              <span class="cell-label">次选模型</span>
+              <select id="settings-favorite-2" class="settings-select" aria-label="次选模型"></select>
+            </div>
+            <button id="btn-refresh-models" class="ios-cell-button" type="button">
+              <span>刷新模型列表</span>
+            </button>
+            <div id="settings-models-note" class="settings-note">新会话默认使用首选模型，已有会话自动同步电脑端最新模型；短按模型胶囊切换首选与次选，长按可任选模型。</div>
+          </div>
+
+          <!-- 扩展与能力 -->
+          <div class="quota-section-header" style="margin: 14px 4px 6px;">扩展与能力</div>
+          <div class="ios-grouped-section">
+            <div class="ios-cell between">
+              <span class="cell-label">Agent 权限模式</span>
+              <select id="settings-permission-preset" class="settings-select" aria-label="Agent 权限模式">
+                <option value="strict">严格审批</option>
+                <option value="sandbox">离席沙箱放行</option>
+                <option value="auto">全自动 (Turbo)</option>
+              </select>
+            </div>
+            <button id="btn-settings-open-tools" class="ios-cell-button" type="button" onclick="window.Phase3?.openToolsBoard?.('mcp')">
+              <span>MCP 工具与技能看板</span>
+            </button>
+            <div class="settings-note">在此配置默认权限并查看 MCP 工具与技能；进入会话后，长按右上角工具按钮也可以随时改变该会话的权限。</div>
+          </div>
+
+          <!-- 语音 -->
+          <div class="quota-section-header" style="margin: 14px 4px 6px;">语音</div>
+          <div class="ios-grouped-section">
+            <label class="ios-cell between" for="settings-enable-voice-mode" style="cursor: pointer;">
+              <span class="cell-label">实时语音对话</span>
+              <input type="checkbox" id="settings-enable-voice-mode" class="ios-switch-input" />
+            </label>
+            <div class="settings-note">开启后，输入框为空且空闲时右侧按钮支持单击实时双工语音通话、长按原生流式语音听写。</div>
+          </div>
+
+          <!-- 外观与主题 -->
+          <div class="quota-section-header" style="margin: 14px 4px 6px;">外观与主题</div>
+          <div class="ios-grouped-section">
+            <div class="ios-cell between settings-mode-row">
+              <span class="cell-label">外观模式</span>
+              <div id="settings-theme-mode-seg" class="settings-segmented" role="radiogroup" aria-label="外观模式">
+                <button type="button" class="settings-seg-btn" data-theme-mode="system" aria-pressed="true">跟随系统</button>
+                <button type="button" class="settings-seg-btn" data-theme-mode="light" aria-pressed="false">浅色</button>
+                <button type="button" class="settings-seg-btn" data-theme-mode="dark" aria-pressed="false">深色</button>
+              </div>
+            </div>
+            <div class="ios-cell between">
+              <span class="cell-label">界面与代码字号</span>
+              <select id="settings-font-size-scale" style="background: transparent; color: var(--ios-label, #fff); border: none; font-size: 13px; font-weight: 500; outline: none; padding: 4px;">
+                <option value="compact">紧凑 (小字号)</option>
+                <option value="default" selected>标准 (默认)</option>
+                <option value="comfortable">舒适 (大字号)</option>
+              </select>
+            </div>
+            <button id="btn-open-compact-settings" class="ios-cell-button between settings-nav-row" type="button">
+              <span class="cell-label">精简模式</span>
+              <span class="settings-nav-trailing">
+                <span id="settings-compact-summary" class="cell-value">已关闭</span>
+                <svg class="settings-chevron" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+              </span>
+            </button>
+          </div>
+          <div class="settings-note" style="margin: 6px 4px 12px;">选择外观模式与界面字号缩放；点进「精简模式」可自定义对话降噪选项。</div>
+
+          <!-- Section 3: 本地数据与缓存 -->
+          <div class="ios-grouped-section">
+            <button id="btn-clear-web-cache" class="ios-cell-button destructive" type="button">
+              <span>清空本地会话与文档缓存</span>
+            </button>
+          </div>
+
+          <!-- Section 5: 关于 -->
+          <div class="ios-grouped-section">
+            <div class="ios-cell between">
+              <span class="cell-label">应用名称</span>
+              <span class="cell-value">Multigravity</span>
+            </div>
+            <div class="ios-cell between">
+              <span class="cell-label">客户端模式</span>
+              <span class="cell-value">Web / PWA</span>
+            </div>
+            <div class="ios-cell between">
+              <span class="cell-label">版本</span>
+              <span id="settings-app-version" class="cell-value">--</span>
+            </div>
+          </div>
+        </div>
+        <div id="settings-sub-body" class="sheet-body hidden">
+          <div id="settings-sub-compact" class="hidden">
+            <div class="ios-grouped-section">
+              <label class="ios-cell between" for="settings-knowledge-mode" style="cursor: pointer;">
+                <span class="cell-label">开启精简模式</span>
+                <input type="checkbox" id="settings-knowledge-mode" class="ios-switch-input" />
+              </label>
+            </div>
+            <div class="settings-note" style="margin: 6px 4px 14px;">开启后可折叠对话中的工具执行过程与底部任务辅助栏，让长对话阅读更聚焦。</div>
+            <div class="quota-section-header" style="margin: 6px 4px 6px;">降噪选项</div>
+            <div id="settings-compact-subpanel" class="ios-grouped-section compact-subpanel">
+              <label class="ios-cell between compact-subcell-page" for="settings-compact-collapse-tools" style="cursor: pointer;">
+                <div class="compact-subtext">
+                  <span class="cell-label">折叠工具执行过程</span>
+                  <span class="compact-subdesc">将检索与命令步骤收起为单行摘要</span>
+                </div>
+                <input type="checkbox" id="settings-compact-collapse-tools" class="ios-switch-input" checked />
+              </label>
+              <label class="ios-cell between compact-subcell-page" for="settings-compact-collapse-tasks" style="cursor: pointer;">
+                <div class="compact-subtext">
+                  <span class="cell-label">收起任务辅助栏</span>
+                  <span class="compact-subdesc">底部运行任务默认单行折叠，保留终止按钮</span>
+                </div>
+                <input type="checkbox" id="settings-compact-collapse-tasks" class="ios-switch-input" checked />
+              </label>
+              <label class="ios-cell between compact-subcell-page" for="settings-compact-hide-healthy-ctx" style="cursor: pointer;">
+                <div class="compact-subtext">
+                  <span class="cell-label">隐藏常规上下文</span>
+                  <span class="compact-subdesc">占用 &lt; 70% 时隐藏顶栏胶囊，≥ 70% 自动恢复预警</span>
+                </div>
+                <input type="checkbox" id="settings-compact-hide-healthy-ctx" class="ios-switch-input" />
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- iOS Bottom Sheet: Device Pairing -->
+    <div id="sheet-pairing" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <button id="btn-sheet-pairing-cancel" class="sheet-header-btn">取消</button>
+          <h2 class="sheet-title">设备配对鉴权</h2>
+          <button id="btn-sheet-pairing-submit" class="sheet-header-btn primary">确认配对</button>
+        </div>
+        <div class="sheet-body">
+          <div class="ios-grouped-section pairing-scan-section">
+            <button id="btn-pairing-scan" class="ios-cell-button pairing-scan-btn" type="button">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"></path>
+                <rect x="8" y="8" width="3" height="3"></rect><rect x="13" y="8" width="3" height="3"></rect><rect x="8" y="13" width="3" height="3"></rect><path d="M13 13h3v3"></path>
+              </svg>
+              <span>扫描配对二维码</span>
+            </button>
+          </div>
+          <div class="ios-grouped-section">
+            <div class="ios-cell no-padding">
+              <textarea id="input-pairing-code" rows="3" placeholder="输入配对码或粘贴完整配对链接 (如 agy://pair?host=...&code=...)"></textarea>
+            </div>
+          </div>
+          <div id="pairing-error-msg" class="pairing-error-text hidden"></div>
+          <p class="section-footer-note">
+            请查看电脑终端网关启动时打印的配对二维码或终端输出的配对 URI。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- iOS Bottom Sheet: 本会话改动 / diff（js/changes.js） -->
+    <div id="sheet-changes" class="ios-sheet-overlay hidden" data-feature="changes">
+      <div class="ios-sheet-card tall-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <button id="btn-changes-back" class="sheet-header-btn hidden" type="button">‹ 返回</button>
+          <h2 id="changes-title" class="sheet-title">本会话改动</h2>
+          <button id="btn-changes-close" class="sheet-header-btn primary" type="button">完成</button>
+        </div>
+        <div id="changes-body" class="sheet-body"></div>
+      </div>
+    </div>
+
+    <!-- iOS Bottom Sheet: Workflow 模板（js/workflows.js） -->
+    <div id="sheet-workflows" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card tall-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <button id="btn-workflows-left" class="sheet-header-btn wf-header-icon-btn" type="button" aria-label="编辑"></button>
+          <h2 id="workflows-title" class="sheet-title">Workflow 模板</h2>
+          <button id="btn-workflows-right" class="sheet-header-btn primary wf-header-icon-btn" type="button" aria-label="新增"></button>
+        </div>
+        <div id="workflows-body" class="sheet-body"></div>
+      </div>
+    </div>
+
+    <!-- iOS Bottom Sheet: Git 提交（js/git.js） -->
+    <div id="sheet-git" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card tall-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <button id="btn-git-refresh" class="sheet-header-btn" type="button" aria-label="刷新">刷新</button>
+          <h2 class="sheet-title">提交改动</h2>
+          <button id="btn-git-close" class="sheet-header-btn primary" type="button">完成</button>
+        </div>
+        <div id="git-body" class="sheet-body"></div>
+      </div>
+    </div>
+
+    <!-- iOS Bottom Sheet: Cockpit Quota Monitor -->
+    <div id="sheet-quota" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card quota-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <button id="btn-quota-mask" class="sheet-header-btn quota-mask-btn" title="打码脱敏" aria-label="打码脱敏">
+            <svg class="mask-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+              <line x1="1" y1="1" x2="23" y2="23"></line>
+            </svg>
+          </button>
+          <div class="sheet-title-group">
+            <h2 class="sheet-title">账户与用量大盘</h2>
+            <span id="quota-last-updated" class="sheet-subtitle"></span>
+          </div>
+          <button id="btn-quota-close" class="sheet-header-btn primary">完成</button>
+        </div>
+        
+        <!-- Segmented Control for Quotas vs Token History -->
+        <div class="sheet-segmented-bar" id="quota-segmented-bar">
+          <button type="button" class="sheet-segment-btn active" data-tab="realtime">实时配额</button>
+          <button type="button" class="sheet-segment-btn" data-tab="history">Token 历史看板</button>
+        </div>
+
+        <div class="sheet-body quota-sheet-body">
+          <!-- Tab 1: Realtime Account Quotas -->
+          <div id="quota-tab-realtime" class="quota-tab-content active">
+            <!-- Pinned Current Account -->
+            <div class="quota-section-header">当前使用账号</div>
+            <div id="quota-current-card" class="quota-account-card current-account-card">
+              <!-- Populated dynamically via JS -->
+            </div>
+
+            <!-- Other Accounts List -->
+            <div id="quota-other-header" class="quota-section-header">备用账号</div>
+            <div id="quota-other-list" class="quota-accounts-list">
+              <!-- Populated dynamically via JS -->
+            </div>
+            <div id="quota-footer" class="quota-footer"></div>
+          </div>
+
+          <!-- Tab 2: Token History & 52-Week Heatmap -->
+          <div id="quota-tab-history" class="quota-tab-content hidden">
+            <!-- Summary KPI Cards -->
+            <div class="token-kpi-grid">
+              <div class="token-kpi-card">
+                <span class="token-kpi-label">今日消耗</span>
+                <strong id="kpi-today-tokens" class="token-kpi-val">--</strong>
+              </div>
+              <div class="token-kpi-card">
+                <span class="token-kpi-label">近 7 日消耗</span>
+                <strong id="kpi-7d-tokens" class="token-kpi-val">--</strong>
+              </div>
+              <div class="token-kpi-card">
+                <span class="token-kpi-label">累计总 Token</span>
+                <strong id="kpi-total-tokens" class="token-kpi-val">--</strong>
+              </div>
+              <div class="token-kpi-card highlight">
+                <span class="token-kpi-label">API 参考折算</span>
+                <div class="token-kpi-cost">
+                  <span id="kpi-cost-usd" class="cost-usd">$0.00</span>
+                  <span id="kpi-cost-cny" class="cost-cny">≈ ¥0.00</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Terminal Source Split Pill -->
+            <div class="token-source-pill">
+              <span id="kpi-desktop-split">桌面端: --</span>
+              <span class="split-divider">·</span>
+              <span id="kpi-cli-split">CLI 端: --</span>
+            </div>
+
+            <!-- 52-Week GitHub Heatmap Section -->
+            <div class="heatmap-section-header">
+              <span>52 周活跃日历热力图</span>
+              <span class="heatmap-legend">
+                <span>少</span>
+                <i class="heat-dot level-0"></i>
+                <i class="heat-dot level-1"></i>
+                <i class="heat-dot level-2"></i>
+                <i class="heat-dot level-3"></i>
+                <i class="heat-dot level-4"></i>
+                <span>多</span>
+              </span>
+            </div>
+            <div class="heatmap-scroll-wrap" id="heatmap-scroll-wrap">
+              <div id="token-heatmap-grid" class="token-heatmap-grid">
+                <!-- Generated dynamically via JS -->
+              </div>
+            </div>
+
+            <!-- Inline Inspector Detail Card -->
+            <div id="token-inspector-card" class="token-inspector-card">
+              <div class="inspector-header">
+                <span id="inspector-date" class="inspector-date">请点击方格查看单日明细</span>
+                <span id="inspector-cost" class="inspector-cost"></span>
+              </div>
+              <div id="inspector-body" class="inspector-body">
+                <div class="inspector-row"><span>总用量:</span> <strong id="inspector-total">--</strong></div>
+                <div class="inspector-row"><span>输入 / 缓存 / 输出:</span> <span id="inspector-breakdown">--</span></div>
+                <div class="inspector-row"><span>活跃步数:</span> <span id="inspector-steps">--</span></div>
+                <div id="inspector-models" class="inspector-models"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Audit Sheet: Context & Generation Speed Inspector -->
+    <div id="sheet-audit" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card audit-sheet-card">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-header">
+          <div class="sheet-title-group">
+            <h2 class="sheet-title">实时上下文</h2>
+            <span id="audit-session-subtitle" class="sheet-subtitle">实时监控与物理窗口分析</span>
+          </div>
+          <button id="btn-audit-close" class="sheet-header-btn primary">完成</button>
+        </div>
+        <div class="sheet-body audit-sheet-body">
+          <div class="audit-kpi-grid">
+            <div class="audit-kpi-card">
+              <span class="audit-kpi-label">实时上下文</span>
+              <div class="audit-kpi-val"><span id="audit-used-tokens">0</span> <span class="audit-kpi-unit">/ <span id="audit-max-tokens">200k</span></span></div>
+              <div class="audit-progress-bar"><div id="audit-progress-fill" class="audit-progress-fill" style="width: 0%"></div></div>
+            </div>
+            <div class="audit-kpi-card">
+              <span class="audit-kpi-label">首字延迟 (TTFT)</span>
+              <div class="audit-kpi-val"><span id="audit-ttft-val">--</span> <span class="audit-kpi-unit">s</span></div>
+            </div>
+            <div class="audit-kpi-card">
+              <span class="audit-kpi-label">流式输出速度</span>
+              <div class="audit-kpi-val"><span id="audit-tps-val">--</span> <span class="audit-kpi-unit">t/s</span></div>
+            </div>
+            <div class="audit-kpi-card">
+              <span class="audit-kpi-label">持续生成时间</span>
+              <div class="audit-kpi-val"><span id="audit-stream-duration">--</span> <span class="audit-kpi-unit">s</span></div>
+            </div>
+          </div>
+          <div class="audit-section-title">Token 结构分布 (本轮)</div>
+          <div class="audit-breakdown-card">
+            <div class="audit-breakdown-row"><span>输入 Tokens (Prompt)</span><strong id="audit-input-tokens">0</strong></div>
+            <div class="audit-breakdown-row"><span>缓存命中 (Cache Read)</span><strong id="audit-cache-tokens">0</strong></div>
+            <div class="audit-breakdown-row"><span>模型输出 (Output)</span><strong id="audit-output-tokens">0</strong></div>
+            <div class="audit-breakdown-row"><span>深度思考 (Thinking)</span><strong id="audit-thinking-tokens">0</strong></div>
+          </div>
+          <div class="audit-actions-bar">
+            <button id="btn-audit-compact" class="audit-action-btn primary" type="button">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5l5 5 5-5"/><path d="M7 19l5-5 5 5"/></svg>
+              一键压缩
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- iOS Bottom Sheet: Markdown File / Plan Viewer -->
+    <div id="sheet-markdown-viewer" class="ios-sheet-overlay hidden">
+      <div class="ios-sheet-card md-viewer-sheet-card">
+        <div class="sheet-grabber md-viewer-grabber"></div>
+        <div class="sheet-header md-viewer-header">
+          <div class="sheet-title-group md-viewer-title-group">
+            <h2 id="md-viewer-title" class="sheet-title md-viewer-title">Implementation Plan</h2>
+            <span id="md-viewer-subtitle" class="sheet-subtitle md-viewer-subtitle"></span>
+          </div>
+          <div class="md-viewer-header-actions">
+            <button id="btn-md-viewer-find" class="sheet-header-btn md-viewer-icon-btn" type="button" aria-label="在文档中查找" title="在文档中查找">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+            </button>
+            <button id="btn-md-viewer-close" class="sheet-header-btn primary" type="button">完成</button>
+          </div>
+        </div>
+        <dialog id="md-find-dialog" popover="manual" class="md-find-popover" aria-label="在文档中查找">
+          <input id="md-find-input" class="md-find-input" type="search" placeholder="在页面中查找…" autocomplete="off" />
+          <span id="md-find-count" class="md-find-count">0/0</span>
+          <button id="btn-md-find-prev" class="md-find-nav" type="button" aria-label="上一个">↑</button>
+          <button id="btn-md-find-next" class="md-find-nav" type="button" aria-label="下一个">↓</button>
+          <button id="btn-md-find-close" class="md-find-nav" type="button" aria-label="关闭查找">✕</button>
+        </dialog>
+        <div class="sheet-body md-viewer-sheet-body">
+          <div id="md-viewer-loading" class="md-viewer-loading">
+            <div class="loading-spinner"></div>
+            <span>正在读取文档内容...</span>
+          </div>
+          <div id="md-viewer-error" class="md-viewer-error hidden">
+            <span id="md-viewer-error-text">加载失败</span>
+            <button id="btn-md-viewer-retry" class="sheet-header-btn primary">重试</button>
+          </div>
+          <div id="md-viewer-content" class="md-viewer-markdown"></div>
+        </div>
+        <div id="md-viewer-proceed-bar" class="md-viewer-proceed-bar hidden">
+          <div class="proceed-bar-info">
+            <span class="proceed-bar-label">方案查阅完毕</span>
+            <span class="proceed-bar-desc">点击立即进入自动化执行</span>
+          </div>
+          <button id="btn-md-viewer-proceed" class="btn-proceed-modal">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            <span>确认执行 (Proceed)</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- iOS Native Alert: Rename Conversation (UIAlertController style) -->
+    <div id="alert-rename" class="ios-alert-overlay hidden">
+      <div class="ios-alert-box">
+        <div class="ios-alert-header">
+          <h3 class="ios-alert-title">重命名会话</h3>
+          <p class="ios-alert-message">请输入此会话的新标题</p>
+        </div>
+        <div class="ios-alert-input-wrapper">
+          <input type="text" id="input-rename-title" class="ios-alert-input" placeholder="输入新标题" maxlength="60" autocomplete="off" />
+        </div>
+        <div class="ios-alert-actions">
+          <button id="btn-alert-rename-cancel" class="ios-alert-btn cancel" type="button">取消</button>
+          <button id="btn-alert-rename-save" class="ios-alert-btn save" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- iOS Native ActionSheet: Delete Conversation Confirmation -->
+    <div id="actionsheet-delete" class="ios-actionsheet-overlay hidden">
+      <div class="ios-actionsheet-backdrop" id="actionsheet-delete-backdrop"></div>
+      <div class="ios-actionsheet-container">
+        <div class="ios-actionsheet-group">
+          <div class="ios-actionsheet-header">
+            <span class="actionsheet-title">确定删除此会话吗？</span>
+            <span class="actionsheet-subtitle">此操作将永久删除会话记录且无法撤销。</span>
+          </div>
+          <button id="btn-actionsheet-delete-confirm" class="ios-actionsheet-btn destructive" type="button">删除会话</button>
+        </div>
+        <div class="ios-actionsheet-group">
+          <button id="btn-actionsheet-delete-cancel" class="ios-actionsheet-btn cancel" type="button">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Full-Screen Image Viewer Modal (Lightbox with Zoom & Pan) -->
+    <div id="image-viewer-modal" class="image-viewer-modal hidden" role="dialog" aria-modal="true" aria-label="全屏查看图片">
+      <div class="image-viewer-backdrop" id="image-viewer-backdrop"></div>
+      
+      <!-- Top Navigation Bar (iOS Translucent Header) -->
+      <div class="image-viewer-navbar">
+        <button id="btn-image-viewer-close" class="image-viewer-nav-btn" aria-label="关闭" title="关闭 (Esc)">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+
+        <div class="image-viewer-title-group">
+          <span id="image-viewer-filename" class="image-viewer-title">原图预览</span>
+          <span id="image-viewer-meta" class="image-viewer-meta">正在载入高清原图...</span>
+        </div>
+
+        <div class="image-viewer-nav-actions">
+          <button id="btn-image-viewer-download" class="image-viewer-nav-btn" aria-label="下载原图" title="保存/下载原图">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+          </button>
+          <button id="btn-image-viewer-external" class="image-viewer-nav-btn" aria-label="新标签页打开" title="在新标签页中打开">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+              <polyline points="15 3 21 3 21 9"></polyline>
+              <line x1="10" y1="14" x2="21" y2="3"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Scrollable Viewport & Interactive Stage -->
+      <div class="image-viewer-viewport" id="image-viewer-viewport">
+        <div class="image-viewer-stage" id="image-viewer-stage">
+          <div class="image-viewer-loading" id="image-viewer-loading">
+            <div class="ios-spinner"></div>
+            <span>加载高清原图中...</span>
+          </div>
+          <img id="image-viewer-img" class="image-viewer-img" src="" alt="原图预览" draggable="false" />
+        </div>
+      </div>
+
+      <!-- Floating Bottom Toolbar -->
+      <div class="image-viewer-toolbar">
+        <button id="btn-image-zoom-out" class="image-viewer-tool-btn" aria-label="缩小" title="缩小">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </button>
+        <span id="image-viewer-zoom-label" class="image-viewer-zoom-label">100%</span>
+        <button id="btn-image-zoom-in" class="image-viewer-tool-btn" aria-label="放大" title="放大">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </button>
+        <div class="image-viewer-tool-divider"></div>
+        <button id="btn-image-zoom-fit" class="image-viewer-tool-btn text-btn" type="button">适应</button>
+        <button id="btn-image-zoom-actual" class="image-viewer-tool-btn text-btn" type="button">1:1</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 扫码配对：实时摄像头 / 拍照识别（见 js/scan.js） -->
+  <div id="scan-overlay" class="scan-overlay hidden" role="dialog" aria-modal="true" aria-label="扫描配对二维码">
+    <video id="scan-video" class="scan-video" playsinline muted autoplay></video>
+    <div class="scan-dim"></div>
+    <div class="scan-topbar">
+      <button id="btn-scan-cancel" class="scan-glass-btn" type="button">取消</button>
+      <span class="scan-title">扫描配对二维码</span>
+      <span class="scan-topbar-spacer"></span>
+    </div>
+    <div class="scan-frame" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    <div class="scan-bottom">
+      <div id="scan-status" class="scan-status">将二维码放入框内</div>
+      <div id="scan-actions" class="scan-actions">
+        <button id="btn-scan-photo" class="scan-glass-btn" type="button">拍照识别</button>
+        <button id="btn-scan-gallery" class="scan-glass-btn" type="button">从相册选择</button>
+      </div>
+    </div>
+    <input id="scan-file-camera" type="file" accept="image/*" capture="environment" hidden>
+    <input id="scan-file-gallery" type="file" accept="image/*" hidden>
+  </div>
+
+  <!-- Antigravity 2.33 Native Modals (<dialog>) -->
+  <dialog id="dialog-github-pr" class="v233-dialog" aria-labelledby="pr-dialog-title">
+    <div class="v233-dialog-head">
+      <div class="v233-dialog-title-wrap">
+        <span id="pr-dialog-state" class="git-pr-badge open">OPEN</span>
+        <h2 id="pr-dialog-title" class="v233-dialog-title">Pull Request</h2>
+      </div>
+      <button type="button" id="btn-pr-dialog-close" class="v233-dialog-close" aria-label="关闭">✕</button>
+    </div>
+    <div id="pr-dialog-body" class="v233-dialog-body"></div>
+    <div class="v233-dialog-foot">
+      <a id="pr-dialog-open-ext" class="v233-btn" href="#" target="_blank" rel="noopener noreferrer">在浏览器打开 ↗</a>
+      <button type="button" id="btn-pr-dialog-ask" class="v233-btn primary">引用 PR 提问</button>
+    </div>
+  </dialog>
+
+  <dialog id="dialog-btw" class="v233-dialog v233-btw-dialog" aria-labelledby="btw-dialog-title">
+    <div class="v233-dialog-head">
+      <div class="v233-dialog-title-wrap">
+        <span class="v233-btw-badge">/btw</span>
+        <h2 id="btw-dialog-title" class="v233-dialog-title">旁问对话 (不干扰主线)</h2>
+      </div>
+      <button type="button" id="btn-btw-dialog-close" class="v233-dialog-close" aria-label="关闭">✕</button>
+    </div>
+    <div id="btw-dialog-body" class="v233-dialog-body">
+      <div id="btw-quote-card" class="v233-btw-quote hidden">
+        <div class="v233-btw-quote-head">
+          <span>附带引用上下文</span>
+          <button type="button" id="btn-btw-clear-quote" class="v233-mini-link">清除</button>
+        </div>
+        <div id="btw-quote-text" class="v233-btw-quote-text"></div>
+      </div>
+      <div id="btw-history-bar" class="v233-btw-history hidden"></div>
+      <div id="btw-status-area" class="v233-btw-status">在下方输入临时问题，独立旁路求解；解答完成后可一键插入主对话或作为独立会话继续。</div>
+    </div>
+    <div class="v233-btw-footer">
+      <div id="btw-insert-actions" class="v233-dialog-foot hidden" style="padding:0 0 8px 0;">
+        <button type="button" id="btn-btw-open-session" class="v233-btn">在独立会话打开</button>
+        <button type="button" id="btn-btw-insert-main" class="v233-btn primary">插入主对话</button>
+      </div>
+      <div class="v233-btw-composer">
+        <textarea id="btw-question-input" class="v233-btw-input" rows="2" placeholder="输入想顺便确认的问题…"></textarea>
+        <button type="button" id="btn-btw-send" class="v233-btn primary">发送</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="dialog-media-preview" class="v233-dialog" aria-labelledby="media-dialog-title">
+    <div class="v233-dialog-head">
+      <h2 id="media-dialog-title" class="v233-dialog-title">文件预览</h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button type="button" id="btn-media-dialog-find" class="v233-btn hidden">查找</button>
+        <button type="button" id="btn-media-dialog-close" class="v233-dialog-close" aria-label="关闭">✕</button>
+      </div>
+    </div>
+    <div id="media-dialog-body" class="v233-dialog-body"></div>
+    <div class="v233-dialog-foot">
+      <a id="media-dialog-open-ext" class="v233-btn primary" href="#" target="_blank" rel="noopener noreferrer">新标签页打开 / 下载 ↗</a>
+    </div>
+  </dialog>
+
+  <script defer src="/js/i18n.js?v=4"></script>
+  <script defer src="/js/e2ee.js?v=1"></script>
+  <script defer src="/js/core.js?v=42"></script>
+  <script defer src="/js/nav.js?v=48"></script>
+  <script defer src="/js/wechat_archive.js?v=1"></script>
+  <script defer src="/js/chat.js?v=45"></script>
+  <script defer src="/js/actions.js?v=37"></script>
+  <script defer src="/js/media.js?v=36"></script>
+  <script defer src="/js/cockpit.js?v=34"></script>
+  <script defer src="/js/scan.js?v=2"></script>
+  <script defer src="/js/msgmenu.js?v=5"></script>
+  <script defer src="/js/slash.js?v=3"></script>
+  <script defer src="/js/workflows.js?v=2"></script>
+  <script defer src="/js/changes.js?v=2"></script>
+  <script defer src="/js/git.js?v=4"></script>
+  <script defer src="/js/models.js?v=2"></script>
+  <script defer src="/js/subagents.js?v=5"></script>
+  <script defer src="/js/swarm.js?v=3"></script>
+  <script defer src="/js/egg.js?v=1"></script>
+  <script defer src="/js/phase3.js?v=4"></script>
+  <script defer src="/js/v233.js?v=5"></script>
+  <!-- init.js 必须最后加载：它在执行时就会调用 initApp()，依赖前面所有脚本里的函数 -->
+  <script defer src="/js/init.js?v=45"></script>
+</body>
+</html>

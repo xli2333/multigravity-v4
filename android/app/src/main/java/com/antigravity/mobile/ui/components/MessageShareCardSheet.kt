@@ -1,0 +1,868 @@
+package com.antigravity.mobile.ui.components
+
+import com.antigravity.mobile.ui.util.loc
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.UnfoldMore
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import com.antigravity.mobile.ui.screen.AntigravityVoiceIcon
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import androidx.compose.ui.graphics.lerp
+import com.antigravity.mobile.ui.theme.AntigravityTheme
+import com.antigravity.mobile.ui.theme.LocalAppColors
+import com.antigravity.mobile.ui.theme.ThemePreset
+import com.antigravity.mobile.ui.theme.ThemePresetCatalog
+import com.antigravity.mobile.ui.util.ShareImageUtils
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+/** 分享长图卡片头部需要的会话上下文。 */
+data class ShareCardContext(
+    val sessionTitle: String = "",
+    /** 完整模型展示名，如 "Gemini 3.8 Flash (High)" / "Claude Opus 4.6 (Thinking)"。 */
+    val modelName: String? = null,
+    val modelIsClaude: Boolean = false,
+    /** 会话发起时间（ISO-8601）。分享卡片显示它，而不是分享当下的时间。 */
+    val startedAtIso: String? = null,
+    /** 紧邻该气泡之前的用户提问消息（含图片/附件，用于「包含上一条提问」开关）。 */
+    val previousMessage: com.antigravity.mobile.data.model.GatewayMessageItem? = null
+) {
+    companion object {
+        /**
+         * 长图里的模型名要和用户当时实际选用的模型一致：
+         * - Agent 回复：用生成这条回复的模型；
+         * - 用户提问：用紧随其后那条回复的模型；
+         * - 都没有（旧数据、未知枚举）：回退到会话当前模型。
+         */
+        fun resolveModel(
+            target: com.antigravity.mobile.data.model.GatewayMessageItem,
+            messages: List<com.antigravity.mobile.data.model.GatewayMessageItem>,
+            activeModel: String,
+            activeModelName: String?
+        ): Pair<String, Boolean> {
+            fun nameOf(m: com.antigravity.mobile.data.model.GatewayMessageItem): String? =
+                m.modelName?.takeIf { it.isNotBlank() } ?: m.model?.takeIf { it.isNotBlank() }?.let { modelBadge(it).first }
+
+            val source: com.antigravity.mobile.data.model.GatewayMessageItem? = when {
+                target.isUser -> {
+                    val idx = messages.indexOfFirst { it === target || (target.id.isNotBlank() && it.id == target.id) }
+                    if (idx < 0) null else messages.drop(idx + 1).takeWhile { !it.isUser }.firstOrNull { nameOf(it) != null }
+                }
+                nameOf(target) != null -> target
+                else -> null
+            }
+            if (source != null) {
+                val id = source.model ?: activeModel
+                return nameOf(source)!! to com.antigravity.mobile.data.model.ModelDefaults.isClaude(id)
+            }
+            val fallback = activeModelName?.takeIf { it.isNotBlank() } ?: modelBadge(activeModel).first
+            return fallback to com.antigravity.mobile.data.model.ModelDefaults.isClaude(activeModel)
+        }
+
+        /** ISO-8601 → 本地时区的 `yyyy-MM-dd HH:mm`；解析失败返回 null（界面直接不显示，不拿分享时间冒充）。 */
+        fun formatStartedAt(iso: String?, zone: java.time.ZoneId = java.time.ZoneId.systemDefault()): String? {
+            val raw = iso?.trim().orEmpty()
+            if (raw.isEmpty()) return null
+            val instant = runCatching { java.time.Instant.parse(raw) }.getOrNull()
+                ?: runCatching { java.time.OffsetDateTime.parse(raw).toInstant() }.getOrNull()
+                ?: return null
+            return java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(zone).format(instant)
+        }
+
+        /** 把 `gemini-3.8-flash-high` / `claude-opus-4-6-thinking` 这类内部模型 ID 转成展示名。 */
+        fun modelBadge(raw: String): Pair<String, Boolean> {
+            val isClaude = raw.contains("claude", ignoreCase = true) || raw.contains("M26")
+            val effort = setOf("high", "medium", "low")
+            val tokens = raw.split("-").filter { it.isNotBlank() }.toMutableList()
+            if (tokens.firstOrNull()?.equals("claude", ignoreCase = true) == true) tokens.removeAt(0)
+            tokens.removeAll { it.lowercase() in effort }
+            val parts = mutableListOf<String>()
+            for (token in tokens) {
+                val isDigits = token.all { it.isDigit() }
+                val last = parts.lastOrNull()
+                if (isDigits && last != null && last.all { it.isDigit() || it == '.' }) {
+                    parts[parts.lastIndex] = "$last.$token"
+                } else if (token.first().isLetter()) {
+                    parts.add(token.replaceFirstChar { it.uppercase() })
+                } else {
+                    parts.add(token)
+                }
+            }
+            var name = parts.joinToString(" ")
+            if (!isClaude && !name.startsWith("Gemini", ignoreCase = true)) name = "Gemini $name"
+            return (name.ifBlank { if (isClaude) "Claude" else "Gemini" }) to isClaude
+        }
+    }
+}
+
+@Immutable
+data class ShareCardTheme(val preset: ThemePreset) {
+    val isDark: Boolean get() = preset.isDark
+    val accent: Color get() = preset.accent
+    val label: String get() = preset.name
+
+    val background: Brush
+        get() = when (preset.appColors.themeId) {
+            "default-dark" -> Brush.linearGradient(listOf(Color(0xFF0F121C), Color(0xFF1F1738)))
+            "default-light" -> Brush.linearGradient(listOf(Color(0xFFFCFCFA), Color(0xFFF5F5F2)))
+            else -> Brush.linearGradient(
+                listOf(preset.bg, lerp(preset.bg, Color.Black, if (preset.isDark) 0.14f else 0.04f))
+            )
+        }
+
+    val questionBackground: Color
+        get() = when (preset.appColors.themeId) {
+            "default-dark" -> Color.White.copy(alpha = 0.09f)
+            "default-light" -> Color.Black.copy(alpha = 0.05f)
+            else -> preset.appColors.surface.copy(alpha = 0.94f)
+        }
+}
+
+private val CARD_WIDTH = 390.dp
+private const val MAX_PIXEL_HEIGHT = 8192
+
+/**
+ * 分享长图预览 Sheet：卡片以真实 Composable 渲染（所见即所得），
+ * 点击保存/分享/拷贝时通过 GraphicsLayer 将卡片原尺寸录制为位图。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MessageShareCardSheet(
+    content: String,
+    isUserMessage: Boolean,
+    images: List<ImageViewerItem>,
+    shareContext: ShareCardContext,
+    urlResolver: ((String) -> String)?,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = remember(context) { com.antigravity.mobile.data.service.PreferencesManager(context) }
+    val isSystemDark = androidx.compose.foundation.isSystemInDarkTheme()
+    val initialPreset = remember { prefs.resolvedShareCardSkin(isSystemDark) }
+    var theme by remember { mutableStateOf(ShareCardTheme(initialPreset)) }
+    var showSkinPicker by remember { mutableStateOf(false) }
+    var includeQuestion by remember { mutableStateOf(true) }
+    var busy by remember { mutableStateOf(false) }
+    val layer = rememberGraphicsLayer()
+    val canIncludeQuestion = !isUserMessage && (shareContext.previousMessage?.hasQuestionContent() ?: false)
+
+    val scaledLayer = rememberGraphicsLayer()
+    val density = androidx.compose.ui.platform.LocalDensity.current
+
+    /**
+     * 将卡片录制为位图。超过像素上限时先把图层按比例缩小录制到第二个图层再取位图，
+     * 避免整张超长图层直接超出 GPU 纹理上限而抛错（表现为"图片未就绪"）。
+     */
+    suspend fun capture(): Bitmap? {
+        return try {
+            val size = layer.size
+            if (size.height > MAX_PIXEL_HEIGHT) {
+                val ratio = MAX_PIXEL_HEIGHT.toFloat() / size.height
+                val target = androidx.compose.ui.unit.IntSize((size.width * ratio).roundToInt().coerceAtLeast(1), MAX_PIXEL_HEIGHT)
+                scaledLayer.record(density, androidx.compose.ui.unit.LayoutDirection.Ltr, target) {
+                    scale(ratio, pivot = Offset.Zero) {
+                        drawLayer(layer)
+                    }
+                }
+                scaledLayer.toImageBitmap().asAndroidBitmap()
+            } else {
+                layer.toImageBitmap().asAndroidBitmap()
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e("MessageShareCard", "capture failed", e)
+            null
+        }
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        sheetMaxWidth = androidx.compose.ui.unit.Dp.Unspecified,
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f)
+                .navigationBarsPadding()
+        ) {
+            // Top bar: 保存（左） / 标题 / 分享（右）
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            ShareImageUtils.saveBitmapToGallery(context, capture())
+                            busy = false
+                        }
+                    },
+                    enabled = !busy
+                ) {
+                    Icon(Icons.Default.FileDownload, contentDescription = "保存到相册".loc)
+                }
+                Text(
+                    text = "分享长图".loc,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+                IconButton(
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            ShareImageUtils.shareBitmap(context, capture())
+                            busy = false
+                        }
+                    },
+                    enabled = !busy
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = "分享".loc)
+                }
+            }
+
+            // Live preview of the card (what you see is what gets exported)
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+            ) {
+                ScaledToFitWidth(designWidth = CARD_WIDTH) {
+                    Box(
+                        modifier = Modifier.drawWithContent {
+                            layer.record { this@drawWithContent.drawContent() }
+                            drawLayer(layer)
+                        }
+                    ) {
+                        MessageShareCard(
+                            content = content,
+                            isUserMessage = isUserMessage,
+                            question = if (includeQuestion && canIncludeQuestion) shareContext.previousMessage else null,
+                            images = images,
+                            theme = theme,
+                            shareContext = shareContext,
+                            urlResolver = urlResolver
+                        )
+                    }
+                }
+            }
+
+            // 底部：左 = 皮肤切换，右 = 是否包含上一条提问
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ShareSkinPickerPill(
+                    preset = theme.preset,
+                    onClick = { showSkinPicker = true }
+                )
+                Spacer(Modifier.weight(1f))
+                if (canIncludeQuestion) {
+                    ShareOptionPill(
+                        icon = if (includeQuestion) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                        label = "包含提问".loc,
+                        selected = includeQuestion,
+                        onClick = { includeQuestion = !includeQuestion }
+                    )
+                }
+            }
+        }
+    }
+
+    if (showSkinPicker) {
+        ShareCardSkinPickerSheet(
+            selectedPreset = theme.preset,
+            onSelect = { preset ->
+                prefs.shareCardSkinId = preset.id
+                theme = ShareCardTheme(preset)
+                showSkinPicker = false
+            },
+            onDismiss = { showSkinPicker = false }
+        )
+    }
+}
+
+@Composable
+internal fun ShareSkinPickerPill(
+    preset: ThemePreset,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .height(44.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(9.dp).clip(CircleShape).background(preset.bg).border(0.5.dp, Color.Gray.copy(alpha = 0.4f), CircleShape))
+            Box(Modifier.size(9.dp).clip(CircleShape).background(preset.fg).border(0.5.dp, Color.Gray.copy(alpha = 0.4f), CircleShape))
+            Box(Modifier.size(9.dp).clip(CircleShape).background(preset.accent).border(0.5.dp, Color.Gray.copy(alpha = 0.4f), CircleShape))
+        }
+        Text(
+            text = preset.name,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Icon(Icons.Default.UnfoldMore, contentDescription = null, modifier = Modifier.size(16.dp))
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ShareCardSkinPickerSheet(
+    selectedPreset: ThemePreset,
+    onSelect: (ThemePreset) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val colors = AntigravityTheme.colors
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = colors.background
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.75f)
+                .navigationBarsPadding()
+        ) {
+            Text(
+                text = "选择长图皮肤".loc,
+                color = colors.textPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+            HorizontalDivider(thickness = 0.5.dp, color = colors.border)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                SkinGroupSection("基础风格".loc, ThemePresetCatalog.defaultSkins, selectedPreset, onSelect)
+                SkinGroupSection("精选桌面端配色".loc, ThemePresetCatalog.desktopSkins, selectedPreset, onSelect)
+                Spacer(Modifier.height(12.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SkinGroupSection(
+    title: String,
+    presets: List<ThemePreset>,
+    selectedPreset: ThemePreset,
+    onSelect: (ThemePreset) -> Unit
+) {
+    val colors = AntigravityTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = title,
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 4.dp)
+        )
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(colors.surface)
+                .border(0.5.dp, colors.border, RoundedCornerShape(12.dp))
+        ) {
+            presets.forEachIndexed { idx, preset ->
+                if (idx > 0) {
+                    HorizontalDivider(color = colors.separator.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(start = 58.dp))
+                }
+                val isSelected = preset.appColors.themeId == selectedPreset.appColors.themeId
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelect(preset) }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .size(width = 34.dp, height = 24.dp)
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(preset.bg)
+                            .border(0.8.dp, colors.border, RoundedCornerShape(7.dp))
+                            .padding(horizontal = 5.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Box(Modifier.size(width = 4.dp, height = 14.dp).clip(RoundedCornerShape(2.dp)).background(preset.accent))
+                        Box(Modifier.size(9.dp).clip(CircleShape).background(preset.fg))
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(preset.name, color = colors.textPrimary, fontSize = 14.5.sp, fontWeight = FontWeight.Medium)
+                        Text(preset.description, color = colors.textSecondary, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    if (isSelected) {
+                        Icon(Icons.Default.Check, contentDescription = null, tint = colors.accentBlue, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShareOptionPill(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val container = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+    else MaterialTheme.colorScheme.surfaceVariant
+    Row(
+        modifier = Modifier
+            .height(44.dp)
+            .clip(CircleShape)
+            .background(container)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
+        Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** 以 [designWidth] 排版内容，宽度不足时等比缩小并同步缩小占位高度。 */
+@Composable
+internal fun ScaledToFitWidth(designWidth: androidx.compose.ui.unit.Dp, content: @Composable () -> Unit) {
+    Box(
+        modifier = Modifier.layout { measurable, constraints ->
+            val designPx = designWidth.roundToPx()
+            val scale = min(1f, constraints.maxWidth.toFloat() / designPx)
+            val placeable = measurable.measure(
+                Constraints(minWidth = designPx, maxWidth = designPx, minHeight = 0, maxHeight = Constraints.Infinity)
+            )
+            layout((designPx * scale).roundToInt(), (placeable.height * scale).roundToInt()) {
+                placeable.placeWithLayer(0, 0) {
+                    scaleX = scale
+                    scaleY = scale
+                    transformOrigin = TransformOrigin(0f, 0f)
+                }
+            }
+        }
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun MessageShareCard(
+    content: String,
+    isUserMessage: Boolean,
+    question: com.antigravity.mobile.data.model.GatewayMessageItem?,
+    images: List<ImageViewerItem>,
+    theme: ShareCardTheme,
+    shareContext: ShareCardContext,
+    urlResolver: ((String) -> String)?
+) {
+    val dateText = remember(shareContext.startedAtIso) { ShareCardContext.formatStartedAt(shareContext.startedAtIso) }
+    CompositionLocalProvider(
+        LocalAppColors provides theme.preset.appColors,
+        LocalShareExport provides true
+    ) {
+        val colors = AntigravityTheme.colors
+        Column(
+            modifier = Modifier
+                .width(CARD_WIDTH)
+                .background(theme.background)
+                .padding(start = 20.dp, end = 20.dp, bottom = 20.dp, top = 56.dp), // 预留顶部：避开刘海/状态栏遮挡
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // Header: 会话标题 / 时间 + 模型胶囊
+            Text(
+                text = shareContext.sessionTitle.ifBlank { "Multigravity 会话".loc },
+                color = colors.textPrimary,
+                fontSize = 24.sp,
+                lineHeight = 30.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (!shareContext.modelName.isNullOrBlank()) {
+                    val tint = if (shareContext.modelIsClaude) colors.accentOrange else colors.accentBlue
+                    Text(
+                        shareContext.modelName,
+                        color = tint,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(tint.copy(alpha = 0.14f))
+                            .border(1.dp, tint.copy(alpha = 0.35f), CircleShape)
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+                if (dateText != null) {
+                    Text(dateText, color = colors.textSecondary, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+                }
+            }
+            HorizontalDivider(color = colors.textMuted.copy(alpha = 0.4f), thickness = 0.5.dp)
+
+            if (question != null) {
+                QuestionBubble(question, theme, urlResolver)
+            }
+
+            val appContext = LocalContext.current
+            images.forEach { item ->
+                AsyncImage(
+                    model = ImageRequest.Builder(appContext)
+                        .data(item.bitmap ?: item.bytes ?: item.url)
+                        .crossfade(false)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    alignment = Alignment.CenterStart,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                )
+            }
+
+            if (isUserMessage) {
+                val (userBodyText, attachedFiles) = remember(content) {
+                    com.antigravity.mobile.data.service.AttachmentRules.parseBlock(content)
+                }
+                val isVoice = remember(userBodyText, attachedFiles) {
+                    VoiceTranscriptCleaner.isVoiceMessage(userBodyText, attachedFiles)
+                }
+                if (isVoice) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(colors.accentIndigo)
+                                .padding(horizontal = 10.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            AntigravityVoiceIcon(
+                                modifier = Modifier.size(15.dp),
+                                tint = Color.White
+                            )
+                            Text(
+                                text = "语音交互".loc,
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        val cleaned = remember(userBodyText) { VoiceTranscriptCleaner.clean(userBodyText) }
+                        if (cleaned.isNotBlank()) {
+                            Text(
+                                text = cleaned,
+                                color = colors.textPrimary,
+                                fontSize = 15.sp,
+                                lineHeight = 21.sp
+                            )
+                        }
+                    }
+                } else {
+                    val (annotated, inlineMap) = remember(content) {
+                        SlashCommandTextRenderer.buildInlineText(
+                            text = content,
+                            iconColor = colors.textPrimary.copy(alpha = 0.85f)
+                        )
+                    }
+                    Text(
+                        text = annotated,
+                        inlineContent = inlineMap,
+                        color = colors.textPrimary,
+                        fontSize = 15.5.sp,
+                        lineHeight = 22.sp
+                    )
+                }
+            } else {
+                MarkdownContentView(content = content, urlResolver = urlResolver)
+            }
+
+            HorizontalDivider(color = colors.textMuted.copy(alpha = 0.4f), thickness = 0.5.dp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Image(
+                    painter = androidx.compose.ui.res.painterResource(com.antigravity.mobile.R.drawable.share_app_logo),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .border(0.5.dp, Color.Black.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Multigravity", color = colors.textPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.weight(1f))
+                val qr = remember { buildQrBitmap(LANDING_URL) }
+                if (qr != null) {
+                    Image(
+                        bitmap = qr.asImageBitmap(),
+                        contentDescription = LANDING_URL,
+                        filterQuality = androidx.compose.ui.graphics.FilterQuality.None,
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.White)
+                            .padding(4.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+private const val LANDING_URL = "https://mgy.jiuge.space"
+
+/** 用 zxing 本地生成落地页二维码（黑白位图）。 */
+private fun buildQrBitmap(text: String, size: Int = 320): Bitmap? = try {
+    val matrix = com.google.zxing.qrcode.QRCodeWriter().encode(
+        text,
+        com.google.zxing.BarcodeFormat.QR_CODE,
+        size,
+        size,
+        mapOf(
+            com.google.zxing.EncodeHintType.MARGIN to 0,
+            com.google.zxing.EncodeHintType.ERROR_CORRECTION to com.google.zxing.qrcode.decoder.ErrorCorrectionLevel.M
+        )
+    )
+    val pixels = IntArray(size * size) { i ->
+        if (matrix[i % size, i / size]) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+    }
+    Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
+} catch (e: Exception) {
+    null
+}
+
+private fun com.antigravity.mobile.data.model.GatewayMessageItem.hasQuestionContent(): Boolean {
+    val (body, files) = com.antigravity.mobile.data.service.AttachmentRules.parseBlock(effectiveText)
+    val hasImages = !imageUrls?.filter { com.antigravity.mobile.data.service.FileIconResolver.isImage(it) }.isNullOrEmpty() || effectiveImageDataList.isNotEmpty()
+    return body.isNotBlank() || files.isNotEmpty() || hasImages
+}
+
+/** 复刻电脑端的提问样式：图片 / 文件 / 文字整体放进一个带底色的圆角矩形，与下面的回答区分开。 */
+@Composable
+private fun QuestionBubble(
+    message: com.antigravity.mobile.data.model.GatewayMessageItem,
+    theme: ShareCardTheme,
+    urlResolver: ((String) -> String)?
+) {
+    val colors = AntigravityTheme.colors
+    val appContext = LocalContext.current
+    val (bodyText, files) = remember(message) {
+        com.antigravity.mobile.data.service.AttachmentRules.parseBlock(message.effectiveText)
+    }
+    val isVoiceMessage = remember(bodyText, files) {
+        VoiceTranscriptCleaner.isVoiceMessage(bodyText, files)
+    }
+    val cleanedVoiceText = remember(bodyText, isVoiceMessage) {
+        if (isVoiceMessage) VoiceTranscriptCleaner.clean(bodyText) else ""
+    }
+    val filteredFiles = remember(files, isVoiceMessage) {
+        if (isVoiceMessage) {
+            files.filter { it.ext.lowercase() !in listOf("wav", "m4a", "aac", "mp3", "caf", "opus") }
+        } else files
+    }
+    val imageItems = remember(message, urlResolver) {
+        val validUrls = message.imageUrls?.filter { com.antigravity.mobile.data.service.FileIconResolver.isImage(it) }
+        if (!validUrls.isNullOrEmpty()) {
+            validUrls.mapIndexed { idx, raw ->
+                ImageViewerItem(url = urlResolver?.invoke(raw) ?: raw, bytes = message.effectiveImageDataList.getOrNull(idx))
+            }
+        } else {
+            message.effectiveImageDataList.mapNotNull { bytes ->
+                try {
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) ImageViewerItem(bytes = bytes, bitmap = bmp) else null
+                } catch (_: Exception) { null }
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(theme.questionBackground)
+            .border(0.5.dp, colors.border, RoundedCornerShape(16.dp))
+            .padding(14.dp),
+        horizontalAlignment = Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        if (isVoiceMessage) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(colors.accentIndigo)
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                AntigravityVoiceIcon(
+                    modifier = Modifier.size(15.dp),
+                    tint = Color.White
+                )
+                Text(
+                    text = "语音交互".loc,
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        if (imageItems.size == 1) {
+            val item = imageItems.first()
+            AsyncImage(
+                model = ImageRequest.Builder(appContext).data(item.bytes ?: item.url).crossfade(false).build(),
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                alignment = Alignment.CenterStart,
+                modifier = Modifier
+                    .widthIn(max = 240.dp)
+                    .heightIn(max = 220.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .border(0.5.dp, colors.border, RoundedCornerShape(14.dp))
+            )
+        } else if (imageItems.size > 1) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                imageItems.forEach { item ->
+                    AsyncImage(
+                        model = ImageRequest.Builder(appContext).data(item.bytes ?: item.url).crossfade(false).build(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(0.5.dp, colors.border, RoundedCornerShape(12.dp))
+                    )
+                }
+            }
+        }
+
+        filteredFiles.forEach { f ->
+            Row(
+                modifier = Modifier
+                    .widthIn(max = 280.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(colors.surface)
+                    .border(0.5.dp, colors.border, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                FileTypeBadge(f.name, 36.dp)
+                Column {
+                    Text(
+                        text = f.name,
+                        color = colors.textPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(text = "${f.ext.uppercase()} · ${f.sizeLabel}", color = colors.textMuted, fontSize = 11.sp)
+                }
+            }
+        }
+
+        if (isVoiceMessage) {
+            if (cleanedVoiceText.isNotBlank()) {
+                Text(
+                    text = cleanedVoiceText,
+                    color = colors.textPrimary,
+                    fontSize = 15.sp,
+                    lineHeight = 21.sp
+                )
+            }
+        } else if (bodyText.isNotBlank()) {
+            Text(
+                text = bodyText,
+                color = colors.textPrimary,
+                fontSize = 15.5.sp,
+                lineHeight = 21.sp
+            )
+        }
+    }
+}

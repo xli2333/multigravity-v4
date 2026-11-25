@@ -1,0 +1,293 @@
+package com.antigravity.mobile.data.model
+
+import com.antigravity.mobile.ui.util.loc
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.util.*
+
+@Serializable
+data class WorkspaceItem(
+    @SerialName("workspaceFolderAbsoluteUri") val workspaceFolderAbsoluteUri: String? = null
+)
+
+@Serializable
+data class Annotations(
+    val title: String? = null,
+    val lastUserViewTime: String? = null,
+    val markedAsUnread: Boolean? = null,
+    val archived: Boolean? = null,
+    val pinned: Boolean? = null
+)
+
+@Serializable
+data class TrajectoryMetadata(
+    val workspaceUris: List<String>? = null,
+    val projectId: String? = null,
+    val createdAt: String? = null,
+    val parentConversationId: String? = null,
+    val rootConversationId: String? = null,
+    val nestingDepth: Int? = null,
+    val isBattleModeFork: Boolean? = null
+)
+
+@Serializable
+data class TrajectorySummary(
+    val summary: String? = null,
+    val stepCount: Int? = null,
+    val lastModifiedTime: String? = null,
+    val trajectoryId: String? = null,
+    val status: String? = null,
+    val workspaces: List<WorkspaceItem>? = null,
+    val annotations: Annotations? = null,
+    val trajectoryMetadata: TrajectoryMetadata? = null,
+    val needsInput: Boolean? = null,
+    val hasError: Boolean? = null,
+    val errorMessage: String? = null,
+    val parentConversationId: String? = null,
+    val nestingDepth: Int? = null,
+    val hasRunningTasks: Boolean? = null,
+    val runningTaskCount: Int? = null,
+    val hasRunningSubagents: Boolean? = null,
+    val notFullyIdle: Boolean? = null,
+    val backgroundTaskCount: Int? = null,
+    /** Official project display name (alias or project.name) resolved by the gateway. */
+    val workspaceName: String? = null,
+    val currentBranch: String? = null,
+    val pullRequest: GitPullRequestItem? = null
+) {
+    val isSubagent: Boolean
+        get() {
+            if (!parentConversationId.isNullOrBlank() || (nestingDepth ?: 0) > 0) return true
+            val meta = trajectoryMetadata ?: return false
+            if (!meta.parentConversationId.isNullOrBlank()) return true
+            if (meta.isBattleModeFork == true) return true
+            if ((meta.nestingDepth ?: 0) > 0) return true
+            return false
+        }
+}
+
+@Serializable
+data class GetAllCascadeTrajectoriesResponse(
+    val trajectorySummaries: Map<String, TrajectorySummary>? = null
+)
+
+enum class ConversationStatus(val raw: String) {
+    RUNNING("RUNNING"),
+    ACTION("ACTION"),
+    ERROR("ERROR"),
+    IDLE("IDLE"),
+    UNKNOWN("UNKNOWN");
+
+    val isRunning: Boolean get() = this == RUNNING
+    val needsAction: Boolean get() = this == ACTION
+    val isError: Boolean get() = this == ERROR
+}
+
+@Serializable
+data class ConversationItem(
+    val id: String,
+    val title: String,
+    val status: ConversationStatus = ConversationStatus.UNKNOWN,
+    val stepCount: Int = 0,
+    val workspaceName: String = "Chat",
+    val lastModifiedTime: String? = null,
+    val isSubagent: Boolean = false,
+    val isUnread: Boolean = false,
+    val draftProject: ProjectItem? = null,
+    val parentConversationId: String? = null,
+    val nestingDepth: Int = 0,
+    val isPinned: Boolean = false,
+    val hasRunningTasks: Boolean = false,
+    val hasRunningSubagents: Boolean = false,
+    val currentBranch: String? = null,
+    val pullRequest: GitPullRequestItem? = null
+) {
+    val displayTitle: String
+        get() = title.ifBlank { "未命名会话".loc }
+
+    val lastModifiedEpochMs: Long
+        get() = parseIsoDate(lastModifiedTime)
+
+    val relativeTimeString: String
+        get() {
+            val timeMs = lastModifiedEpochMs
+            if (timeMs <= 0L) return ""
+            val diffMs = System.currentTimeMillis() - timeMs
+            if (diffMs < 0) return "刚刚".loc
+            val diffSec = diffMs / 1000
+            return when {
+                diffSec < 60 -> "刚刚".loc
+                diffSec < 3600 -> "${diffSec / 60}分钟前".loc
+                diffSec < 86400 -> "${diffSec / 3600}小时前".loc
+                else -> "${diffSec / 86400}天前".loc
+            }
+        }
+
+    val isPureChat: Boolean
+        get() = workspaceName == "Chat" || workspaceName.isEmpty() || draftProject?.isPureChat == true
+
+    val isWorking: Boolean
+        get() = status.isRunning || hasRunningTasks
+
+    val isDraft: Boolean
+        get() = id.startsWith("local_draft_") || id.startsWith("draft_") || draftProject != null
+
+    companion object {
+        fun sanitizeTitle(raw: String): String {
+            val stripped = raw.replace(Regex("<[^>]+>"), "").trim()
+            val firstLine = stripped.lines().firstOrNull { it.isNotBlank() }?.trim() ?: ""
+            if (firstLine.isEmpty()) return "未命名会话".loc
+            return if (firstLine.length > 36) firstLine.take(36) + "..." else firstLine
+        }
+
+        fun fromSummary(
+            id: String,
+            summary: TrajectorySummary,
+            localTitle: String? = null,
+            localViewTime: Long = 0,
+            isPinned: Boolean = summary.annotations?.pinned == true
+        ): ConversationItem {
+            val annotationTitle = summary.annotations?.title
+            val summaryText = summary.summary
+            val resolvedTitle = when {
+                !annotationTitle.isNullOrBlank() && annotationTitle != "未命名会话".loc ->
+                    sanitizeTitle(annotationTitle)
+                !summaryText.isNullOrBlank() && summaryText != "未命名会话".loc ->
+                    sanitizeTitle(summaryText)
+                else -> "未命名会话".loc
+            }
+
+            val hasRunningTasks = summary.hasRunningTasks == true ||
+                (summary.runningTaskCount ?: 0) > 0 ||
+                (summary.backgroundTaskCount ?: 0) > 0 ||
+                summary.notFullyIdle == true
+            val hasRunningSubagents = summary.hasRunningSubagents == true
+
+            val status = when {
+                summary.needsInput == true || summary.status?.contains("WAITING", ignoreCase = true) == true -> ConversationStatus.ACTION
+                summary.hasError == true || summary.status.equals("CASCADE_RUN_STATUS_ERROR", ignoreCase = true) || summary.status.equals("ERROR", ignoreCase = true) || summary.status.equals("CASCADE_RUN_STATUS_FAILED", ignoreCase = true) -> ConversationStatus.ERROR
+                summary.status.equals("CASCADE_RUN_STATUS_RUNNING", ignoreCase = true) || summary.status.equals("RUNNING", ignoreCase = true) || hasRunningSubagents -> ConversationStatus.RUNNING
+                summary.status.equals("CASCADE_RUN_STATUS_IDLE", ignoreCase = true) || summary.status.equals("IDLE", ignoreCase = true) || summary.status.equals("CASCADE_RUN_STATUS_DONE", ignoreCase = true) || summary.status.equals("CASCADE_RUN_STATUS_COMPLETED", ignoreCase = true) -> ConversationStatus.IDLE
+                else -> ConversationStatus.UNKNOWN
+            }
+
+            val stepCount = summary.stepCount ?: 0
+
+            val wsUri = summary.trajectoryMetadata?.workspaceUris?.firstOrNull()
+                ?: summary.workspaces?.firstOrNull()?.workspaceFolderAbsoluteUri
+                ?: ""
+
+            // Prefer the gateway-resolved official project name / alias, then fall back to the folder name.
+            val explicitWsName = summary.workspaceName?.trim().orEmpty()
+            val workspaceName = when {
+                explicitWsName.isNotEmpty() -> explicitWsName
+                wsUri.isNotBlank() -> wsUri.trimEnd('/').substringAfterLast('/').ifBlank { "Chat" }
+                else -> "Chat"
+            }
+
+            val resolvedTime = summary.lastModifiedTime?.takeIf { it.isNotBlank() }
+                ?: summary.annotations?.lastUserViewTime?.takeIf { it.isNotBlank() }
+                ?: summary.trajectoryMetadata?.createdAt?.takeIf { it.isNotBlank() }
+
+            // Unread calculation
+            var unread = false
+            if (status != ConversationStatus.RUNNING && status != ConversationStatus.ACTION && summary.annotations?.archived != true) {
+                if (summary.annotations?.markedAsUnread == true) {
+                    unread = true
+                } else if (!resolvedTime.isNullOrBlank()) {
+                    val modDate = parseIsoDate(resolvedTime)
+                    val serverViewDate = summary.annotations?.lastUserViewTime?.let { parseIsoDate(it) } ?: 0L
+                    val effectiveDate = maxOf(serverViewDate, localViewTime)
+                    unread = if (effectiveDate > 0) modDate > effectiveDate else true
+                }
+            }
+
+            val parentId = summary.parentConversationId ?: summary.trajectoryMetadata?.parentConversationId
+            val depth = summary.nestingDepth ?: summary.trajectoryMetadata?.nestingDepth ?: 0
+
+            return ConversationItem(
+                id = id,
+                title = resolvedTitle,
+                status = status,
+                stepCount = stepCount,
+                workspaceName = workspaceName,
+                lastModifiedTime = resolvedTime,
+                isSubagent = summary.isSubagent,
+                isUnread = unread,
+                parentConversationId = parentId,
+                nestingDepth = depth,
+                isPinned = isPinned,
+                hasRunningTasks = hasRunningTasks,
+                hasRunningSubagents = hasRunningSubagents,
+                currentBranch = summary.currentBranch,
+                pullRequest = summary.pullRequest
+            )
+        }
+
+        fun parseIsoDate(isoString: String?): Long {
+            if (isoString.isNullOrBlank()) return 0L
+            val trimmed = isoString.trim()
+            val normalized = if (trimmed.contains(' ') && !trimmed.contains('T')) {
+                trimmed.replace(' ', 'T')
+            } else {
+                trimmed
+            }
+            return try {
+                Instant.parse(normalized).toEpochMilli()
+            } catch (_: Exception) {
+                try {
+                    OffsetDateTime.parse(normalized).toInstant().toEpochMilli()
+                } catch (_: Exception) {
+                    try {
+                        val clean = normalized.trimEnd('Z').substringBefore('.')
+                        val inputFmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+                            timeZone = TimeZone.getTimeZone("UTC")
+                        }
+                        inputFmt.parse(clean)?.time ?: 0L
+                    } catch (_: Exception) {
+                        0L
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Serializable
+data class LocalDraftSession(
+    val id: String = "local_draft_${UUID.randomUUID()}",
+    val project: ProjectItem,
+    var draftText: String = "",
+    val createdAtEpochMs: Long = System.currentTimeMillis(),
+    var updatedAtEpochMs: Long = System.currentTimeMillis()
+) {
+    fun toConversationItem(hasImages: Boolean = false, isPinned: Boolean = false): ConversationItem {
+        val trimmed = draftText.trim()
+        val firstLine = trimmed.lines().firstOrNull { it.isNotBlank() }?.trim() ?: ""
+        val isPure = project.isPureChat
+        val displayTitle = when {
+            firstLine.isNotEmpty() -> if (firstLine.length > 36) firstLine.take(36) + "..." else firstLine
+            hasImages -> if (isPure) "[图片] 新对话".loc else "[图片] ${project.name}".loc
+            else -> if (isPure) "新对话".loc else project.name
+        }
+        val nowIso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date(updatedAtEpochMs))
+
+        return ConversationItem(
+            id = id,
+            title = displayTitle,
+            status = ConversationStatus.IDLE,
+            stepCount = 0,
+            workspaceName = if (isPure) "Chat" else project.name,
+            lastModifiedTime = nowIso,
+            isSubagent = false,
+            isUnread = false,
+            isPinned = isPinned,
+            draftProject = project
+        )
+    }
+}

@@ -1,0 +1,539 @@
+import Foundation
+
+public struct GetAllCascadeTrajectoriesResponse: Codable, Sendable {
+    public let trajectorySummaries: [String: TrajectorySummary]?
+}
+
+public struct TrajectorySummary: Codable, Sendable {
+    public let summary: String?
+    public let stepCount: Int?
+    public let lastModifiedTime: String?
+    public let trajectoryId: String?
+    public let status: String?
+    public let workspaces: [WorkspaceItem]?
+    public let annotations: Annotations?
+    public let trajectoryMetadata: TrajectoryMetadata?
+    public let needsInput: Bool?
+    public let hasError: Bool?
+    public let errorMessage: String?
+    public let parentConversationId: String?
+    public let nestingDepth: Int?
+    public let hasRunningTasks: Bool?
+    public let runningTaskCount: Int?
+    public let hasRunningSubagents: Bool?
+    public let notFullyIdle: Bool?
+    public let backgroundTaskCount: Int?
+    public let workspaceName: String?
+    public let currentBranch: String?
+    public let pullRequest: GitPullRequestItem?
+    
+    public var isSubagent: Bool {
+        if let parent = parentConversationId, !parent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        if let depth = nestingDepth, depth > 0 {
+            return true
+        }
+        if let meta = trajectoryMetadata {
+            if let parent = meta.parentConversationId, !parent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return true
+            }
+            if meta.isBattleModeFork == true {
+                return true
+            }
+            if let depth = meta.nestingDepth, depth > 0 {
+                return true
+            }
+            if meta.hasSubagentSpec == true {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+public struct WorkspaceItem: Codable, Sendable {
+    public let workspaceFolderAbsoluteUri: String?
+}
+
+public struct Annotations: Codable, Sendable {
+    public let title: String?
+    public let lastUserViewTime: String?
+    public let markedAsUnread: Bool?
+    public let archived: Bool?
+    public let pinned: Bool?
+}
+
+public struct TrajectoryMetadata: Codable, Sendable {
+    public let workspaceUris: [String]?
+    public let projectId: String?
+    public let createdAt: String?
+    public let parentConversationId: String?
+    public let rootConversationId: String?
+    public let nestingDepth: Int?
+    public let hasSubagentSpec: Bool?
+    public let isBattleModeFork: Bool?
+    
+    enum CodingKeys: String, CodingKey {
+        case workspaceUris
+        case projectId
+        case createdAt
+        case parentConversationId
+        case rootConversationId
+        case nestingDepth
+        case subagentSpec
+        case agentScript
+        case isBattleModeFork
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.workspaceUris = try container.decodeIfPresent([String].self, forKey: .workspaceUris)
+        self.projectId = try container.decodeIfPresent(String.self, forKey: .projectId)
+        self.createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
+        self.parentConversationId = try container.decodeIfPresent(String.self, forKey: .parentConversationId)
+        self.rootConversationId = try container.decodeIfPresent(String.self, forKey: .rootConversationId)
+        self.nestingDepth = try container.decodeIfPresent(Int.self, forKey: .nestingDepth)
+        self.isBattleModeFork = try container.decodeIfPresent(Bool.self, forKey: .isBattleModeFork)
+        
+        let hasSpec = container.contains(.subagentSpec)
+        let hasScript = container.contains(.agentScript)
+        self.hasSubagentSpec = hasSpec || hasScript
+    }
+    
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(workspaceUris, forKey: .workspaceUris)
+        try container.encodeIfPresent(projectId, forKey: .projectId)
+        try container.encodeIfPresent(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(parentConversationId, forKey: .parentConversationId)
+        try container.encodeIfPresent(rootConversationId, forKey: .rootConversationId)
+        try container.encodeIfPresent(nestingDepth, forKey: .nestingDepth)
+        try container.encodeIfPresent(isBattleModeFork, forKey: .isBattleModeFork)
+    }
+    
+    public init(
+        workspaceUris: [String]? = nil,
+        projectId: String? = nil,
+        createdAt: String? = nil,
+        parentConversationId: String? = nil,
+        rootConversationId: String? = nil,
+        nestingDepth: Int? = nil,
+        hasSubagentSpec: Bool? = nil,
+        isBattleModeFork: Bool? = nil
+    ) {
+        self.workspaceUris = workspaceUris
+        self.projectId = projectId
+        self.createdAt = createdAt
+        self.parentConversationId = parentConversationId
+        self.rootConversationId = rootConversationId
+        self.nestingDepth = nestingDepth
+        self.hasSubagentSpec = hasSubagentSpec
+        self.isBattleModeFork = isBattleModeFork
+    }
+}
+
+public struct ConversationItem: Identifiable, Hashable, Sendable, Codable {
+    public let id: String
+    public let title: String
+    public let status: ConversationStatus
+    public let stepCount: Int
+    public let workspaceName: String
+    public let lastModified: Date?
+    public let isSubagent: Bool
+    public let isUnread: Bool
+    public let draftProject: ProjectItem?
+    public let parentConversationId: String?
+    public let nestingDepth: Int
+    public let isPinned: Bool
+    public let hasRunningTasks: Bool
+    public let hasRunningSubagents: Bool
+    public let currentBranch: String?
+    public let pullRequest: GitPullRequestItem?
+    
+    public var isDraft: Bool {
+        id.hasPrefix("local_draft_") || id.hasPrefix("draft_") || draftProject != nil
+    }
+    
+    public var isPureChat: Bool {
+        workspaceName == "Chat" || workspaceName.isEmpty || draftProject?.isPureChat == true
+    }
+
+    public var isWorking: Bool {
+        status.isRunning || hasRunningTasks
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case status
+        case stepCount
+        case workspaceName
+        case lastModified
+        case isSubagent
+        case isUnread
+        case draftProject
+        case parentConversationId
+        case nestingDepth
+        case isPinned
+        case hasRunningTasks
+        case hasRunningSubagents
+        case currentBranch
+        case pullRequest
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.title = try container.decode(String.self, forKey: .title)
+        self.status = try container.decodeIfPresent(ConversationStatus.self, forKey: .status) ?? .unknown
+        self.stepCount = try container.decodeIfPresent(Int.self, forKey: .stepCount) ?? 0
+        self.workspaceName = try container.decodeIfPresent(String.self, forKey: .workspaceName) ?? "Chat"
+        self.lastModified = try container.decodeIfPresent(Date.self, forKey: .lastModified)
+        self.isSubagent = try container.decodeIfPresent(Bool.self, forKey: .isSubagent) ?? false
+        self.isUnread = try container.decodeIfPresent(Bool.self, forKey: .isUnread) ?? false
+        self.draftProject = try container.decodeIfPresent(ProjectItem.self, forKey: .draftProject)
+        self.parentConversationId = try container.decodeIfPresent(String.self, forKey: .parentConversationId)
+        self.nestingDepth = try container.decodeIfPresent(Int.self, forKey: .nestingDepth) ?? 0
+        self.isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        self.hasRunningTasks = try container.decodeIfPresent(Bool.self, forKey: .hasRunningTasks) ?? false
+        self.hasRunningSubagents = try container.decodeIfPresent(Bool.self, forKey: .hasRunningSubagents) ?? false
+        self.currentBranch = try container.decodeIfPresent(String.self, forKey: .currentBranch)
+        self.pullRequest = try container.decodeIfPresent(GitPullRequestItem.self, forKey: .pullRequest)
+    }
+    
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(status, forKey: .status)
+        try container.encode(stepCount, forKey: .stepCount)
+        try container.encode(workspaceName, forKey: .workspaceName)
+        try container.encodeIfPresent(lastModified, forKey: .lastModified)
+        try container.encode(isSubagent, forKey: .isSubagent)
+        try container.encode(isUnread, forKey: .isUnread)
+        try container.encodeIfPresent(draftProject, forKey: .draftProject)
+        try container.encodeIfPresent(parentConversationId, forKey: .parentConversationId)
+        try container.encode(nestingDepth, forKey: .nestingDepth)
+        try container.encode(isPinned, forKey: .isPinned)
+        try container.encode(hasRunningTasks, forKey: .hasRunningTasks)
+        try container.encode(hasRunningSubagents, forKey: .hasRunningSubagents)
+        try container.encodeIfPresent(currentBranch, forKey: .currentBranch)
+        try container.encodeIfPresent(pullRequest, forKey: .pullRequest)
+    }
+    
+    public enum ConversationStatus: String, Sendable, Codable {
+        case running = "RUNNING"
+        case action = "ACTION"
+        case idle = "IDLE"
+        case unknown = "UNKNOWN"
+        case error = "ERROR"
+        
+        public var isRunning: Bool {
+            self == .running
+        }
+        
+        public var needsAction: Bool {
+            self == .action
+        }
+        
+        public var isError: Bool {
+            self == .error
+        }
+    }
+    
+    public func withTitle(_ newTitle: String) -> ConversationItem {
+        ConversationItem(
+            id: self.id,
+            title: newTitle,
+            status: self.status,
+            stepCount: self.stepCount,
+            workspaceName: self.workspaceName,
+            lastModified: self.lastModified,
+            isSubagent: self.isSubagent,
+            isUnread: self.isUnread,
+            draftProject: self.draftProject,
+            parentConversationId: self.parentConversationId,
+            nestingDepth: self.nestingDepth,
+            isPinned: self.isPinned,
+            hasRunningTasks: self.hasRunningTasks,
+            hasRunningSubagents: self.hasRunningSubagents,
+            currentBranch: self.currentBranch,
+            pullRequest: self.pullRequest
+        )
+    }
+
+    public func withPinned(_ pinned: Bool) -> ConversationItem {
+        ConversationItem(
+            id: self.id,
+            title: self.title,
+            status: self.status,
+            stepCount: self.stepCount,
+            workspaceName: self.workspaceName,
+            lastModified: self.lastModified,
+            isSubagent: self.isSubagent,
+            isUnread: self.isUnread,
+            draftProject: self.draftProject,
+            parentConversationId: self.parentConversationId,
+            nestingDepth: self.nestingDepth,
+            isPinned: pinned,
+            hasRunningTasks: self.hasRunningTasks,
+            hasRunningSubagents: self.hasRunningSubagents,
+            currentBranch: self.currentBranch,
+            pullRequest: self.pullRequest
+        )
+    }
+    
+    public static func sanitizeTitle(_ raw: String) -> String {
+        let s = raw.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if let firstLine = s.components(separatedBy: CharacterSet.newlines).first(where: { !$0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty }) {
+            let trimmed = firstLine.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            if trimmed.count > 36 {
+                return String(trimmed.prefix(36)) + "..."
+            }
+            return trimmed
+        }
+        return String(localized: "未命名会话")
+    }
+
+    public init(id: String, summary: TrajectorySummary) {
+        self.id = id
+        self.draftProject = nil
+        
+        var resolvedTitle = ""
+        if let t = summary.annotations?.title?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !t.isEmpty && t != "未命名会话" {
+            resolvedTitle = ConversationItem.sanitizeTitle(t)
+        } else if let s = summary.summary?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !s.isEmpty && s != "未命名会话" {
+            resolvedTitle = ConversationItem.sanitizeTitle(s)
+        } else {
+            if let cached = CacheManager.shared.loadSession(for: id) {
+                if let t = cached.title?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !t.isEmpty && t != "未命名会话" {
+                    resolvedTitle = ConversationItem.sanitizeTitle(t)
+                } else if let firstUserMsg = cached.messages.first(where: { $0.isUser }),
+                          let prompt = firstUserMsg.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).components(separatedBy: CharacterSet.newlines).first(where: { !$0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty }) {
+                    resolvedTitle = ConversationItem.sanitizeTitle(prompt)
+                }
+            }
+        }
+        let untitledLocalized = String(localized: "未命名会话")
+        self.title = (resolvedTitle.isEmpty || resolvedTitle == untitledLocalized) ? untitledLocalized : resolvedTitle
+        
+        self.hasRunningTasks = summary.hasRunningTasks == true ||
+            (summary.runningTaskCount ?? 0) > 0 ||
+            (summary.backgroundTaskCount ?? 0) > 0 ||
+            summary.notFullyIdle == true
+        self.hasRunningSubagents = summary.hasRunningSubagents == true
+        
+        if summary.needsInput == true {
+            self.status = .action
+        } else if summary.hasError == true || summary.status == "CASCADE_RUN_STATUS_ERROR" {
+            self.status = .error
+        } else if summary.status == "CASCADE_RUN_STATUS_RUNNING" || self.hasRunningSubagents {
+            self.status = .running
+        } else if summary.status == "CASCADE_RUN_STATUS_IDLE" {
+            self.status = .idle
+        } else {
+            self.status = .unknown
+        }
+        
+        self.stepCount = summary.stepCount ?? 0
+        
+        let wsUri = summary.trajectoryMetadata?.workspaceUris?.first
+            ?? summary.workspaces?.first?.workspaceFolderAbsoluteUri
+            ?? ""
+        let parts = wsUri.split(separator: "/").filter { !$0.isEmpty }
+        if let explicitWsName = summary.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitWsName.isEmpty {
+            self.workspaceName = explicitWsName
+        } else {
+            self.workspaceName = parts.last.map(String.init) ?? "Chat"
+        }
+        
+        if let timeStr = summary.lastModifiedTime {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            self.lastModified = formatter.date(from: timeStr) ?? ISO8601DateFormatter().date(from: timeStr)
+        } else {
+            self.lastModified = nil
+        }
+        
+        self.isSubagent = summary.isSubagent
+        
+        // 未读状态计算：排除运行中、等待交互及归档会话
+        var unread = false
+        if self.status != .running && self.status != .action && summary.annotations?.archived != true {
+            if summary.annotations?.markedAsUnread == true {
+                unread = true
+            } else if let modDate = self.lastModified {
+                var serverViewDate: Date? = nil
+                if let uvStr = summary.annotations?.lastUserViewTime {
+                    let formatter = ISO8601DateFormatter()
+                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    serverViewDate = formatter.date(from: uvStr) ?? ISO8601DateFormatter().date(from: uvStr)
+                }
+                let localViewDate = CacheManager.shared.getLastViewDate(for: id)
+                let effectiveDate = [serverViewDate, localViewDate].compactMap { $0 }.max()
+                if let eff = effectiveDate {
+                    unread = modDate > eff
+                } else {
+                    unread = true
+                }
+            }
+        }
+        self.isUnread = unread
+        self.parentConversationId = summary.parentConversationId ?? summary.trajectoryMetadata?.parentConversationId
+        self.nestingDepth = summary.nestingDepth ?? summary.trajectoryMetadata?.nestingDepth ?? 0
+        if let serverPinned = summary.annotations?.pinned {
+            self.isPinned = serverPinned
+            CacheManager.shared.setPinned(cascadeId: id, pinned: serverPinned)
+        } else {
+            self.isPinned = CacheManager.shared.isPinned(cascadeId: id)
+        }
+        self.currentBranch = summary.currentBranch
+        self.pullRequest = summary.pullRequest
+    }
+    
+    public init(
+        id: String,
+        title: String,
+        status: ConversationStatus = .idle,
+        stepCount: Int = 0,
+        workspaceName: String = "workspace",
+        lastModified: Date? = Date(),
+        isSubagent: Bool = false,
+        isUnread: Bool = false,
+        draftProject: ProjectItem? = nil,
+        parentConversationId: String? = nil,
+        nestingDepth: Int = 0,
+        isPinned: Bool = false,
+        hasRunningTasks: Bool = false,
+        hasRunningSubagents: Bool = false,
+        currentBranch: String? = nil,
+        pullRequest: GitPullRequestItem? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.status = status
+        self.stepCount = stepCount
+        self.workspaceName = workspaceName
+        self.lastModified = lastModified
+        self.isSubagent = isSubagent
+        self.isUnread = isUnread
+        self.draftProject = draftProject
+        self.parentConversationId = parentConversationId
+        self.nestingDepth = nestingDepth
+        self.isPinned = isPinned
+        self.hasRunningTasks = hasRunningTasks
+        self.hasRunningSubagents = hasRunningSubagents
+        self.currentBranch = currentBranch
+        self.pullRequest = pullRequest
+    }
+    
+    public var effectiveLastModified: Date {
+        var newest = lastModified ?? .distantPast
+        if let touch = CacheManager.shared.getTouchDate(for: id), touch > newest {
+            newest = touch
+        }
+        if CacheManager.shared.hasDraft(for: id), let draftDate = CacheManager.shared.getDraftDate(for: id), draftDate > newest {
+            newest = draftDate
+        }
+        return newest
+    }
+    
+    public var relativeTimeString: String {
+        let date = effectiveLastModified
+        guard date != .distantPast else { return "" }
+        let diff = Date().timeIntervalSince(date)
+        if diff < 60 { return String(localized: "刚刚") }
+        if diff < 3600 { return String(localized: "\(Int(diff / 60))分钟前") }
+        if diff < 86400 { return String(localized: "\(Int(diff / 3600))小时前") }
+        return String(localized: "\(Int(diff / 86400))天前")
+    }
+}
+
+public struct LocalDraftSession: Codable, Sendable, Identifiable, Hashable {
+    public let id: String
+    public let project: ProjectItem
+    public var draftText: String
+    public var draftImages: [Data]
+    public var createdAt: Date
+    public var updatedAt: Date
+    
+    enum CodingKeys: String, CodingKey {
+        case id
+        case project
+        case draftText
+        case draftImages
+        case createdAt
+        case updatedAt
+    }
+    
+    public init(
+        id: String = "local_draft_\(UUID().uuidString)",
+        project: ProjectItem,
+        draftText: String = "",
+        draftImages: [Data] = [],
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.project = project
+        self.draftText = draftText
+        self.draftImages = draftImages
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.project = try container.decode(ProjectItem.self, forKey: .project)
+        self.draftText = try container.decodeIfPresent(String.self, forKey: .draftText) ?? ""
+        self.draftImages = try container.decodeIfPresent([Data].self, forKey: .draftImages) ?? []
+        self.createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        self.updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+    
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(project, forKey: .project)
+        try container.encode(draftText, forKey: .draftText)
+        try container.encode(draftImages, forKey: .draftImages)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
+    
+    public func toConversationItem() -> ConversationItem {
+        let trimmed = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let firstLine = trimmed.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasImages = !draftImages.isEmpty || CacheManager.shared.hasDraftImages(for: id)
+        let hasFiles = DraftFileStore.shared.hasFiles(for: id)
+        let isRecording = AudioRecorderManager.shared.isRecording && AudioRecorderManager.shared.currentCascadeId == id
+        let isPure = project.isPureChat
+        let displayTitle: String
+        if !firstLine.isEmpty {
+            displayTitle = firstLine
+        } else if isRecording {
+            displayTitle = isPure ? String(localized: "[录音中] 新对话") : String(localized: "[录音中] \(project.name)")
+        } else if hasImages {
+            displayTitle = isPure ? String(localized: "[图片] 新对话") : String(localized: "[图片] \(project.name)")
+        } else if hasFiles {
+            displayTitle = isPure ? String(localized: "[文件] 新对话") : String(localized: "[文件] \(project.name)")
+        } else {
+            displayTitle = isPure ? String(localized: "新对话") : project.name
+        }
+        return ConversationItem(
+            id: id,
+            title: displayTitle,
+            status: .idle,
+            stepCount: 0,
+            workspaceName: isPure ? "Chat" : project.name,
+            lastModified: updatedAt,
+            isSubagent: false,
+            isUnread: false,
+            draftProject: project
+        )
+    }
+}

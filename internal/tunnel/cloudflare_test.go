@@ -1,0 +1,295 @@
+package tunnel
+
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"antigravity-mobile/internal/config"
+)
+
+func TestGetStableMachineID(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("MULTIGRAVITY_DATA_DIR", tmpDir)
+
+	id1 := GetStableMachineID()
+	if id1 == "" {
+		t.Fatalf("expected non-empty machine id")
+	}
+	id2 := GetStableMachineID()
+	if id1 != id2 {
+		t.Fatalf("expected stable machine id across calls, got %s vs %s", id1, id2)
+	}
+	if len(id1) != 64 {
+		t.Fatalf("expected 64-hex CSPRNG machine id, got %s (len %d)", id1, len(id1))
+	}
+
+	// Verify existing machine_id on disk is preserved smoothly (CRIT-02 TOFU compatibility)
+	legacyID := "legacy-deterministic-machine-id-0123456789"
+	if err := os.WriteFile(filepath.Join(tmpDir, "machine_id"), []byte(legacyID+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetStableMachineID(); got != legacyID {
+		t.Fatalf("expected existing machine_id %q to be preserved, got %q", legacyID, got)
+	}
+}
+
+func TestNextReconnectBackoffAndPinnedChecksums(t *testing.T) {
+	b0 := nextReconnectBackoff(0)
+	b5 := nextReconnectBackoff(5)
+	if b0 < 2*time.Second || b0 > 5*time.Second {
+		t.Errorf("unexpected initial backoff: %v", b0)
+	}
+	if b5 < 45*time.Second || b5 > 75*time.Second {
+		t.Errorf("unexpected capped backoff: %v", b5)
+	}
+	for _, u := range getCloudflaredDownloadURLs() {
+		if _, err := expectedCloudflaredSHA256(u); err != nil {
+			t.Errorf("expected pinned SHA-256 for %s, got err: %v", u, err)
+		}
+	}
+	if _, err := expectedCloudflaredSHA256("http://github.com/cloudflare/cloudflared/releases/download/2026.11.1/cloudflared-linux-amd64"); err == nil {
+		t.Errorf("expected non-HTTPS download URL to be rejected")
+	}
+}
+
+func TestCloudflareTunnel_PublicURL(t *testing.T) {
+	res := &CFTunnelResult{
+		Success:   true,
+		Subdomain: "abc12345.mgy.example.com",
+		URL:       "https://abc12345.mgy.example.com",
+		Token:     "test-token",
+	}
+	tun := NewCloudflareTunnel(res)
+	if tun.PublicURL() != "https://abc12345.mgy.example.com" {
+		t.Errorf("unexpected public URL: %s", tun.PublicURL())
+	}
+	if tun.Subdomain() != "abc12345.mgy.example.com" {
+		t.Errorf("unexpected subdomain: %s", tun.Subdomain())
+	}
+}
+
+func TestGetCloudflaredDownloadURLs(t *testing.T) {
+	urls := getCloudflaredDownloadURLs()
+	if len(urls) == 0 {
+		t.Fatalf("expected download urls for current platform")
+	}
+
+	var hasFast, hasProxy, hasOfficial bool
+	for _, u := range urls {
+		if !strings.HasPrefix(u, "https://") {
+			t.Errorf("expected HTTPS download URL, got %s", u)
+		}
+		if strings.Contains(u, "ghfast.top") {
+			hasFast = true
+		}
+		if strings.Contains(u, "ghproxy.net") {
+			hasProxy = true
+		}
+		if strings.HasPrefix(u, "https://github.com/") {
+			hasOfficial = true
+		}
+	}
+
+	if !hasFast {
+		t.Errorf("expected ghfast.top in download URLs")
+	}
+	if !hasProxy {
+		t.Errorf("expected ghproxy.net in download URLs")
+	}
+	if !hasOfficial {
+		t.Errorf("expected official github.com URL as fallback")
+	}
+}
+
+func TestCreateDownloadHTTPClient(t *testing.T) {
+	// 1. Mirror client: must force direct (Proxy == nil)
+	mirrorClient := createDownloadHTTPClient("https://ghfast.top/https://github.com/foo/bar")
+	if mirrorClient.Timeout < 4*time.Minute {
+		t.Errorf("expected at least 4m timeout, got %v", mirrorClient.Timeout)
+	}
+	tr, ok := mirrorClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport")
+	}
+	if tr.Proxy != nil {
+		t.Errorf("expected mirror transport Proxy to be nil (forced direct)")
+	}
+
+	// 2. Official GitHub client
+	officialClient := createDownloadHTTPClient("https://github.com/foo/bar")
+	if officialClient.Timeout < 4*time.Minute {
+		t.Errorf("expected at least 4m timeout, got %v", officialClient.Timeout)
+	}
+}
+
+func TestDetectLocalProxy_Env(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
+	proxyURL := detectLocalProxy()
+	if proxyURL == nil {
+		t.Fatalf("expected detected proxy URL")
+	}
+	if proxyURL.Host != "127.0.0.1:9999" {
+		t.Errorf("expected host 127.0.0.1:9999, got %s", proxyURL.Host)
+	}
+}
+
+func TestBuildTunnelArgs(t *testing.T) {
+	// 1. Full config with DNS resolvers
+	cfg := &config.CloudflareConfig{
+		EdgeIPVersion: "4",
+		Protocol:      "http2",
+		Region:        "us",
+		DNSResolvers:  "223.5.5.5,119.29.29.29:53",
+	}
+	args := buildTunnelArgs(cfg)
+	expected := []string{
+		"tunnel",
+		"--edge-ip-version", "4",
+		"--region", "us",
+		"run",
+		"--protocol", "http2",
+		"--dns-resolver-addrs", "223.5.5.5:53",
+		"--dns-resolver-addrs", "119.29.29.29:53",
+	}
+	if len(args) != len(expected) {
+		t.Fatalf("expected %d args, got %d: %v", len(expected), len(args), args)
+	}
+	for i := range expected {
+		if args[i] != expected[i] {
+			t.Errorf("arg[%d]: expected %q, got %q", i, expected[i], args[i])
+		}
+	}
+
+	// 2. DNS override disabled
+	cfgDisabled := &config.CloudflareConfig{
+		DNSResolvers: "system",
+	}
+	argsDisabled := buildTunnelArgs(cfgDisabled)
+	for _, a := range argsDisabled {
+		if a == "--dns-resolver-addrs" {
+			t.Errorf("expected no --dns-resolver-addrs when disabled with 'system'")
+		}
+	}
+
+	// 3. Default auto config without custom DNS resolvers
+	cfgDefault := &config.CloudflareConfig{
+		EdgeIPVersion: "auto",
+		Protocol:      "http2",
+	}
+	argsDefault := buildTunnelArgs(cfgDefault)
+	expectedDefault := []string{
+		"tunnel",
+		"--edge-ip-version", "auto",
+		"run",
+		"--protocol", "http2",
+	}
+	if len(argsDefault) != len(expectedDefault) {
+		t.Fatalf("expected %d args, got %d: %v", len(expectedDefault), len(argsDefault), argsDefault)
+	}
+	for i := range expectedDefault {
+		if argsDefault[i] != expectedDefault[i] {
+			t.Errorf("arg[%d]: expected %q, got %q", i, expectedDefault[i], argsDefault[i])
+		}
+	}
+}
+
+func TestIsBenignCloudflareLog(t *testing.T) {
+	benignCases := []string{
+		"context canceled",
+		"2026-10-01T02:29:55Z ERR failed to serve incoming request error=\"already connected to this server, trying another address\"",
+		"2026-10-01T02:29:55Z WRN Unable to establish connection. error=\"already connected to this server, trying another address\" connIndex=3 event=0 ip=198.41.200.113",
+		"2026-10-01T02:29:57Z WRN Connection terminated error=\"already connected to this server, trying another address\" connIndex=3",
+		"2026-10-01T01:59:59Z ERR Failed to initialize DNS local resolver error=\"lookup region1.v2.argotunnel.com: i/o timeout\"",
+		"2026-10-01T02:05:04Z ERR Failed to refresh DNS local resolver error=\"lookup region1.v2.argotunnel.com: i/o timeout\"",
+	}
+
+	for _, line := range benignCases {
+		if !isBenignCloudflareLog(line) {
+			t.Errorf("expected benign log to be filtered: %q", line)
+		}
+	}
+
+	criticalCases := []string{
+		"ERR Fatal error: failed to authenticate with token",
+		"ERR Cannot dial edge: connection refused",
+		"ERR Registration failed",
+	}
+
+	for _, line := range criticalCases {
+		if isBenignCloudflareLog(line) {
+			t.Errorf("expected critical error NOT to be filtered: %q", line)
+		}
+	}
+}
+
+func TestFindCloudflaredBinary_IgnoresInvalidFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Create a 0-byte fake "cloudflared" in tmpDir
+	fakeBin := filepath.Join(tmpDir, "cloudflared")
+	if err := os.WriteFile(fakeBin, []byte(""), 0755); err != nil {
+		t.Fatalf("failed to create fake binary: %v", err)
+	}
+
+	// isValidCloudflared must return false for 0-byte file
+	if isValidCloudflared(fakeBin) {
+		t.Errorf("expected isValidCloudflared to be false for 0-byte file")
+	}
+
+	// Prepend tmpDir to PATH
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+origPath)
+
+	// If the real cloudflared was in original PATH, FindCloudflaredBinary might find the real one,
+	// but it MUST NEVER return fakeBin!
+	found := FindCloudflaredBinary()
+	if found == fakeBin {
+		t.Errorf("FindCloudflaredBinary returned invalid 0-byte binary %s", fakeBin)
+	}
+}
+
+func TestIsRevokedOrDeletedTunnelLogAndInvalidateCache(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+
+	revokedLines := []string{
+		`2026-11-22T02:00:00Z ERR Server error: Tunnel not found`,
+		`2026-11-22T02:00:00Z ERR Register tunnel error from server side error="Unauthorized: invalid tunnel secret"`,
+		`ERR failed to sufficiently authenticate with Cloudflare edge`,
+	}
+	for _, line := range revokedLines {
+		if !isRevokedOrDeletedTunnelLog(line) {
+			t.Errorf("expected revoked tunnel log match for %q", line)
+		}
+	}
+	if isRevokedOrDeletedTunnelLog("ERR lookup region1.v2.argotunnel.com: i/o timeout") {
+		t.Errorf("unexpected revoked match on transient DNS timeout")
+	}
+
+	dataDir := config.GetDataDir()
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		t.Fatalf("mkdir dataDir: %v", err)
+	}
+	cacheFile := filepath.Join(dataDir, "cf_tunnel.json")
+	if err := os.WriteFile(cacheFile, []byte(`{"token":"old","url":"https://deadbeef.jiuge.space"}`), 0600); err != nil {
+		t.Fatalf("write cache file: %v", err)
+	}
+
+	tun := NewCloudflareTunnel(&CFTunnelResult{Token: "old", URL: "https://deadbeef.jiuge.space"}, &config.CloudflareConfig{
+		Enabled:   true,
+		WorkerURL: "https://dispatcher.jiuge.space",
+	})
+	tun.markStaleCredentials(nil, "Tunnel not found")
+	if !tun.needsRefresh {
+		t.Errorf("expected needsRefresh=true after markStaleCredentials")
+	}
+	if _, err := os.Stat(cacheFile); !os.IsNotExist(err) {
+		t.Errorf("expected cf_tunnel.json to be removed after markStaleCredentials, err=%v", err)
+	}
+}
+
+

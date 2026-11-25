@@ -1,0 +1,178 @@
+package com.antigravity.mobile.ui.components
+
+import android.util.LruCache
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+
+import com.antigravity.mobile.ui.theme.ThemePresetCatalog
+import com.antigravity.mobile.ui.theme.ThemeSyntaxPalette
+
+/**
+ * Zero-dependency offline syntax highlighter with bounded LRU memoization.
+ * Produces adaptive Light/Dark [AnnotatedString] spans without WebViews or remote assets.
+ */
+object CodeSyntaxHighlighter {
+    private const val MAX_HIGHLIGHT_LENGTH = 24_000
+
+    private data class CacheEntry(
+        val source: String,
+        val annotated: AnnotatedString
+    )
+
+    private val cache = object : LruCache<String, CacheEntry>(256) {}
+
+    private fun paletteFor(isDark: Boolean, themeId: String): ThemeSyntaxPalette {
+        return when (themeId) {
+            "", "default", "default-light", "default-dark" -> ThemePresetCatalog.appleSyntax(isDark)
+            else -> ThemePresetCatalog.findByThemeId(themeId, isDark).syntax
+        }
+    }
+
+    private val rRegex = Regex(
+        """(#[^\n]*)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|(```\{[rR][^}]*\}|```)|\b(0x[0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[iL]?)\b|(<-|->|<<-|->>|\|>|%>%)|\b(function|if|else|repeat|while|for|in|next|break|return|TRUE|FALSE|NULL|NA|NA_integer_|NA_real_|NA_character_|NA_complex_|Inf|NaN|library|require|source|switch|tryCatch|stop|warning|message)\b|\b([a-zA-Z.][a-zA-Z0-9._]*)(?=\s*\()"""
+    )
+
+    private val jsonRegex = Regex(
+        """("(?:\\.|[^"\\])*")\s*:|("(?:\\.|[^"\\])*")|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"""
+    )
+
+    private val yamlRegex = Regex(
+        """(#[^\n]*)|^(\s*[\w.-]+)\s*:|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(true|false|null|yes|no)\b|(\b-?\d+(?:\.\d+)?\b)""",
+        RegexOption.MULTILINE
+    )
+
+    private val markupRegex = Regex(
+        """(<!--[\s\S]*?-->)|(</?[\w:-]+)|(\s[\w:-]+)(?==)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
+    )
+
+    private val codeRegex = Regex(
+        """(//[^\n]*|/\*[\s\S]*?\*/|#(?!!\[)[^\n]*)|("${'"'}${'"'}[\s\S]*?"${'"'}${'"'}|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|(@[A-Za-z_]\w*)|\b(0x[0-9a-fA-F_]+|0b[01_]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b|\b(func|fn|fun|def|function|return|if|else|elif|when|for|while|loop|match|switch|case|default|break|continue|struct|class|enum|interface|trait|protocol|extension|impl|type|typealias|import|from|export|package|module|pub|public|private|internal|protected|static|final|const|let|var|val|mut|async|await|try|catch|throw|throws|defer|go|select|chan|range|in|as|is|nil|null|None|True|False|true|false|self|Self|super|this|new|guard|where|actor|nonisolated|some|any|override|open|suspend|data|sealed|companion|object)\b|\b([A-Z][A-Za-z0-9_]*)\b|\b([a-zA-Z_]\w*)(?=\s*\()"""
+    )
+
+    fun highlight(
+        code: String,
+        language: String,
+        isDark: Boolean,
+        useNord: Boolean = false,
+        themeId: String? = null
+    ): AnnotatedString {
+        if (code.isEmpty() || code.length > MAX_HIGHLIGHT_LENGTH) {
+            return AnnotatedString(code)
+        }
+        val normLang = normalizeLanguage(language)
+        if (normLang == "text") {
+            return AnnotatedString(code)
+        }
+
+        val resolvedThemeId = when {
+            !themeId.isNullOrBlank() -> themeId
+            useNord -> "nord"
+            isDark -> "default-dark"
+            else -> "default-light"
+        }
+        val key = "$resolvedThemeId:$isDark:$normLang:${code.length}:${code.hashCode()}"
+        synchronized(cache) {
+            cache.get(key)?.let { if (it.source == code) return it.annotated }
+        }
+
+        val palette = paletteFor(isDark, resolvedThemeId)
+        val result = buildAnnotatedString {
+            append(code)
+            when (normLang) {
+                "diff" -> {
+                    var idx = 0
+                    while (idx < code.length) {
+                        val nl = code.indexOf('\n', idx)
+                        val end = if (nl == -1) code.length else nl + 1
+                        val first = code[idx]
+                        when (first) {
+                            '+' -> addStyle(SpanStyle(color = palette.diffAdd), idx, end)
+                            '-' -> addStyle(SpanStyle(color = palette.diffDel), idx, end)
+                            '@' -> addStyle(SpanStyle(color = palette.function), idx, end)
+                        }
+                        idx = end
+                    }
+                }
+                "r" -> {
+                    for (m in rRegex.findAll(code)) {
+                        val g = m.groups
+                        when {
+                            g[1] != null -> addStyle(SpanStyle(color = palette.comment), g[1]!!.range.first, g[1]!!.range.last + 1)
+                            g[2] != null -> addStyle(SpanStyle(color = palette.string), g[2]!!.range.first, g[2]!!.range.last + 1)
+                            g[3] != null -> addStyle(SpanStyle(color = palette.property), g[3]!!.range.first, g[3]!!.range.last + 1)
+                            g[4] != null -> addStyle(SpanStyle(color = palette.number), g[4]!!.range.first, g[4]!!.range.last + 1)
+                            g[5] != null -> addStyle(SpanStyle(color = palette.keyword), g[5]!!.range.first, g[5]!!.range.last + 1)
+                            g[6] != null -> addStyle(SpanStyle(color = palette.keyword), g[6]!!.range.first, g[6]!!.range.last + 1)
+                            g[7] != null -> addStyle(SpanStyle(color = palette.function), g[7]!!.range.first, g[7]!!.range.last + 1)
+                        }
+                    }
+                }
+                "json" -> {
+                    for (m in jsonRegex.findAll(code)) {
+                        val g = m.groups
+                        when {
+                            g[1] != null -> addStyle(SpanStyle(color = palette.property), g[1]!!.range.first, g[1]!!.range.last + 1)
+                            g[2] != null -> addStyle(SpanStyle(color = palette.string), g[2]!!.range.first, g[2]!!.range.last + 1)
+                            g[3] != null -> addStyle(SpanStyle(color = palette.keyword), g[3]!!.range.first, g[3]!!.range.last + 1)
+                            g[4] != null -> addStyle(SpanStyle(color = palette.number), g[4]!!.range.first, g[4]!!.range.last + 1)
+                        }
+                    }
+                }
+                "yaml" -> {
+                    for (m in yamlRegex.findAll(code)) {
+                        val g = m.groups
+                        when {
+                            g[1] != null -> addStyle(SpanStyle(color = palette.comment), g[1]!!.range.first, g[1]!!.range.last + 1)
+                            g[2] != null -> addStyle(SpanStyle(color = palette.property), g[2]!!.range.first, g[2]!!.range.last + 1)
+                            g[3] != null -> addStyle(SpanStyle(color = palette.string), g[3]!!.range.first, g[3]!!.range.last + 1)
+                            g[4] != null -> addStyle(SpanStyle(color = palette.keyword), g[4]!!.range.first, g[4]!!.range.last + 1)
+                            g[5] != null -> addStyle(SpanStyle(color = palette.number), g[5]!!.range.first, g[5]!!.range.last + 1)
+                        }
+                    }
+                }
+                "markup" -> {
+                    for (m in markupRegex.findAll(code)) {
+                        val g = m.groups
+                        when {
+                            g[1] != null -> addStyle(SpanStyle(color = palette.comment), g[1]!!.range.first, g[1]!!.range.last + 1)
+                            g[2] != null -> addStyle(SpanStyle(color = palette.keyword), g[2]!!.range.first, g[2]!!.range.last + 1)
+                            g[3] != null -> addStyle(SpanStyle(color = palette.property), g[3]!!.range.first, g[3]!!.range.last + 1)
+                            g[4] != null -> addStyle(SpanStyle(color = palette.string), g[4]!!.range.first, g[4]!!.range.last + 1)
+                        }
+                    }
+                }
+                else -> {
+                    for (m in codeRegex.findAll(code)) {
+                        val g = m.groups
+                        when {
+                            g[1] != null -> addStyle(SpanStyle(color = palette.comment), g[1]!!.range.first, g[1]!!.range.last + 1)
+                            g[2] != null -> addStyle(SpanStyle(color = palette.string), g[2]!!.range.first, g[2]!!.range.last + 1)
+                            g[3] != null -> addStyle(SpanStyle(color = palette.function), g[3]!!.range.first, g[3]!!.range.last + 1)
+                            g[4] != null -> addStyle(SpanStyle(color = palette.number), g[4]!!.range.first, g[4]!!.range.last + 1)
+                            g[5] != null -> addStyle(SpanStyle(color = palette.keyword), g[5]!!.range.first, g[5]!!.range.last + 1)
+                            g[6] != null -> addStyle(SpanStyle(color = palette.typeName), g[6]!!.range.first, g[6]!!.range.last + 1)
+                            g[7] != null -> addStyle(SpanStyle(color = palette.function), g[7]!!.range.first, g[7]!!.range.last + 1)
+                        }
+                    }
+                }
+            }
+        }
+
+        synchronized(cache) {
+            cache.put(key, CacheEntry(code, result))
+        }
+        return result
+    }
+
+    private fun normalizeLanguage(raw: String): String = when (raw.trim().lowercase()) {
+        "txt", "plain", "plaintext", "output", "log" -> "text"
+        "json", "jsonc", "jsonl" -> "json"
+        "yaml", "yml", "toml" -> "yaml"
+        "diff", "patch" -> "diff"
+        "html", "xml", "svg" -> "markup"
+        "r", "rmd", "rmarkdown", "rprofile", "renviron", "namespace" -> "r"
+        else -> "code"
+    }
+}

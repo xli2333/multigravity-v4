@@ -1,0 +1,453 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"antigravity-mobile/internal/auth"
+	"antigravity-mobile/internal/inspector"
+	"antigravity-mobile/internal/proxy"
+	"antigravity-mobile/web"
+)
+
+func setupTestRouter(t *testing.T) http.Handler {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "auth.json")
+	authStore, err := auth.NewAuthStore(storePath)
+	if err != nil {
+		t.Fatalf("failed to create auth store: %v", err)
+	}
+	t.Cleanup(authStore.Close)
+
+	pm := auth.NewPairingManager()
+	authHandler := auth.NewAuthHandler(authStore, pm, "127.0.0.1", 58900, false)
+	t.Cleanup(authHandler.Close)
+	insp := inspector.NewInspector(10 * time.Second)
+	p := proxy.NewProxy(insp)
+	startTime := time.Now()
+	webHandler := web.Handler()
+
+	return buildRouter(authStore, authHandler, p, insp, startTime, webHandler, auth.AuthPolicy{})
+}
+
+func TestHealthzEndpoint(t *testing.T) {
+	router := setupTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /healthz, got %d", rr.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp["status"] != "ok" {
+		t.Errorf("expected status 'ok', got %q", resp["status"])
+	}
+	if resp["os"] != runtime.GOOS {
+		t.Errorf("expected os %q, got %q", runtime.GOOS, resp["os"])
+	}
+	if resp["platform"] != runtime.GOOS {
+		t.Errorf("expected platform %q, got %q", runtime.GOOS, resp["platform"])
+	}
+}
+
+func TestReadyzEndpoint(t *testing.T) {
+	router := setupTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	// Since inspector has no active language_server, status should be not_ready or 200 if active
+	if rr.Code != http.StatusOK && rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 200 or 503 from /readyz, got %d", rr.Code)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if _, ok := resp["status"]; !ok {
+		t.Errorf("missing 'status' in readyz response: %+v", resp)
+	}
+	if resp["os"] != runtime.GOOS {
+		t.Errorf("expected os %q, got %v", runtime.GOOS, resp["os"])
+	}
+	if resp["platform"] != runtime.GOOS {
+		t.Errorf("expected platform %q, got %v", runtime.GOOS, resp["platform"])
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	router := setupTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("expected X-Content-Type-Options: nosniff, got %q", rr.Header().Get("X-Content-Type-Options"))
+	}
+	if rr.Header().Get("X-Frame-Options") != "DENY" {
+		t.Errorf("expected X-Frame-Options: DENY, got %q", rr.Header().Get("X-Frame-Options"))
+	}
+	if rr.Header().Get("Content-Security-Policy") == "" {
+		t.Errorf("expected Content-Security-Policy header")
+	}
+	if rr.Header().Get("Referrer-Policy") != "strict-origin-when-cross-origin" {
+		t.Errorf("expected Referrer-Policy: strict-origin-when-cross-origin, got %q", rr.Header().Get("Referrer-Policy"))
+	}
+	if rr.Header().Get("Strict-Transport-Security") != "" {
+		t.Errorf("HSTS must not be set on plaintext HTTP, got %q", rr.Header().Get("Strict-Transport-Security"))
+	}
+
+	httpsReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	httpsReq.Header.Set("X-Forwarded-Proto", "https")
+	httpsRR := httptest.NewRecorder()
+	router.ServeHTTP(httpsRR, httpsReq)
+	if httpsRR.Header().Get("Strict-Transport-Security") == "" {
+		t.Errorf("expected HSTS when X-Forwarded-Proto is https")
+	}
+}
+
+func TestGatewayStatusRequiresAuth(t *testing.T) {
+	router := setupTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/gateway/status", nil)
+	req.RemoteAddr = "192.168.1.50:12345"
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 from unauthenticated /gateway/status, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "csrf_token") {
+		t.Errorf("unauthenticated status must not leak csrf_token: %s", rr.Body.String())
+	}
+}
+
+func TestUnauthorizedAPIRejected(t *testing.T) {
+	router := setupTestRouter(t)
+
+	// A non-whitelisted path should return 401 without auth token
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/content?uri=test", nil)
+	// Non-loopback remote address
+	req.RemoteAddr = "192.168.1.100:12345"
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for remote request without token, got %d", rr.Code)
+	}
+}
+
+func TestStaticWebAssetsAccessible(t *testing.T) {
+	router := setupTestRouter(t)
+
+	for _, p := range []string{"/", "/js/core.js", "/js/cockpit.js", "/style.css", "/manifest.json", "/favicon.ico"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("expected 200 for %s, got %d", p, rr.Code)
+		}
+	}
+}
+
+func TestDetermineViewMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		url        string
+		userAgent  string
+		cookie     *http.Cookie
+		expectMode string
+	}{
+		{
+			name:       "PC Mac Chrome default",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			expectMode: "desktop",
+		},
+		{
+			name:       "PC Windows Edge default",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+			expectMode: "desktop",
+		},
+		{
+			name:       "PC Linux Firefox default",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
+			expectMode: "desktop",
+		},
+		{
+			name:       "iPhone Safari -> PWA",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+			expectMode: "pwa",
+		},
+		{
+			name:       "iPad Safari -> PWA",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (iPad; CPU OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+			expectMode: "pwa",
+		},
+		{
+			name:       "Android Phone -> PWA",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+			expectMode: "pwa",
+		},
+		{
+			name:       "Android Tablet -> PWA",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (Linux; Android 13; SM-X900) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			expectMode: "pwa",
+		},
+		{
+			name:       "Query override view=desktop on mobile",
+			url:        "http://localhost:58900/?view=desktop",
+			userAgent:  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+			expectMode: "desktop",
+		},
+		{
+			name:       "Query override view=pwa on desktop",
+			url:        "http://localhost:58900/?view=pwa",
+			userAgent:  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+			expectMode: "pwa",
+		},
+		{
+			name:       "Cookie override desktop",
+			url:        "http://localhost:58900/",
+			userAgent:  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+			cookie:     &http.Cookie{Name: "agy_view_mode", Value: "desktop"},
+			expectMode: "desktop",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
+			if tc.userAgent != "" {
+				req.Header.Set("User-Agent", tc.userAgent)
+			}
+			if tc.cookie != nil {
+				req.AddCookie(tc.cookie)
+			}
+			actual := determineViewMode(req)
+			if actual != tc.expectMode {
+				t.Errorf("expected view mode %q, got %q", tc.expectMode, actual)
+			}
+		})
+	}
+}
+
+func TestOnboardingRedirect(t *testing.T) {
+	router := setupTestRouter(t)
+
+	// Test 1: Direct /onboarding?login=true redirects to /
+	req := httptest.NewRequest(http.MethodGet, "/onboarding?login=true", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307 redirect, got %d", rr.Code)
+	}
+	if loc := rr.Header().Get("Location"); loc != "/" {
+		t.Errorf("expected Location '/', got %q", loc)
+	}
+
+	// Test 2: /onboarding with custom redirect parameter
+	req2 := httptest.NewRequest(http.MethodGet, "/onboarding?login=true&redirect=/c/123", nil)
+	rr2 := httptest.NewRecorder()
+	router.ServeHTTP(rr2, req2)
+
+	if rr2.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307 redirect, got %d", rr2.Code)
+	}
+	if loc := rr2.Header().Get("Location"); loc != "/c/123" {
+		t.Errorf("expected Location '/c/123', got %q", loc)
+	}
+
+	// Test 3: Open redirect payloads must be sanitized to '/' (SEC-06)
+	for _, evil := range []string{
+		"https://evil.example.com",
+		"//evil.example.com",
+		`/\\evil.example.com`,
+		`/\evil.example.com`,
+		"/onboarding?login=true",
+	} {
+		reqEvil := httptest.NewRequest(http.MethodGet, "/onboarding?login=true&redirect="+evil, nil)
+		rrEvil := httptest.NewRecorder()
+		router.ServeHTTP(rrEvil, reqEvil)
+		if rrEvil.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("expected 307 for redirect=%q, got %d", evil, rrEvil.Code)
+		}
+		if loc := rrEvil.Header().Get("Location"); loc != "/" {
+			t.Errorf("open redirect payload %q escaped sanitizeLocalRedirect: Location=%q", evil, loc)
+		}
+	}
+}
+
+func TestCloudURLHeaderGatedOnAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	authStore, err := auth.NewAuthStore(filepath.Join(tmpDir, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(authStore.Close)
+	devToken := "paired-device-secret-token"
+	if err := authStore.AddDevice(auth.PairedDevice{
+		DeviceID:   "dev-cf-test",
+		DeviceName: "iPhone",
+		Platform:   "ios",
+		TokenHash:  auth.HashToken(devToken),
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pm := auth.NewPairingManager()
+	authHandler := auth.NewAuthHandler(authStore, pm, "127.0.0.1", 58900, false)
+	t.Cleanup(authHandler.Close)
+	authHandler.SetCloudflareURL("https://secret-tunnel.example.com")
+	insp := inspector.NewInspector(10 * time.Second)
+	p := proxy.NewProxy(insp)
+	router := buildRouter(authStore, authHandler, p, insp, time.Now(), web.Handler(), auth.AuthPolicy{})
+
+	// 1. Unauthenticated request to whitelisted /healthz must NOT leak X-Antigravity-Cloud-URL (SEC-03)
+	unauthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	unauthReq.RemoteAddr = "203.0.113.10:54321"
+	unauthRR := httptest.NewRecorder()
+	router.ServeHTTP(unauthRR, unauthReq)
+	if got := unauthRR.Header().Get("X-Antigravity-Cloud-URL"); got != "" {
+		t.Errorf("unauthenticated response leaked X-Antigravity-Cloud-URL: %q", got)
+	}
+
+	// 2. Authenticated request MUST receive X-Antigravity-Cloud-URL for self-healing
+	authReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	authReq.RemoteAddr = "203.0.113.10:54321"
+	authReq.Header.Set("Authorization", "Bearer "+devToken)
+	authRR := httptest.NewRecorder()
+	router.ServeHTTP(authRR, authReq)
+	if got := authRR.Header().Get("X-Antigravity-Cloud-URL"); got != "https://secret-tunnel.example.com" {
+		t.Errorf("authenticated response missing X-Antigravity-Cloud-URL, got %q", got)
+	}
+}
+
+func TestExtractLangFlag(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		expectedLang string
+		expectedArgs []string
+	}{
+		{
+			name:         "no flag",
+			args:         []string{"pair", "-port", "58900"},
+			expectedLang: "",
+			expectedArgs: []string{"pair", "-port", "58900"},
+		},
+		{
+			name:         "separated flag",
+			args:         []string{"--lang", "en", "pair"},
+			expectedLang: "en",
+			expectedArgs: []string{"pair"},
+		},
+		{
+			name:         "equals flag",
+			args:         []string{"run", "--lang=zh"},
+			expectedLang: "zh",
+			expectedArgs: []string{"run"},
+		},
+		{
+			name:         "single dash equals flag",
+			args:         []string{"-lang=en", "help"},
+			expectedLang: "en",
+			expectedArgs: []string{"help"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := make([]string, len(tc.args))
+			copy(args, tc.args)
+			lang := extractLangFlag(&args)
+			if lang != tc.expectedLang {
+				t.Fatalf("expected lang %q, got %q", tc.expectedLang, lang)
+			}
+			if len(args) != len(tc.expectedArgs) {
+				t.Fatalf("expected args %+v, got %+v", tc.expectedArgs, args)
+			}
+			for i := range args {
+				if args[i] != tc.expectedArgs[i] {
+					t.Errorf("arg[%d] expected %q, got %q", i, tc.expectedArgs[i], args[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPushTokenCrossDeviceProtection(t *testing.T) {
+	tmpDir := t.TempDir()
+	authStore, err := auth.NewAuthStore(filepath.Join(tmpDir, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(authStore.Close)
+
+	tokA := "tok_device_a_secret"
+	if err := authStore.AddDevice(auth.PairedDevice{
+		DeviceID:   "dev_a",
+		DeviceName: "Phone A",
+		Platform:   "ios",
+		TokenHash:  auth.HashToken(tokA),
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pm := auth.NewPairingManager()
+	authHandler := auth.NewAuthHandler(authStore, pm, "127.0.0.1", 58900, false)
+	t.Cleanup(authHandler.Close)
+	insp := inspector.NewInspector(10 * time.Second)
+	p := proxy.NewProxy(insp)
+	router := buildRouter(authStore, authHandler, p, insp, time.Now(), web.Handler(), auth.AuthPolicy{TrustLAN: true})
+
+	// 1. Paired device dev_a attempting to modify dev_b's push token -> 403 Forbidden (LOW-01)
+	postCross := httptest.NewRequest(http.MethodPost, "/api/v1/device/push-token", strings.NewReader(`{"platform":"ios","token_type":"alert","device_id":"dev_b","token":"abcd"}`))
+	postCross.RemoteAddr = "203.0.113.10:12345"
+	postCross.Header.Set("Authorization", "Bearer "+tokA)
+	rrCross := httptest.NewRecorder()
+	router.ServeHTTP(rrCross, postCross)
+	if rrCross.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-device push token update, got %d: %s", rrCross.Code, rrCross.Body.String())
+	}
+
+	// 2. Unpaired TrustLAN synthetic caller attempting to delete dev_a's push token -> 403 Forbidden
+	delLAN := httptest.NewRequest(http.MethodDelete, "/api/v1/device/push-token?device_id=dev_a", nil)
+	delLAN.RemoteAddr = "192.168.1.88:5555"
+	delLAN.Host = "192.168.1.1:58900"
+	rrLAN := httptest.NewRecorder()
+	router.ServeHTTP(rrLAN, delLAN)
+	if rrLAN.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for TrustLAN push token deletion, got %d: %s", rrLAN.Code, rrLAN.Body.String())
+	}
+}
+
+
+

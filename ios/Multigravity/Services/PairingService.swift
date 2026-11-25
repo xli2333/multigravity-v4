@@ -1,0 +1,509 @@
+import Foundation
+import UIKit
+
+/// PairingInfo represents the metadata parsed from an agy://pair QR code.
+public struct PairingInfo: Equatable, Sendable {
+    public let host: String
+    public let port: Int
+    public let code: String
+    public let ssl: Bool
+    public let lanHost: String?
+    public let ddnsHost: String?
+    public let relayHost: String?
+    public let os: String?
+    public let platform: String?
+    public let e2eePubKey: String?
+    
+    public init(
+        host: String,
+        port: Int,
+        code: String,
+        ssl: Bool,
+        lanHost: String? = nil,
+        ddnsHost: String? = nil,
+        relayHost: String? = nil,
+        os: String? = nil,
+        platform: String? = nil,
+        e2eePubKey: String? = nil
+    ) {
+        self.host = host
+        self.port = port
+        self.code = code
+        self.ssl = ssl
+        self.lanHost = lanHost
+        self.ddnsHost = ddnsHost
+        self.relayHost = Self.normalizeHost(relayHost)
+        self.os = os
+        self.platform = platform
+        let trimmedPK = e2eePubKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.e2eePubKey = (trimmedPK?.isEmpty == false) ? trimmedPK : nil
+    }
+    
+    public var gatewayDisplayName: String {
+        switch (platform ?? os)?.lowercased() {
+        case "windows", "win":
+            return String(localized: "Windows 网关")
+        case "darwin", "macos", "mac":
+            return String(localized: "Mac 网关")
+        case "linux":
+            return String(localized: "Linux 网关")
+        default:
+            return String(localized: "电脑网关")
+        }
+    }
+    
+    public static func formatURL(host: String, port: Int, ssl: Bool) -> String {
+        let scheme = ssl ? "https://" : "http://"
+        let formattedHost = host
+        if (ssl && port == 443) || (!ssl && port == 80) {
+            return "\(scheme)\(formattedHost)"
+        }
+        return "\(scheme)\(formattedHost):\(port)"
+    }
+    
+    public var serverBaseURL: String {
+        Self.formatURL(host: host, port: port, ssl: ssl)
+    }
+    
+    public var lanBaseURL: String? {
+        guard let lan = lanHost, !lan.isEmpty else { return nil }
+        let lanPort = (ssl && port == 443) ? 58900 : port
+        let lanSSL = (ssl && port == 443) ? false : ssl
+        return Self.formatURL(host: lan, port: lanPort, ssl: lanSSL)
+    }
+    
+    public var ddnsBaseURL: String? {
+        guard let ddns = ddnsHost, !ddns.isEmpty else { return nil }
+        return Self.formatURL(host: ddns, port: port, ssl: ssl)
+    }
+    
+    public var relayBaseURL: String? {
+        guard let relay = relayHost, !relay.isEmpty else { return nil }
+        return Self.formatURL(host: relay, port: port, ssl: ssl)
+    }
+    
+    public var candidateBaseURLs: [String] {
+        var list: [String] = []
+        if let lan = lanBaseURL, !list.contains(lan) { list.append(lan) }
+        let prim = serverBaseURL
+        if !list.contains(prim) { list.append(prim) }
+        if let relay = relayBaseURL, !list.contains(relay) { list.append(relay) }
+        if let ddns = ddnsBaseURL, !list.contains(ddns) { list.append(ddns) }
+        return list
+    }
+    
+    nonisolated static func normalizeHost(_ raw: String?) -> String? {
+        guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        if value.hasPrefix("http://") || value.hasPrefix("https://"), let url = URL(string: value), let host = url.host {
+            value = host
+        }
+        return value.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+    }
+}
+
+public enum PairingError: LocalizedError, Sendable {
+    case invalidURI(String)
+    case missingFields(String)
+    case networkError(String)
+    case serverRejected(String)
+    case decodingError(String)
+    
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURI(let msg):
+            return String(localized: "无效的二维码配对链接: \(msg)")
+        case .missingFields(let msg):
+            return String(localized: "二维码缺少必要参数: \(msg)")
+        case .networkError(let msg):
+            return String(localized: "配对网络请求失败: \(msg)")
+        case .serverRejected(let msg):
+            return String(localized: "配对失败: \(msg)")
+        case .decodingError(let msg):
+            return String(localized: "配对响应解析失败: \(msg)")
+        }
+    }
+}
+
+public final class PairingService: Sendable {
+    public static let shared = PairingService()
+    
+    private init() {}
+    
+    /// Parses an agy://pair?host=...&port=...&code=...&ssl=... URI string into PairingInfo.
+    public func parsePairingURI(_ uriString: String) -> Result<PairingInfo, PairingError> {
+        let trimmed = uriString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed) else {
+            return .failure(.invalidURI(String(localized: "无法识别的 URL 格式")))
+        }
+        
+        guard url.scheme?.lowercased() == "agy" && url.host?.lowercased() == "pair" else {
+            return .failure(.invalidURI(String(localized: "无效的配对协议（需要 agy://pair）")))
+        }
+        
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let queryItems = components.queryItems else {
+            return .failure(.invalidURI(String(localized: "缺少参数")))
+        }
+        
+        var host: String?
+        var port: Int?
+        var code: String?
+        var sslExplicit: Bool?
+        var lanHost: String?
+        var ddnsHost: String?
+        var relayHost: String?
+        var os: String?
+        var platform: String?
+        var e2eePubKey: String?
+        
+        for item in queryItems {
+            switch item.name.lowercased() {
+            case "host":
+                host = item.value
+            case "port":
+                if let val = item.value, let p = Int(val), p > 0 && p <= 65535 {
+                    port = p
+                }
+            case "code":
+                code = item.value
+            case "ssl":
+                if let val = item.value {
+                    sslExplicit = (val == "1" || val.lowercased() == "true")
+                }
+            case "lan":
+                lanHost = item.value
+            case "ddns":
+                ddnsHost = item.value
+            case "relay":
+                relayHost = item.value
+            case "os":
+                os = item.value
+            case "platform":
+                platform = item.value
+            case "pk":
+                e2eePubKey = item.value
+            default:
+                break
+            }
+        }
+        
+        guard let rawHost = host?.trimmingCharacters(in: .whitespacesAndNewlines), !rawHost.isEmpty else {
+            return .failure(.missingFields(String(localized: "未找到主机地址 (host)")))
+        }
+        guard let validCode = code?.trimmingCharacters(in: .whitespacesAndNewlines), !validCode.isEmpty else {
+            return .failure(.missingFields(String(localized: "未找到配对码 (code)")))
+        }
+        let validPort = port ?? 443
+        
+        // Auto-expand compressed subdomain (e.g. 825a5a50 -> 825a5a50.jiuge.space)
+        var validHost = rawHost
+        if !validHost.contains(".") && !validHost.contains(":") && validHost.lowercased() != "localhost" {
+            validHost = "\(validHost).jiuge.space"
+        }
+        
+        let effectiveSSL = sslExplicit ?? (validPort == 443 || (!validHost.hasPrefix("192.168.") && !validHost.hasPrefix("10.") && !validHost.hasPrefix("127.")))
+        
+        var validRelay = relayHost?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let r = validRelay, !r.isEmpty, !r.contains("."), !r.contains(":"), r.lowercased() != "localhost" {
+            validRelay = "\(r).jiuge.space"
+        }
+        
+        return .success(PairingInfo(
+            host: validHost,
+            port: validPort,
+            code: validCode,
+            ssl: effectiveSSL,
+            lanHost: lanHost,
+            ddnsHost: ddnsHost,
+            relayHost: validRelay,
+            os: os,
+            platform: platform,
+            e2eePubKey: e2eePubKey
+        ))
+    }
+    
+    /// Sends pairing request to the gateway, trying candidate endpoints and saving credentials upon success.
+    public func pair(with info: PairingInfo) async throws -> (deviceId: String, deviceToken: String) {
+        var candidates = info.candidateBaseURLs
+        if NetworkTransport.shared.isCellular {
+            // Off-LAN: try cloud relay before RFC1918 addresses that will just time out.
+            let privateLAN = candidates.filter { url in
+                guard let host = URL(string: url)?.host else { return false }
+                return NetworkTransport.isLocalOrPrivateHost(host)
+            }
+            let publicPaths = candidates.filter { cand in !privateLAN.contains(cand) }
+            candidates = publicPaths + privateLAN
+        }
+        guard !candidates.isEmpty else {
+            throw PairingError.invalidURI(String(localized: "无可用网关端点地址"))
+        }
+        
+        let deviceName = await MainActor.run { UIDevice.current.name }
+        let (ephemPriv, clientPubB64) = E2EECrypto.generateEphemeralKeyPair()
+        let payload: [String: Any] = [
+            "pairing_code": info.code,
+            "device_name": deviceName,
+            "platform": "ios",
+            "e2ee_pub": clientPubB64
+        ]
+        
+        let bodyData: Data
+        do {
+            bodyData = try JSONSerialization.data(withJSONObject: payload)
+        } catch {
+            throw PairingError.networkError(String(localized: "无法打包配对请求数据: \(error.localizedDescription)"))
+        }
+        
+        struct EndpointResp: Decodable {
+            let type: String
+            let url: String
+        }
+        
+        struct PairResp: Decodable {
+            let device_id: String
+            let device_token: String
+            let endpoints: [EndpointResp]?
+            let os: String?
+            let platform: String?
+            let e2ee_gateway_pub: String?
+            let e2ee_salt: String?
+            let relay_cloud_url: String?
+        }
+        
+        var lastError: Error?
+        
+        for baseURL in candidates {
+            let candHost = URL(string: baseURL)?.host ?? ""
+            let useEncryptedPair = (info.e2eePubKey != nil) && !NetworkTransport.isLocalOrPrivateHost(candHost)
+            let pairPath = useEncryptedPair ? "/api/v1/e2ee/pair" : "/api/v1/auth/pair"
+            guard let endpointURL = URL(string: "\(baseURL)\(pairPath)") else {
+                continue
+            }
+            
+            var request = URLRequest(url: endpointURL)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 8 // Fast timeout per candidate
+
+            var activePairPriv = ephemPriv
+            var activeClientPub = clientPubB64
+            if useEncryptedPair, let gwPub = info.e2eePubKey {
+                let enc = try E2EECrypto.shared.encryptPairRequest(pairBody: bodyData, gatewayPubB64: gwPub)
+                activePairPriv = enc.privateKey
+                activeClientPub = enc.clientPubB64
+                request.httpBody = enc.envelopeBody
+            } else {
+                request.httpBody = bodyData
+            }
+            
+            do {
+                let (rawData, response) = try await NetworkTransport.shared.send(request: request)
+                
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    continue
+                }
+                
+                let effectiveStatus: Int
+                let data: Data
+                if useEncryptedPair, httpResponse.statusCode == 200, let gwPub = info.e2eePubKey {
+                    let dec = try E2EECrypto.shared.decryptPairResponse(
+                        outerData: rawData,
+                        privateKey: activePairPriv,
+                        clientPubB64: activeClientPub,
+                        gatewayPubB64: gwPub
+                    )
+                    effectiveStatus = dec.status
+                    data = dec.body
+                } else {
+                    effectiveStatus = httpResponse.statusCode
+                    data = rawData
+                }
+
+                if effectiveStatus != 200 {
+                    if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let errMsg = errObj["error"] as? String {
+                        throw PairingError.serverRejected(errMsg)
+                    }
+                    throw PairingError.serverRejected("HTTP \(effectiveStatus)")
+                }
+                
+                let decoded = try JSONDecoder().decode(PairResp.self, from: data)
+                
+                // Persist to Keychain
+                KeychainHelper.shared.save(key: .deviceToken, value: decoded.device_token)
+                KeychainHelper.shared.save(key: .deviceID, value: decoded.device_id)
+                if let gwPub = decoded.e2ee_gateway_pub, !gwPub.isEmpty,
+                   let saltB64 = decoded.e2ee_salt, !saltB64.isEmpty {
+                    _ = try? E2EECrypto.shared.deriveAndSaveDeviceKey(
+                        privateKey: activePairPriv,
+                        gatewayPubB64: gwPub,
+                        saltB64: saltB64,
+                        deviceID: decoded.device_id
+                    )
+                }
+                
+                // Update AppSettings endpoints on MainActor
+                await MainActor.run {
+                    if let plat = decoded.platform ?? decoded.os ?? info.platform ?? info.os {
+                        AppSettings.shared.gatewayPlatform = plat
+                    }
+                    var lanURL: String? = info.lanBaseURL
+                    var relayURL: String? = nil
+                    var cloudURL: String? = nil
+                    
+                    if info.ssl || !NetworkTransport.isLocalOrPrivateHost(info.host) {
+                        cloudURL = info.serverBaseURL
+                    }
+                    
+                    if let eps = decoded.endpoints {
+                        for ep in eps {
+                            guard Self.isTrustedEndpoint(ep.url, pairing: info, usedBase: baseURL) || (useEncryptedPair && NetworkTransport.isValidAdvertisedCloudURL(ep.url, trustedByE2EE: true)) else {
+                                continue
+                            }
+                            switch ep.type.lowercased() {
+                            case "lan":
+                                lanURL = ep.url
+                            case "relay":
+                                relayURL = ep.url
+                                cloudURL = ep.url
+                                if let rHost = URL(string: ep.url)?.host {
+                                    E2EECrypto.shared.markHostRequiresE2EE(rHost)
+                                }
+                            case "cloudflare":
+                                if cloudURL == nil || relayURL == nil {
+                                    cloudURL = ep.url
+                                }
+                            case "primary":
+                                let h = URL(string: ep.url)?.host ?? ""
+                                if NetworkTransport.isLocalOrPrivateHost(h) {
+                                    if lanURL == nil { lanURL = ep.url }
+                                } else {
+                                    if cloudURL == nil { cloudURL = ep.url }
+                                }
+                            default:
+                                break
+                            }
+                        }
+                    }
+
+                    if let dualRelay = decoded.relay_cloud_url?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !dualRelay.isEmpty,
+                       E2EECrypto.shared.isReady,
+                       NetworkTransport.isValidAdvertisedCloudURL(dualRelay, trustedByE2EE: true) {
+                        relayURL = dualRelay
+                        cloudURL = dualRelay
+                        if let rHost = URL(string: dualRelay)?.host {
+                            E2EECrypto.shared.markHostRequiresE2EE(rHost)
+                        }
+                    }
+                    
+                    // Fallback classify successful candidate if slots are unassigned
+                    let candClean = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    if let candHost = URL(string: candClean)?.host {
+                        if NetworkTransport.isLocalOrPrivateHost(candHost) {
+                            if lanURL == nil { lanURL = candClean }
+                        } else {
+                            if cloudURL == nil { cloudURL = candClean }
+                        }
+                    }
+                    
+                    AppSettings.shared.updateEndpoints(
+                        lan: lanURL,
+                        relay: relayURL,
+                        custom: nil,
+                        active: baseURL,
+                        primaryCloud: cloudURL
+                    )
+                    AppSettings.shared.syncWidgetConfiguration(reloadWidget: false)
+                    ActivityManager.shared.startRemoteTokenObservers()
+                    PushNotificationManager.shared.syncAllTokensIfPaired(force: true)
+                    Task {
+                        await PushNotificationManager.shared.refreshAuthorizationStatus()
+                        if PushNotificationManager.shared.authorizationStatus == .notDetermined {
+                            _ = await PushNotificationManager.shared.requestAuthorizationAndRegister()
+                        }
+                    }
+                }
+                
+                return (decoded.device_id, decoded.device_token)
+            } catch let pairErr as PairingError {
+                // If server rejected (e.g. invalid code), don't keep looping with same code
+                if case .serverRejected = pairErr {
+                    throw pairErr
+                }
+                lastError = pairErr
+            } catch {
+                lastError = error
+            }
+        }
+        
+        if let err = lastError {
+            if let pairingErr = err as? PairingError {
+                throw pairingErr
+            }
+            throw PairingError.networkError(String(localized: "所有网关端点连接均失败: \(err.localizedDescription)"))
+        }
+        
+        throw PairingError.networkError(String(localized: "连接网关失败"))
+    }
+    
+    /// Accept endpoints that match the QR hosts, the URL we just paired with, private/loopback addresses,
+    /// or recognized Cloudflare/Multigravity tunnel domains over HTTPS.
+    nonisolated static func isTrustedEndpoint(_ urlString: String, pairing info: PairingInfo, usedBase: String) -> Bool {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              url.user == nil,
+              url.password == nil,
+              let host = url.host else { return false }
+        let h = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        guard !h.isEmpty else { return false }
+
+        let isPrivate = NetworkTransport.isLocalOrPrivateHost(h)
+        if scheme == "http" {
+            return isPrivate
+        }
+        guard scheme == "https" else { return false }
+        if isPrivate {
+            return true
+        }
+
+        var allowed: [String] = [NetworkTransport.extractHost(from: info.host)]
+        if let lan = info.lanHost { allowed.append(NetworkTransport.extractHost(from: lan)) }
+        if let ddns = info.ddnsHost { allowed.append(NetworkTransport.extractHost(from: ddns)) }
+        if let relay = info.relayHost { allowed.append(NetworkTransport.extractHost(from: relay)) }
+        let usedHost = NetworkTransport.extractHost(from: usedBase)
+        if !usedHost.isEmpty {
+            allowed.append(usedHost)
+        }
+        if allowed.contains(h) {
+            return true
+        }
+        if h.hasSuffix(".trycloudflare.com") || h.hasSuffix(".mgy.jiuge.space") || h.hasSuffix(".jiuge.space") || h.hasSuffix(".antigravity.internal") {
+            return true
+        }
+        // Allow sibling subdomains under the same registrable parent domain as the QR host
+        let parts = h.split(separator: ".")
+        if parts.count >= 3 {
+            let parentSuffix = "." + parts.dropFirst().joined(separator: ".")
+            if allowed.contains(where: { !$0.isEmpty && $0.hasSuffix(parentSuffix) }) {
+                return true
+            }
+        }
+        return false
+    }
+    
+    /// Clears saved credentials.
+    public func unpair() {
+        KeychainHelper.shared.clearAll()
+    }
+    
+    /// Checks if the device has an existing pairing token.
+    public var isPaired: Bool {
+        guard let token = KeychainHelper.shared.read(key: .deviceToken), !token.isEmpty else {
+            return false
+        }
+        return true
+    }
+}

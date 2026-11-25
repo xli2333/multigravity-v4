@@ -1,0 +1,900 @@
+package com.antigravity.mobile.ui.components
+
+import com.antigravity.mobile.ui.util.loc
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.drawBehind
+import android.widget.Toast
+import androidx.compose.animation.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.DisableSelection
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Collections
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lightbulb
+import androidx.compose.material.icons.filled.PriorityHigh
+import androidx.compose.material.icons.filled.Report
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
+import com.antigravity.mobile.data.service.ApiClient
+import com.antigravity.mobile.data.service.PreferencesManager
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.*
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import com.antigravity.mobile.data.service.FileIconResolver
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.antigravity.mobile.ui.theme.AppColors
+
+/** 为 true 时表示正在为分享长图离屏渲染：代码块 / 表格不再横向滚动，而是铺满宽度自动换行。 */
+internal val LocalShareExport = compositionLocalOf { false }
+internal val LocalMarkdownBodyScale = compositionLocalOf { 1.0f }
+internal val LocalMarkdownCodeScale = compositionLocalOf { 1.0f }
+internal val LocalCurrentCascadeId = compositionLocalOf<String?> { null }
+internal val LocalKnowledgeModeEnabled = compositionLocalOf { false }
+internal val LocalMarkdownSelectable = compositionLocalOf { true }
+internal val LocalMarkdownLongPress = compositionLocalOf<(() -> Unit)?> { null }
+
+@Composable
+internal fun HeadingBlockView(
+    level: Int,
+    text: String,
+    colors: AppColors,
+    onPlanClick: ((String, String) -> Unit)?
+) {
+    val baseSize = when (level) {
+        1 -> 20f
+        2 -> 18f
+        3 -> 16f
+        4 -> 15f
+        else -> 14f
+    }
+    val bodyScale = if (LocalShareExport.current) 1.0f else LocalMarkdownBodyScale.current
+    val fontSize = (baseSize * bodyScale).sp
+
+    val topPadding = if (level <= 2) 6.dp else 2.dp
+
+    Box(modifier = Modifier.padding(top = topPadding, bottom = 2.dp)) {
+        RichTextRenderer(
+            text = text,
+            colors = colors,
+            baseFontSize = fontSize,
+            baseFontWeight = FontWeight.Bold,
+            onPlanClick = onPlanClick
+        )
+    }
+}
+
+@Composable
+internal fun CodeBlockView(
+    lang: String,
+    code: String,
+    colors: AppColors
+) {
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
+    val haptic = com.antigravity.mobile.ui.util.rememberHaptic()
+    var copied by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(colors.codeBlockBg)
+            .border(0.8.dp, colors.border, RoundedCornerShape(10.dp))
+    ) {
+        // Code Block Header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(colors.surfaceVariant.copy(alpha = 0.6f))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            val fileType = remember(lang) { com.antigravity.mobile.data.service.FileIconResolver.resolve(lang) }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(fileType.color)
+                )
+                if (fileType.glyph.isNotEmpty()) {
+                    Text(
+                        text = fileType.glyph,
+                        fontSize = 11.sp
+                    )
+                }
+                Text(
+                    text = fileType.displayName,
+                    color = fileType.color,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
+            if (!LocalShareExport.current) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable {
+                        haptic.medium()
+                        clipboardManager.setText(AnnotatedString(code.trimEnd('\r', '\n')))
+                        copied = true
+                        Toast.makeText(context, "已复制到剪贴板".loc, Toast.LENGTH_SHORT).show()
+                    }
+                    .padding(horizontal = 6.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+                    contentDescription = "Copy",
+                    tint = if (copied) colors.accentIndigo else colors.textSecondary,
+                    modifier = Modifier.size(12.dp)
+                )
+                Text(
+                    text = if (copied) "已复制".loc else "复制".loc,
+                    color = if (copied) colors.accentIndigo else colors.textSecondary,
+                    fontSize = 11.sp
+                )
+            }
+            }
+        }
+
+        HorizontalDivider(color = colors.border.copy(alpha = 0.4f), thickness = 0.5.dp)
+
+        // Horizontally Scrollable Monospaced Code
+        val codeScale = if (LocalShareExport.current) 1.0f else LocalMarkdownCodeScale.current
+        val trimmedCode = remember(code) { code.trimEnd() }
+        val isDark = colors.codeBlockBg.luminance() < 0.5f
+        val highlighted = remember(trimmedCode, lang, isDark, colors.themeId) {
+            CodeSyntaxHighlighter.highlight(trimmedCode, lang, isDark, colors.useNord, colors.themeId)
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(if (LocalShareExport.current) Modifier else Modifier.horizontalScroll(rememberScrollState()))
+                .padding(12.dp)
+        ) {
+            Text(
+                text = highlighted,
+                color = colors.textPrimary,
+                fontSize = (12.5f * codeScale).sp,
+                fontFamily = FontFamily.Monospace,
+                lineHeight = (18f * codeScale).sp
+            )
+        }
+    }
+}
+
+@Composable
+internal fun TableBlockView(
+    headers: List<String>,
+    rows: List<List<String>>,
+    alignments: List<TableColumnAlignment>,
+    colors: AppColors,
+    onPlanClick: ((String, String) -> Unit)?
+) {
+    val columnCount = maxOf(headers.size, rows.maxOfOrNull { it.size } ?: 0)
+    if (columnCount == 0) return
+    val isExport = LocalShareExport.current
+    val hasHeader = headers.isNotEmpty()
+    val lastRow = rows.size - 1
+
+    @Composable
+    fun Cell(text: String, colIdx: Int, isHeader: Boolean, rowIdx: Int) {
+        val alignment = alignments.getOrNull(colIdx) ?: TableColumnAlignment.LEADING
+        val bg = when {
+            isHeader -> colors.surfaceVariant.copy(alpha = 0.85f)
+            rowIdx % 2 == 0 -> Color.Transparent
+            else -> colors.surfaceVariant.copy(alpha = 0.35f)
+        }
+        val vLine = colors.border.copy(alpha = if (isHeader) 0.4f else 0.3f)
+        val hLine = if (isHeader) colors.border.copy(alpha = 0.5f) else colors.border.copy(alpha = 0.25f)
+        val drawBottom = isHeader || rowIdx < lastRow
+        val isLastCol = colIdx == columnCount - 1
+        Box(
+            modifier = Modifier
+                .background(bg)
+                .drawBehind {
+                    if (!isLastCol) {
+                        drawLine(vLine, Offset(size.width, 0f), Offset(size.width, size.height), strokeWidth = 0.8.dp.toPx())
+                    }
+                    if (drawBottom) {
+                        drawLine(hLine, Offset(0f, size.height), Offset(size.width, size.height), strokeWidth = 0.6.dp.toPx())
+                    }
+                }
+                .padding(horizontal = 12.dp, vertical = 9.dp),
+            contentAlignment = when (alignment) {
+                TableColumnAlignment.LEADING -> Alignment.CenterStart
+                TableColumnAlignment.CENTER -> Alignment.Center
+                TableColumnAlignment.TRAILING -> Alignment.CenterEnd
+            }
+        ) {
+            RichTextRenderer(
+                text = text,
+                colors = colors,
+                baseFontSize = 13.sp,
+                baseFontWeight = if (isHeader) FontWeight.Bold else FontWeight.Normal,
+                onPlanClick = onPlanClick
+            )
+        }
+    }
+
+    // 容器宽度来自外层约束（横向滚动内部约束是无限的），列宽按内容自适应并支持横向滚动
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val limitPx = with(LocalDensity.current) { maxWidth.roundToPx() }
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .border(0.8.dp, colors.border, RoundedCornerShape(10.dp))
+                .then(if (isExport) Modifier else Modifier.horizontalScroll(rememberScrollState()))
+        ) {
+            AutoTableLayout(
+                columnCount = columnCount,
+                hasHeader = hasHeader,
+                limitPx = limitPx,
+                isExport = isExport
+            ) {
+                if (hasHeader) {
+                    for (c in 0 until columnCount) Cell(headers.getOrNull(c) ?: "", c, true, -1)
+                }
+                rows.forEachIndexed { r, row ->
+                    for (c in 0 until columnCount) Cell(row.getOrNull(c) ?: "", c, false, r)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 表格自适应列宽：短列保持单行完整显示；长文本列按舒适阅读宽度自动换行，
+ * 总宽超出容器时不强行压缩列宽，交由外层横向滚动。对齐 iOS 的 AutoTableLayout。
+ */
+@Composable
+private fun AutoTableLayout(
+    columnCount: Int,
+    hasHeader: Boolean,
+    limitPx: Int,
+    isExport: Boolean,
+    content: @Composable () -> Unit
+) {
+    val density = LocalDensity.current
+    val minColPx = with(density) { 44.dp.roundToPx() }
+    val cap180Px = with(density) { 180.dp.roundToPx() }
+    val cap260Px = with(density) { 260.dp.roundToPx() }
+    val cap280Px = with(density) { 280.dp.roundToPx() }
+    val cap320Px = with(density) { 320.dp.roundToPx() }
+    val floor64Px = with(density) { 64.dp.roundToPx() }
+    val floor120Px = with(density) { 120.dp.roundToPx() }
+
+    Layout(content = content) { measurables, constraints ->
+        val maxW = IntArray(columnCount) { minColPx }
+        val headerW = IntArray(columnCount)
+        measurables.forEachIndexed { i, m ->
+            val c = i % columnCount
+            val singleW = m.maxIntrinsicWidth(Constraints.Infinity)
+            maxW[c] = maxOf(maxW[c], singleW)
+            if (hasHeader && i < columnCount) {
+                headerW[c] = singleW
+            }
+        }
+        val limit = if (constraints.hasBoundedWidth) minOf(limitPx, constraints.maxWidth) else limitPx
+        val sumMax = maxW.sum()
+        val widths = if (limit > 0 && sumMax <= limit) {
+            maxW
+        } else {
+            val base = IntArray(columnCount) { c ->
+                val defaultCap = when (columnCount) {
+                    1 -> maxOf(limit, cap260Px)
+                    2 -> if (c == 0) cap180Px else cap320Px
+                    else -> cap260Px
+                }
+                val cap = maxOf(defaultCap, minOf(headerW[c], cap280Px))
+                minOf(maxW[c], cap)
+            }
+            val sumWidths = base.sum()
+            if (limit > 0 && sumWidths < limit) {
+                val extraNeeded = (0 until columnCount).sumOf { maxW[it] - base[it] }
+                if (extraNeeded > 0) {
+                    val grow = minOf(1f, (limit - sumWidths).toFloat() / extraNeeded)
+                    for (c in 0 until columnCount) {
+                        if (maxW[c] > base[c]) {
+                            base[c] += ((maxW[c] - base[c]) * grow).toInt()
+                        }
+                    }
+                }
+                base
+            } else if (isExport && limit > 0 && sumWidths > limit) {
+                val floors = IntArray(columnCount) { c ->
+                    minOf(maxW[c], maxOf(minOf(headerW[c], floor120Px), floor64Px))
+                }
+                val sumFloors = floors.sum()
+                if (sumFloors >= limit) {
+                    floors
+                } else {
+                    val t = (limit - sumFloors).toFloat() / (sumWidths - sumFloors)
+                    IntArray(columnCount) { c ->
+                        floors[c] + ((base[c] - floors[c]) * t).toInt()
+                    }
+                }
+            } else {
+                base
+            }
+        }
+        val rowCount = (measurables.size + columnCount - 1) / columnCount
+        val rowHeights = IntArray(rowCount)
+        for (r in 0 until rowCount) {
+            for (c in 0 until columnCount) {
+                val i = r * columnCount + c
+                if (i < measurables.size) {
+                    rowHeights[r] = maxOf(rowHeights[r], measurables[i].minIntrinsicHeight(widths[c]))
+                }
+            }
+        }
+        val placeables = measurables.mapIndexed { i, m ->
+            val c = i % columnCount
+            m.measure(Constraints.fixed(widths[c], rowHeights[i / columnCount]))
+        }
+        layout(widths.sum(), rowHeights.sum()) {
+            var y = 0
+            for (r in 0 until rowCount) {
+                var x = 0
+                for (c in 0 until columnCount) {
+                    val i = r * columnCount + c
+                    if (i < placeables.size) placeables[i].placeRelative(x, y)
+                    x += widths[c]
+                }
+                y += rowHeights[r]
+            }
+        }
+    }
+}
+
+private data class ParsedTaskListItem(
+    val marker: String?,
+    val isChecked: Boolean,
+    val content: String
+)
+
+private fun parseTaskListItem(raw: String): ParsedTaskListItem {
+    return when {
+        raw.startsWith("[ ] ") -> ParsedTaskListItem("☐", false, raw.drop(4))
+        raw.startsWith("[x] ") || raw.startsWith("[X] ") -> ParsedTaskListItem("☑", true, raw.drop(4))
+        raw.startsWith("[/] ") || raw.startsWith("[-] ") -> ParsedTaskListItem("◐", false, raw.drop(4))
+        else -> ParsedTaskListItem(null, false, raw)
+    }
+}
+
+@Composable
+internal fun BulletListBlockView(
+    items: List<String>,
+    colors: AppColors,
+    onPlanClick: ((String, String) -> Unit)?
+) {
+    val bodyScale = if (LocalShareExport.current) 1.0f else LocalMarkdownBodyScale.current
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        items.forEach { item ->
+            val parsed = parseTaskListItem(item)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                DisableSelection {
+                    Text(
+                        text = parsed.marker ?: "•",
+                        color = if (parsed.isChecked) colors.accentBlue else colors.textSecondary,
+                        fontSize = ((if (parsed.marker != null) 14.5f else 14f) * bodyScale).sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+                Box(modifier = Modifier.weight(1f)) {
+                    ParagraphBlockView(
+                        text = parsed.content,
+                        colors = colors,
+                        onPlanClick = onPlanClick
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun OrderedListBlockView(
+    startIndex: Int,
+    items: List<String>,
+    colors: AppColors,
+    onPlanClick: ((String, String) -> Unit)?
+) {
+    val bodyScale = if (LocalShareExport.current) 1.0f else LocalMarkdownBodyScale.current
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        items.forEachIndexed { idx, item ->
+            val parsed = parseTaskListItem(item)
+            val displayContent = if (parsed.marker != null) "${parsed.marker} ${parsed.content}" else item
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                DisableSelection {
+                    Text(
+                        text = "${startIndex + idx}.",
+                        color = colors.textSecondary,
+                        fontSize = (13.5f * bodyScale).sp,
+                        fontWeight = FontWeight.SemiBold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+                Box(modifier = Modifier.weight(1f)) {
+                    ParagraphBlockView(
+                        text = displayContent,
+                        colors = colors,
+                        onPlanClick = onPlanClick
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun AlertBlockView(
+    type: MarkdownAlertType,
+    content: String,
+    colors: AppColors,
+    modifier: Modifier = Modifier,
+    onPlanClick: ((String, String) -> Unit)? = null,
+    urlResolver: ((String) -> String)? = null,
+    onImageClick: ((String) -> Unit)? = null
+) {
+    val accentColor = when (type) {
+        MarkdownAlertType.NOTE -> Color(0xFF0A84FF)
+        MarkdownAlertType.TIP -> Color(0xFF30D158)
+        MarkdownAlertType.IMPORTANT -> Color(0xFFBF5AF2)
+        MarkdownAlertType.WARNING -> Color(0xFFFF9F0A)
+        MarkdownAlertType.CAUTION -> Color(0xFFFF453A)
+    }
+
+    val iconVector = when (type) {
+        MarkdownAlertType.NOTE -> Icons.Default.Info
+        MarkdownAlertType.TIP -> Icons.Default.Lightbulb
+        MarkdownAlertType.IMPORTANT -> Icons.Default.PriorityHigh
+        MarkdownAlertType.WARNING -> Icons.Default.Warning
+        MarkdownAlertType.CAUTION -> Icons.Default.Report
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(accentColor.copy(alpha = 0.08f))
+            .drawBehind {
+                val strokeWidth = 3.5.dp.toPx()
+                drawLine(
+                    color = accentColor,
+                    start = Offset(strokeWidth / 2, 0f),
+                    end = Offset(strokeWidth / 2, size.height),
+                    strokeWidth = strokeWidth
+                )
+            }
+            .padding(start = 14.dp, end = 12.dp, top = 9.dp, bottom = 9.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = iconVector,
+                    contentDescription = null,
+                    tint = accentColor,
+                    modifier = Modifier.size(15.dp)
+                )
+                Text(
+                    text = type.title,
+                    color = accentColor,
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (content.isNotEmpty()) {
+                MarkdownContentView(
+                    content = content,
+                    onPlanClick = onPlanClick,
+                    urlResolver = urlResolver,
+                    onImageClick = onImageClick
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun BlockquoteBlockView(
+    content: String,
+    colors: AppColors,
+    modifier: Modifier = Modifier,
+    onPlanClick: ((String, String) -> Unit)? = null,
+    urlResolver: ((String) -> String)? = null,
+    onImageClick: ((String) -> Unit)? = null
+) {
+    val barColor = colors.textSecondary.copy(alpha = 0.45f)
+    val bgColor = colors.surfaceVariant.copy(alpha = 0.4f)
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(bgColor)
+            .drawBehind {
+                val strokeWidth = 3.5.dp.toPx()
+                drawLine(
+                    color = barColor,
+                    start = Offset(strokeWidth / 2, 0f),
+                    end = Offset(strokeWidth / 2, size.height),
+                    strokeWidth = strokeWidth
+                )
+            }
+            .padding(start = 14.dp, end = 12.dp, top = 8.dp, bottom = 8.dp)
+    ) {
+        if (content.isNotEmpty()) {
+            MarkdownContentView(
+                content = content,
+                onPlanClick = onPlanClick,
+                urlResolver = urlResolver,
+                onImageClick = onImageClick
+            )
+        }
+    }
+}
+
+@Composable
+internal fun CarouselBlockView(
+    slides: List<MarkdownCarouselSlide>,
+    colors: AppColors,
+    modifier: Modifier = Modifier,
+    onPlanClick: ((String, String) -> Unit)? = null,
+    urlResolver: ((String) -> String)? = null,
+    onImageClick: ((String) -> Unit)? = null
+) {
+    if (slides.isEmpty()) return
+
+    var currentIndex by remember { mutableIntStateOf(0) }
+    val safeIndex = currentIndex.coerceIn(0, slides.size - 1)
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(colors.surface)
+            .border(1.dp, colors.border.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+    ) {
+        // Header Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(colors.surfaceVariant.copy(alpha = 0.6f))
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Collections,
+                    contentDescription = null,
+                    tint = colors.accentBlue,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = "照片轮播".loc,
+                    color = colors.textPrimary,
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(colors.surfaceVariant)
+                        .padding(horizontal = 7.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = "${safeIndex + 1} / ${slides.size}",
+                        color = colors.textSecondary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            // Navigation Buttons (上一张 / 下一张)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                // 上一张
+                val prevEnabled = safeIndex > 0
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .border(
+                            0.8.dp,
+                            colors.border.copy(alpha = if (prevEnabled) 0.5f else 0.2f),
+                            RoundedCornerShape(8.dp)
+                        )
+                        .background(if (prevEnabled) colors.surfaceVariant.copy(alpha = 0.8f) else Color.Transparent)
+                        .clickable(enabled = prevEnabled) {
+                            if (safeIndex > 0) currentIndex--
+                        }
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "上一张".loc,
+                        tint = if (prevEnabled) colors.textPrimary else colors.textSecondary.copy(alpha = 0.35f),
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Text(
+                        text = "上一张".loc,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (prevEnabled) colors.textPrimary else colors.textSecondary.copy(alpha = 0.35f)
+                    )
+                }
+
+                // 下一张
+                val nextEnabled = safeIndex < slides.size - 1
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .border(
+                            0.8.dp,
+                            colors.border.copy(alpha = if (nextEnabled) 0.5f else 0.2f),
+                            RoundedCornerShape(8.dp)
+                        )
+                        .background(if (nextEnabled) colors.surfaceVariant.copy(alpha = 0.8f) else Color.Transparent)
+                        .clickable(enabled = nextEnabled) {
+                            if (safeIndex < slides.size - 1) currentIndex++
+                        }
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Text(
+                        text = "下一张".loc,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (nextEnabled) colors.textPrimary else colors.textSecondary.copy(alpha = 0.35f)
+                    )
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                        contentDescription = "下一张".loc,
+                        tint = if (nextEnabled) colors.textPrimary else colors.textSecondary.copy(alpha = 0.35f),
+                        modifier = Modifier.size(12.dp)
+                    )
+                }
+            }
+        }
+
+        HorizontalDivider(
+            color = colors.border.copy(alpha = 0.4f),
+            thickness = 0.8.dp
+        )
+
+        // Slide Content Area with swipe support
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .pointerInput(safeIndex, slides.size) {
+                    var totalDrag = 0f
+                    detectHorizontalDragGestures(
+                        onDragStart = { totalDrag = 0f },
+                        onDragEnd = {
+                            if (totalDrag < -60f && safeIndex < slides.size - 1) {
+                                currentIndex++
+                            } else if (totalDrag > 60f && safeIndex > 0) {
+                                currentIndex--
+                            }
+                        },
+                        onHorizontalDrag = { _, dragAmount ->
+                            totalDrag += dragAmount
+                        }
+                    )
+                }
+        ) {
+            AnimatedContent(
+                targetState = safeIndex,
+                transitionSpec = {
+                    if (targetState > initialState) {
+                        (slideInHorizontally { width -> width / 3 } + fadeIn()).togetherWith(
+                            slideOutHorizontally { width -> -width / 3 } + fadeOut()
+                        )
+                    } else {
+                        (slideInHorizontally { width -> -width / 3 } + fadeIn()).togetherWith(
+                            slideOutHorizontally { width -> width / 3 } + fadeOut()
+                        )
+                    }
+                },
+                label = "carousel_slide"
+            ) { targetIdx ->
+                val slide = slides[targetIdx]
+                MarkdownContentView(
+                    content = slide.content,
+                    onPlanClick = onPlanClick,
+                    urlResolver = urlResolver,
+                    onImageClick = onImageClick
+                )
+            }
+        }
+
+        // Bottom pagination dots
+        if (slides.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp, bottom = 10.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                slides.forEachIndexed { idx, _ ->
+                    Box(
+                        modifier = Modifier
+                            .padding(horizontal = 3.dp)
+                            .size(width = if (idx == safeIndex) 18.dp else 6.dp, height = 6.dp)
+                            .clip(CircleShape)
+                            .background(if (idx == safeIndex) colors.accentBlue else colors.textSecondary.copy(alpha = 0.25f))
+                            .clickable { currentIndex = idx }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun PluginCardBlockView(
+    pluginId: String,
+    colors: AppColors,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val cascadeId = LocalCurrentCascadeId.current
+    val haptic = com.antigravity.mobile.ui.util.rememberHaptic()
+
+    var isInstalling by remember { mutableStateOf(false) }
+    var isInstalled by remember { mutableStateOf(false) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(colors.accentIndigo.copy(alpha = 0.08f))
+            .border(1.dp, colors.accentIndigo.copy(alpha = 0.28f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Extension,
+                    contentDescription = null,
+                    tint = colors.accentIndigo,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = "推荐插件：$pluginId".loc,
+                    color = colors.textPrimary,
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (isInstalled) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(colors.accentGreen.copy(alpha = 0.14f))
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = "已安装".loc,
+                        color = colors.accentGreen,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            } else {
+                Button(
+                    onClick = {
+                        if (isInstalling) return@Button
+                        haptic.medium()
+                        isInstalling = true
+                        errorMsg = null
+                        scope.launch {
+                            val client = ApiClient.defaultInstance
+                                ?: ApiClient(context.applicationContext, PreferencesManager(context.applicationContext))
+                            val res = client.installPlugin(pluginId, cascadeId, autoResume = true)
+                            res.onSuccess { resp ->
+                                isInstalled = resp.installed || resp.success
+                                Toast.makeText(context, "插件已安装并续接对话".loc, Toast.LENGTH_SHORT).show()
+                            }.onFailure { err ->
+                                errorMsg = err.message ?: "安装失败".loc
+                            }
+                            isInstalling = false
+                        }
+                    },
+                    enabled = !isInstalling,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    modifier = Modifier.height(30.dp)
+                ) {
+                    if (isInstalling) {
+                        CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 1.6.dp)
+                    } else {
+                        Text("一键安装".loc, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+
+        Text(
+            text = errorMsg ?: "来自 Antigravity 插件市场。点击一键安装后将自动为您续接当前对话。".loc,
+            color = if (errorMsg != null) Color(0xFFEF4444) else colors.textSecondary,
+            fontSize = 11.5.sp
+        )
+    }
+}
+

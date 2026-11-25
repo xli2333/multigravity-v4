@@ -1,0 +1,937 @@
+import SwiftUI
+
+extension MarkdownContentView {
+    // MARK: - Rich Text with File Icons and Inline Code Styler
+    
+    final class InlineMarkdownCache: @unchecked Sendable {
+        static let shared = InlineMarkdownCache()
+        private let lock = NSLock()
+        private let maxEntries = 1200
+        private var cache: [Int: AttributedString] = [:]
+        private var insertionOrder: [Int] = []
+        
+        func get(_ key: Int) -> AttributedString? {
+            lock.lock()
+            defer { lock.unlock() }
+            return cache[key]
+        }
+        
+        func set(_ key: Int, value: AttributedString) {
+            lock.lock()
+            defer { lock.unlock() }
+            if cache[key] == nil {
+                if cache.count >= maxEntries {
+                    let evictCount = min(300, insertionOrder.count)
+                    for i in 0..<evictCount {
+                        cache.removeValue(forKey: insertionOrder[i])
+                    }
+                    insertionOrder.removeFirst(evictCount)
+                }
+                insertionOrder.append(key)
+            }
+            cache[key] = value
+        }
+    }
+    
+    public static func renderRichText(_ rawText: String, size: CGFloat = 15, weight: Font.Weight = .regular) -> Text {
+        var text = MathSymbolProcessor.process(rawText)
+        text = replaceHtmlBreaks(in: text)
+        text = unwrapBacktickBold(in: text)
+        
+        // Auto-link bare implementation_plan.md, walkthrough.md, task.md outside code spans
+        func autoLinkPlans(in s: String) -> String {
+            var res = s
+            if res.contains("implementation_plan.md") && !res.contains("[implementation_plan.md]") && !res.contains("](implementation_plan.md)") {
+                res = res.replacingOccurrences(of: "implementation_plan.md", with: "[implementation_plan.md](implementation_plan.md)")
+            }
+            if res.contains("walkthrough.md") && !res.contains("[walkthrough.md]") && !res.contains("](walkthrough.md)") {
+                res = res.replacingOccurrences(of: "walkthrough.md", with: "[walkthrough.md](walkthrough.md)")
+            }
+            if res.contains("task.md") && !res.contains("[task.md]") && !res.contains("](task.md)") {
+                res = res.replacingOccurrences(of: "task.md", with: "[task.md](task.md)")
+            }
+            return res
+        }
+        
+        if text.contains("implementation_plan.md") || text.contains("walkthrough.md") || text.contains("task.md") {
+            if text.contains("`") {
+                let segments = splitCodeSpans(in: text)
+                text = segments.map { segment in
+                    segment.isCode ? segment.content : autoLinkPlans(in: segment.content)
+                }.joined()
+            } else {
+                text = autoLinkPlans(in: text)
+            }
+        }
+        
+        // Auto-link MEDIA: paths (e.g. MEDIA:/path/to/image.png) into clickable image links
+        if text.contains("MEDIA:") {
+            let mediaPattern = #"(?:^|\s|<br\s*/?>)MEDIA:\s*([^\s\)\<\>\"\'\`]+)"#
+            if let regex = try? NSRegularExpression(pattern: mediaPattern) {
+                let nsText = text as NSString
+                let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+                if !matches.isEmpty {
+                    var replaced = ""
+                    var lastEnd = 0
+                    for match in matches {
+                        if match.range.location > lastEnd {
+                            replaced += nsText.substring(with: NSRange(location: lastEnd, length: match.range.location - lastEnd))
+                        }
+                        let rawPath = nsText.substring(with: match.range(at: 1))
+                        let clean = rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "`\"'()[]<>"))
+                        let fn = (clean as NSString).lastPathComponent
+                        let linkTarget = (clean.hasPrefix("file://") || clean.hasPrefix("http://") || clean.hasPrefix("https://")) ? clean : "file://\(clean)"
+                        let actionText = isVideoURL(clean) ? String(localized: "点击预览并播放视频") : String(localized: "点击放大查看图片")
+                        replaced += "\n[\(actionText) (\(fn))](\(linkTarget))"
+                        lastEnd = match.range.location + match.range.length
+                    }
+                    if lastEnd < nsText.length {
+                        replaced += nsText.substring(with: NSRange(location: lastEnd, length: nsText.length - lastEnd))
+                    }
+                    text = replaced
+                }
+            }
+        }
+        
+        let attr = renderInlineMarkdownNormalized(text, size: size, weight: weight)
+        
+        // Fast-path: If text does not contain markdown link signature `](` or URL scheme, return Text(attr) directly
+        guard (text.contains("[") && text.contains("](")) || text.contains("http://") || text.contains("https://") || text.contains("file://") else {
+            return Text(attr)
+        }
+        
+        var iconInsertions: [(icon: String, index: AttributedString.Index)] = []
+        var currentLinkUrl: URL? = nil
+        var currentLinkRunsText = ""
+        var currentLinkStartIndex: AttributedString.Index? = nil
+        
+        func finishCurrentLink() {
+            guard let url = currentLinkUrl, let startIdx = currentLinkStartIndex else { return }
+            let linkText = currentLinkRunsText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let icon = FileIconResolver.resolveIcon(for: linkText) ?? FileIconResolver.resolveIcon(for: url.absoluteString) {
+                iconInsertions.append((icon: icon, index: startIdx))
+            }
+            currentLinkUrl = nil
+            currentLinkRunsText = ""
+            currentLinkStartIndex = nil
+        }
+        
+        for run in attr.runs {
+            if let link = run.link {
+                if let activeUrl = currentLinkUrl, activeUrl == link {
+                    currentLinkRunsText += String(attr[run.range].characters)
+                } else {
+                    finishCurrentLink()
+                    currentLinkUrl = link
+                    currentLinkRunsText = String(attr[run.range].characters)
+                    currentLinkStartIndex = run.range.lowerBound
+                }
+            } else {
+                finishCurrentLink()
+            }
+        }
+        finishCurrentLink()
+        
+        if iconInsertions.isEmpty {
+            return Text(attr)
+        }
+        
+        var combined = Text("")
+        var currentIndex = attr.startIndex
+        let iconOffset: CGFloat = (size <= 13) ? -2.2 : -2.0
+        
+        for ins in iconInsertions {
+            if ins.index > currentIndex {
+                let leading = AttributedString(attr[currentIndex..<ins.index])
+                combined = combined + Text(leading)
+            }
+            combined = combined + Text(Image(ins.icon)).baselineOffset(iconOffset) + Text("\u{2009}")
+            currentIndex = ins.index
+        }
+        
+        if currentIndex < attr.endIndex {
+            let trailing = AttributedString(attr[currentIndex..<attr.endIndex])
+            combined = combined + Text(trailing)
+        }
+        
+        return combined
+    }
+    
+    // MARK: - Markdown Attributed String Styler
+    
+    static let cjkDelimiterMarker = "\u{FE50}" // Small comma (Unicode category Po - Punctuation, other)
+    
+    static let cjkDelimiterPatterns: [NSRegularExpression] = {
+        let patternStrings = [
+            (#"(?<!\*)\*\*\*(?!\*)"#, #"(?:[^\*]|\*(?!\*\*))+?"#, #"(?<!\*)\*\*\*(?!\*)"#),
+            (#"(?<!\*)\*\*(?!\*)"#, #"(?:[^\*]|\*(?!\*))+?"#, #"(?<!\*)\*\*(?!\*)"#),
+            (#"(?<!~)~~(?!~)"#, #"(?:[^~]|~(?!~))+?"#, #"(?<!~)~~(?!~)"#),
+            (#"(?<![A-Za-z0-9_])__(?!_)"#, #"(?:[^_]|_(?!_))+?"#, #"(?<!_)__(?![A-Za-z0-9_])"#),
+            (#"(?<!\*)\*(?!\*)"#, #"[^\*\n]+?"#, #"(?<!\*)\*(?!\*)"#),
+            (#"(?<![A-Za-z0-9_\\\{\}])_(?![_\{])"#, #"[^_\n\{\}]+?"#, #"(?<![_\\\{\}])_(?![A-Za-z0-9_\{])"#)
+        ]
+        return patternStrings.compactMap { (openPat, innerPat, closePat) in
+            try? NSRegularExpression(pattern: "(\(openPat))(\(innerPat))(\(closePat))")
+        }
+    }()
+    
+    // MARK: - HTML Line Break, Inline HTML Tags & Inline Code Processor
+    
+    static let htmlBreakRegex = try? NSRegularExpression(
+        pattern: #"[ \t]*<(?:\/br|br\b[^>]*\/?)>[ \t]*\n?"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlBoldRegex = try? NSRegularExpression(
+        pattern: #"<(b|strong)\b[^>]*>([\s\S]*?)<\/\1>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlItalicRegex = try? NSRegularExpression(
+        pattern: #"<(i|em)\b[^>]*>([\s\S]*?)<\/\1>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlStrikeRegex = try? NSRegularExpression(
+        pattern: #"<(s|del|strike)\b[^>]*>([\s\S]*?)<\/\1>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlCodeRegex = try? NSRegularExpression(
+        pattern: #"<(code|kbd)\b[^>]*>([\s\S]*?)<\/\1>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlMarkRegex = try? NSRegularExpression(
+        pattern: #"<mark\b[^>]*>([\s\S]*?)<\/mark>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlUnderlineRegex = try? NSRegularExpression(
+        pattern: #"<(u|ins)\b[^>]*>([\s\S]*?)<\/\1>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlSupRegex = try? NSRegularExpression(
+        pattern: #"<sup\b[^>]*>([\s\S]*?)<\/sup>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlSubRegex = try? NSRegularExpression(
+        pattern: #"<sub\b[^>]*>([\s\S]*?)<\/sub>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlSummaryRegex = try? NSRegularExpression(
+        pattern: #"<summary\b[^>]*>([\s\S]*?)<\/summary>"#,
+        options: [.caseInsensitive]
+    )
+    static let htmlDetailsTagRegex = try? NSRegularExpression(
+        pattern: #"<\/?details\b[^>]*>"#,
+        options: [.caseInsensitive]
+    )
+    static let markdownHighlightRegex = try? NSRegularExpression(
+        pattern: #"(?<!=)==([^=\n]+)==(?!=)"#
+    )
+    
+    /// Splits text into inline code segments (wrapped in backticks) and regular markdown text segments.
+    public static func splitCodeSpans(in text: String) -> [(content: String, isCode: Bool)] {
+        guard text.contains("`") else {
+            return [(content: text, isCode: false)]
+        }
+        
+        var segments: [(content: String, isCode: Bool)] = []
+        let chars = Array(text)
+        var i = 0
+        var lastIdx = 0
+        
+        while i < chars.count {
+            if chars[i] == "`" {
+                let tickStart = i
+                while i < chars.count && chars[i] == "`" {
+                    i += 1
+                }
+                let tickLen = i - tickStart
+                
+                if tickStart > lastIdx {
+                    segments.append((String(chars[lastIdx..<tickStart]), false))
+                }
+                
+                var closeFound = false
+                var j = i
+                while j < chars.count {
+                    if chars[j] == "`" {
+                        let cStart = j
+                        while j < chars.count && chars[j] == "`" {
+                            j += 1
+                        }
+                        if (j - cStart) == tickLen {
+                            closeFound = true
+                            segments.append((String(chars[tickStart..<j]), true))
+                            i = j
+                            lastIdx = j
+                            break
+                        }
+                    } else {
+                        j += 1
+                    }
+                }
+                if !closeFound {
+                    i = tickStart + 1
+                }
+            } else {
+                i += 1
+            }
+        }
+        if lastIdx < chars.count {
+            segments.append((String(chars[lastIdx..<chars.count]), false))
+        }
+        return segments
+    }
+    
+    public static func codeSpanIndexSet(in text: String) -> IndexSet {
+        guard text.contains("`") else { return IndexSet() }
+        var occupied = IndexSet()
+        var loc = 0
+        for seg in splitCodeSpans(in: text) {
+            let len = (seg.content as NSString).length
+            if seg.isCode && len > 0 {
+                occupied.insert(integersIn: loc ..< (loc + len))
+            }
+            loc += len
+        }
+        return occupied
+    }
+    
+    /// Replaces HTML line breaks, common inline HTML tags, ==highlight==, and HTML entities while protecting inline code spans.
+    public static func replaceHtmlBreaks(in text: String) -> String {
+        guard text.contains("<") || text.contains("&") || text.contains("==") else {
+            return text
+        }
+        
+        let replaceInString = { (s: String) -> String in
+            var out = s
+            if out.contains("<") {
+                if let regex = htmlBreakRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "\n")
+                }
+                if let regex = htmlBoldRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "**$2**")
+                }
+                if let regex = htmlItalicRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "*$2*")
+                }
+                if let regex = htmlStrikeRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "~~$2~~")
+                }
+                if let regex = htmlCodeRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "`$2`")
+                }
+                if let regex = htmlMarkRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "**$1**")
+                }
+                if let regex = htmlUnderlineRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "$2")
+                }
+                if let regex = htmlSupRegex {
+                    let ns = out as NSString
+                    let matches = regex.matches(in: out, range: NSRange(location: 0, length: ns.length))
+                    for m in matches.reversed() {
+                        let inner = ns.substring(with: m.range(at: 1))
+                        let converted = MathSymbolProcessor.cleanMathExpression("^{\(inner)}")
+                        out = (out as NSString).replacingCharacters(in: m.range, with: converted)
+                    }
+                }
+                if let regex = htmlSubRegex {
+                    let ns = out as NSString
+                    let matches = regex.matches(in: out, range: NSRange(location: 0, length: ns.length))
+                    for m in matches.reversed() {
+                        let inner = ns.substring(with: m.range(at: 1))
+                        let converted = MathSymbolProcessor.cleanMathExpression("_{\(inner)}")
+                        out = (out as NSString).replacingCharacters(in: m.range, with: converted)
+                    }
+                }
+                if let regex = htmlSummaryRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "**▸ $1**\n")
+                }
+                if let regex = htmlDetailsTagRegex {
+                    out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "")
+                }
+            }
+            if out.contains("=="), let regex = markdownHighlightRegex {
+                out = regex.stringByReplacingMatches(in: out, options: [], range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "**$1**")
+            }
+            if out.contains("&") {
+                out = out
+                    .replacingOccurrences(of: "&nbsp;", with: "\u{00A0}", options: .caseInsensitive)
+                    .replacingOccurrences(of: "&#160;", with: "\u{00A0}")
+                    .replacingOccurrences(of: "&mdash;", with: "—")
+                    .replacingOccurrences(of: "&ndash;", with: "–")
+                    .replacingOccurrences(of: "&hellip;", with: "…")
+                    .replacingOccurrences(of: "&rarr;", with: "→")
+                    .replacingOccurrences(of: "&larr;", with: "←")
+                    .replacingOccurrences(of: "&harr;", with: "↔")
+                    .replacingOccurrences(of: "&rArr;", with: "⇒")
+                    .replacingOccurrences(of: "&lArr;", with: "⇐")
+                    .replacingOccurrences(of: "&hArr;", with: "⇔")
+                    .replacingOccurrences(of: "&times;", with: "×")
+                    .replacingOccurrences(of: "&divide;", with: "÷")
+                    .replacingOccurrences(of: "&plusmn;", with: "±")
+                    .replacingOccurrences(of: "&le;", with: "≤")
+                    .replacingOccurrences(of: "&ge;", with: "≥")
+                    .replacingOccurrences(of: "&ne;", with: "≠")
+                    .replacingOccurrences(of: "&approx;", with: "≈")
+                    .replacingOccurrences(of: "&equiv;", with: "≡")
+                    .replacingOccurrences(of: "&infin;", with: "∞")
+                    .replacingOccurrences(of: "&bull;", with: "•")
+                    .replacingOccurrences(of: "&middot;", with: "·")
+                    .replacingOccurrences(of: "&deg;", with: "°")
+                    .replacingOccurrences(of: "&copy;", with: "©")
+                    .replacingOccurrences(of: "&reg;", with: "®")
+                    .replacingOccurrences(of: "&trade;", with: "™")
+                    .replacingOccurrences(of: "&lt;", with: "<")
+                    .replacingOccurrences(of: "&gt;", with: ">")
+                    .replacingOccurrences(of: "&quot;", with: "\"")
+                    .replacingOccurrences(of: "&#39;", with: "'")
+                    .replacingOccurrences(of: "&#039;", with: "'")
+                    .replacingOccurrences(of: "&apos;", with: "'")
+                    .replacingOccurrences(of: "&amp;", with: "&")
+            }
+            return out
+        }
+        
+        guard text.contains("`") else {
+            return replaceInString(text)
+        }
+        
+        let segments = splitCodeSpans(in: text)
+        return segments.map { segment in
+            segment.isCode ? segment.content : replaceInString(segment.content)
+        }.joined()
+    }
+    
+    // Unwraps bold text mistakenly wrapped in inline code backticks,
+    // e.g. "`** BUILD SUCCEEDED **`" -> "**BUILD SUCCEEDED**"
+    // so it parses and renders as true bold text rather than raw code with asterisks.
+    // Uses splitCodeSpans to avoid matching across distinct code span boundaries (e.g. `code1`**、**`code2`).
+    public static func unwrapBacktickBold(in text: String) -> String {
+        guard text.contains("`") && text.contains("**") else { return text }
+        let segments = splitCodeSpans(in: text)
+        return segments.map { segment in
+            guard segment.isCode else { return segment.content }
+            var trimmed = segment.content
+            while trimmed.hasPrefix("`") { trimmed.removeFirst() }
+            while trimmed.hasSuffix("`") { trimmed.removeLast() }
+            let innerTrimmed = trimmed.trimmingCharacters(in: .whitespaces)
+            if innerTrimmed.hasPrefix("***") && innerTrimmed.hasSuffix("***") && innerTrimmed.count >= 6 {
+                let boldContent = innerTrimmed.dropFirst(3).dropLast(3).trimmingCharacters(in: .whitespaces)
+                return "***\(boldContent)***"
+            } else if innerTrimmed.hasPrefix("**") && innerTrimmed.hasSuffix("**") && innerTrimmed.count >= 4 {
+                let boldContent = innerTrimmed.dropFirst(2).dropLast(2).trimmingCharacters(in: .whitespaces)
+                return "**\(boldContent)**"
+            }
+            return segment.content
+        }.joined()
+    }
+    
+    // Normalizes inner whitespace in bold markdown, e.g. "** text **" -> " **text** "
+    static let boldPairRegex = try? NSRegularExpression(
+        pattern: #"(?<!\*)(\*{2,3})((?:[^\*]|\*(?!\*))+?)\1(?!\*)"#
+    )
+    
+    static func normalizeBoldSpaces(in text: String) -> String {
+        guard text.contains("**"), let regex = boldPairRegex else { return text }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        guard !matches.isEmpty else { return text }
+        
+        var result = ""
+        var lastEnd = 0
+        
+        for match in matches {
+            let fullRange = match.range
+            if fullRange.location > lastEnd {
+                result += nsText.substring(with: NSRange(location: lastEnd, length: fullRange.location - lastEnd))
+            }
+            
+            let stars = nsText.substring(with: match.range(at: 1))
+            let inner = nsText.substring(with: match.range(at: 2))
+            
+            var leadingSpaces = ""
+            var trailingSpaces = ""
+            var trimmed = inner
+            
+            while let first = trimmed.first, first == " " || first == "\t" {
+                leadingSpaces.append(first)
+                trimmed.removeFirst()
+            }
+            while let last = trimmed.last, last == " " || last == "\t" {
+                trailingSpaces.append(last)
+                trimmed.removeLast()
+            }
+            
+            if trimmed.isEmpty {
+                result += nsText.substring(with: fullRange)
+            } else {
+                result += leadingSpaces + stars + trimmed + stars + trailingSpaces
+            }
+            
+            lastEnd = fullRange.location + fullRange.length
+        }
+        
+        if lastEnd < nsText.length {
+            result += nsText.substring(with: NSRange(location: lastEnd, length: nsText.length - lastEnd))
+        }
+        
+        return result
+    }
+
+    /// Fixes CommonMark delimiter bounding rules for CJK text.
+    /// Under CommonMark 0.30 specification, delimiter runs adjacent to punctuation
+    /// (e.g. **“bold”** or **(bold)**text) fail left-flanking or right-flanking checks
+    /// because CJK characters preceding or following the delimiters are letters (not whitespace or punctuation).
+    /// Inserting a temporary Unicode punctuation marker (U+FE50) on the non-punctuation side
+    /// satisfies CommonMark flanking rules, and the marker is cleanly stripped from the AttributedString.
+    static func fixCJKDelimiters(in text: String) -> (fixed: String, hasMarkers: Bool) {
+        guard text.contains("*") || text.contains("_") || text.contains("~") else {
+            return (text, false)
+        }
+        guard !text.contains(codeSpanPlaceholder) && !text.contains(protectedSpanPlaceholder) && !text.contains(bareURLPlaceholder) else {
+            return (text, false)
+        }
+        
+        let segments = splitCodeSpans(in: text)
+
+        // Mask each code span with a single placeholder so emphasis that wraps inline code
+        // (e.g. 设定为**`Code`（说明）**) is processed as one run instead of being cut apart.
+        var codeSpans: [String] = []
+        var masked = ""
+        for segment in segments {
+            if segment.isCode {
+                codeSpans.append(segment.content)
+                masked.append(codeSpanPlaceholder)
+            } else {
+                masked += segment.content
+            }
+        }
+
+        let (processed, hasMarkers) = processProtectedAndDelimiters(in: masked)
+
+        var result = ""
+        var index = 0
+        for ch in processed {
+            if ch == codeSpanPlaceholder, index < codeSpans.count {
+                result += codeSpans[index]
+                index += 1
+            } else {
+                result.append(ch)
+            }
+        }
+        return (result, hasMarkers)
+    }
+
+    /// Stand-in for an inline code span while delimiter fixing runs (private-use, treated as punctuation).
+    static let codeSpanPlaceholder: Character = "\u{E000}"
+    /// Stand-in for Markdown links and angle-bracket autolinks while delimiter fixing runs (private-use, treated as punctuation).
+    static let protectedSpanPlaceholder: Character = "\u{E001}"
+    /// Stand-in for bare URLs while delimiter fixing runs (private-use, treated as non-punctuation).
+    static let bareURLPlaceholder: Character = "\u{E002}"
+
+    /// Masks Markdown links `[label](destination)` and bare/autolink URLs (`http://`, `https://`, `file://`)
+    /// so emphasis regexes never insert markers into URLs or pair delimiters across link boundaries,
+    /// and escapes standalone single `~` as `\~` so `cmark-gfm` does not parse range tildes (`1.5~2`, `10~13`)
+    /// as strikethrough spans that swallow surrounding `**bold**` delimiters.
+    /// Link labels are still processed recursively so CJK bold/italic inside `[label]` continues to work.
+    private static func processProtectedAndDelimiters(in text: String) -> (String, Bool) {
+        let chars = Array(text)
+        var protectedSpans: [String] = []
+        var masked = ""
+        var anyInnerMarkers = false
+        var i = 0
+
+        while i < chars.count {
+            if chars[i] == "\\", i + 1 < chars.count {
+                masked.append(chars[i])
+                masked.append(chars[i + 1])
+                i += 2
+                continue
+            }
+
+            if chars[i] == "[", let linkMatch = scanMarkdownLink(in: chars, from: i) {
+                let (fixedLabel, labelMarkers) = processProtectedAndDelimiters(in: linkMatch.label)
+                if labelMarkers { anyInnerMarkers = true }
+                protectedSpans.append("[\(fixedLabel)]\(linkMatch.destinationWithParens)")
+                masked.append(protectedSpanPlaceholder)
+                i = linkMatch.nextIndex
+                continue
+            }
+
+            if chars[i] == "<", let autoEnd = scanAngleURL(in: chars, from: i) {
+                protectedSpans.append(String(chars[i..<autoEnd]))
+                masked.append(protectedSpanPlaceholder)
+                i = autoEnd
+                continue
+            }
+
+            if let bareEnd = scanBareURL(in: chars, from: i) {
+                protectedSpans.append(String(chars[i..<bareEnd]))
+                masked.append(bareURLPlaceholder)
+                i = bareEnd
+                continue
+            }
+
+            if chars[i] == "~" {
+                var j = i
+                while j < chars.count && chars[j] == "~" {
+                    j += 1
+                }
+                if j - i == 1 {
+                    masked.append("\\")
+                    masked.append("~")
+                } else {
+                    masked.append(contentsOf: chars[i..<j])
+                }
+                i = j
+                continue
+            }
+
+            masked.append(chars[i])
+            i += 1
+        }
+
+        let normalized = normalizeBoldSpaces(in: masked)
+        let (processed, outerMarkers) = processDelimitersInSegment(normalized)
+
+        if protectedSpans.isEmpty {
+            return (processed, outerMarkers || anyInnerMarkers)
+        }
+
+        var restored = ""
+        var spanIdx = 0
+        for ch in processed {
+            if (ch == protectedSpanPlaceholder || ch == bareURLPlaceholder), spanIdx < protectedSpans.count {
+                restored += protectedSpans[spanIdx]
+                spanIdx += 1
+            } else {
+                restored.append(ch)
+            }
+        }
+        return (restored, outerMarkers || anyInnerMarkers)
+    }
+
+    private static func scanMarkdownLink(
+        in chars: [Character],
+        from start: Int
+    ) -> (label: String, destinationWithParens: String, nextIndex: Int)? {
+        guard start < chars.count, chars[start] == "[" else { return nil }
+        var i = start + 1
+        var bracketDepth = 1
+        while i < chars.count {
+            let ch = chars[i]
+            if ch == "\\", i + 1 < chars.count {
+                i += 2
+                continue
+            }
+            if ch == "[" {
+                bracketDepth += 1
+            } else if ch == "]" {
+                bracketDepth -= 1
+                if bracketDepth == 0 {
+                    break
+                }
+            }
+            i += 1
+        }
+        guard bracketDepth == 0, i + 1 < chars.count, chars[i + 1] == "(" else {
+            return nil
+        }
+
+        let label = String(chars[(start + 1)..<i])
+        let destOpenIdx = i + 1
+        var j = destOpenIdx + 1
+        var parenDepth = 1
+        while j < chars.count {
+            let ch = chars[j]
+            if ch == "\\", j + 1 < chars.count {
+                j += 2
+                continue
+            }
+            if ch == "\n" || ch == "\r" {
+                return nil
+            }
+            if ch == "(" {
+                parenDepth += 1
+            } else if ch == ")" {
+                parenDepth -= 1
+                if parenDepth == 0 {
+                    let dest = String(chars[destOpenIdx...j])
+                    return (label, dest, j + 1)
+                }
+            }
+            j += 1
+        }
+        return nil
+    }
+
+    private static func scanAngleURL(in chars: [Character], from start: Int) -> Int? {
+        guard start < chars.count, chars[start] == "<" else { return nil }
+        let rest = String(chars[(start + 1)..<min(chars.count, start + 10)])
+        guard rest.hasPrefix("https://") || rest.hasPrefix("http://") || rest.hasPrefix("file://") else {
+            return nil
+        }
+        var i = start + 1
+        while i < chars.count {
+            let ch = chars[i]
+            if ch.isWhitespace || ch == "<" {
+                return nil
+            }
+            if ch == ">" {
+                return i + 1
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    private static func scanBareURL(in chars: [Character], from start: Int) -> Int? {
+        if start > 0 {
+            let prev = chars[start - 1]
+            if prev.isLetter || prev.isNumber || prev == "_" {
+                return nil
+            }
+        }
+        let maxPrefix = min(chars.count, start + 8)
+        let prefix = String(chars[start..<maxPrefix])
+        let schemeLen: Int
+        if prefix.hasPrefix("https://") {
+            schemeLen = 8
+        } else if prefix.hasPrefix("http://") || prefix.hasPrefix("file://") {
+            schemeLen = 7
+        } else {
+            return nil
+        }
+        var i = start + schemeLen
+        var parenDepth = 0
+        var bracketDepth = 0
+        while i < chars.count {
+            let ch = chars[i]
+            if ch.isWhitespace || ch == "<" || ch == ">" {
+                break
+            }
+            if ch == "(" {
+                parenDepth += 1
+            } else if ch == ")" {
+                if parenDepth == 0 { break }
+                parenDepth -= 1
+            } else if ch == "[" {
+                bracketDepth += 1
+            } else if ch == "]" {
+                if bracketDepth == 0 { break }
+                bracketDepth -= 1
+            }
+            i += 1
+        }
+        return i > start + schemeLen ? i : nil
+    }
+    
+    static func processDelimitersInSegment(_ text: String) -> (String, Bool) {
+        var hasMarkers = false
+        var result = text
+        
+        // Matches cmark-gfm punctuation rules: Unicode General Category P or ASCII symbols (`$`, `+`, `~`, etc.),
+        // excluding non-ASCII symbols (`≈`, `¥`, `→`, `℃`) which cmark-gfm treats as non-punctuation.
+        func isPunctOrSymbol(_ c: Character) -> Bool {
+            return c.isPunctuation || (c.isASCII && c.isSymbol) || c == codeSpanPlaceholder || c == protectedSpanPlaceholder
+        }
+        
+        for regex in cjkDelimiterPatterns {
+            let nsText = result as NSString
+            let matches = regex.matches(in: result, range: NSRange(location: 0, length: nsText.length))
+            guard !matches.isEmpty else { continue }
+            
+            var modified = ""
+            var lastEnd = 0
+            
+            for match in matches {
+                let fullRange = match.range
+                if fullRange.location > lastEnd {
+                    modified += nsText.substring(with: NSRange(location: lastEnd, length: fullRange.location - lastEnd))
+                }
+                
+                let openDelim = nsText.substring(with: match.range(at: 1))
+                let innerText = nsText.substring(with: match.range(at: 2))
+                let closeDelim = nsText.substring(with: match.range(at: 3))
+                
+                let prevChar: Character? = fullRange.location > 0 ? (nsText.substring(with: NSRange(location: fullRange.location - 1, length: 1)).first) : nil
+                let nextCharIndex = fullRange.location + fullRange.length
+                let nextChar: Character? = nextCharIndex < nsText.length ? (nsText.substring(with: NSRange(location: nextCharIndex, length: 1)).first) : nil
+                
+                let firstInner = innerText.first
+                let lastInner = innerText.last
+                
+                var prefixMarker = ""
+                var openMarker = ""
+                var closeMarker = ""
+                var suffixMarker = ""
+                
+                // 1. Opening delimiter flanking fixes:
+                if let fi = firstInner {
+                    if isPunctOrSymbol(fi) {
+                        // If fi is punct, and prevChar is letter -> need punct before openDelim
+                        if let p = prevChar, !p.isWhitespace && !isPunctOrSymbol(p) {
+                            prefixMarker = cjkDelimiterMarker
+                            hasMarkers = true
+                        }
+                    } else if !fi.isWhitespace {
+                        // If fi is letter, and prevChar is punct -> need punct after openDelim
+                        if let p = prevChar, isPunctOrSymbol(p) {
+                            openMarker = cjkDelimiterMarker
+                            hasMarkers = true
+                        }
+                    }
+                }
+                
+                // 2. Closing delimiter flanking fixes:
+                if let li = lastInner {
+                    if isPunctOrSymbol(li) {
+                        // If li is punct, and nextChar is letter -> need punct after closeDelim
+                        if let n = nextChar, !n.isWhitespace && !isPunctOrSymbol(n) {
+                            suffixMarker = cjkDelimiterMarker
+                            hasMarkers = true
+                        }
+                    } else if !li.isWhitespace {
+                        // If li is letter, and nextChar is punct -> need punct before closeDelim
+                        if let n = nextChar, isPunctOrSymbol(n) {
+                            closeMarker = cjkDelimiterMarker
+                            hasMarkers = true
+                        }
+                    }
+                }
+                
+                modified += prefixMarker + openDelim + openMarker + innerText + closeMarker + closeDelim + suffixMarker
+                lastEnd = fullRange.location + fullRange.length
+            }
+            
+            if lastEnd < nsText.length {
+                modified += nsText.substring(with: NSRange(location: lastEnd, length: nsText.length - lastEnd))
+            }
+            
+            result = modified
+        }
+        
+        return (result, hasMarkers)
+    }
+    
+    public static func renderInlineMarkdown(_ text: String, size: CGFloat = 15, weight: Font.Weight = .regular) -> AttributedString {
+        let textWithBreaks = replaceHtmlBreaks(in: text)
+        let unwrappedText = unwrapBacktickBold(in: textWithBreaks)
+        return renderInlineMarkdownNormalized(unwrappedText, size: size, weight: weight)
+    }
+
+    /// Strips `<16-hex>-` prefixes from WeChat chat archive display references in link labels,
+    /// inline code, and prose, while keeping link destination URLs and bare/angle URLs intact.
+    static func stripWeChatDisplayPrefixes(in text: String) -> String {
+        guard text.contains("聊天记录"), text.contains("-") else { return text }
+
+        func stripInNonCodeSegment(_ segment: String) -> String {
+            let chars = Array(segment)
+            var out = ""
+            var plainBuffer = ""
+            var i = 0
+
+            func flushPlain() {
+                if !plainBuffer.isEmpty {
+                    out += FileIconResolver.strippingWeChatDisplayPrefix(in: plainBuffer)
+                    plainBuffer = ""
+                }
+            }
+
+            while i < chars.count {
+                if chars[i] == "\\", i + 1 < chars.count {
+                    plainBuffer.append(chars[i])
+                    plainBuffer.append(chars[i + 1])
+                    i += 2
+                    continue
+                }
+                if chars[i] == "[", let linkMatch = scanMarkdownLink(in: chars, from: i) {
+                    flushPlain()
+                    let cleanedLabel = stripWeChatDisplayPrefixes(in: linkMatch.label)
+                    out += "[\(cleanedLabel)]\(linkMatch.destinationWithParens)"
+                    i = linkMatch.nextIndex
+                    continue
+                }
+                if chars[i] == "<", let autoEnd = scanAngleURL(in: chars, from: i) {
+                    flushPlain()
+                    out += String(chars[i..<autoEnd])
+                    i = autoEnd
+                    continue
+                }
+                if let bareEnd = scanBareURL(in: chars, from: i) {
+                    flushPlain()
+                    out += String(chars[i..<bareEnd])
+                    i = bareEnd
+                    continue
+                }
+                plainBuffer.append(chars[i])
+                i += 1
+            }
+            flushPlain()
+            return out
+        }
+
+        guard text.contains("`") else {
+            return stripInNonCodeSegment(text)
+        }
+
+        return splitCodeSpans(in: text).map { segment in
+            if segment.isCode {
+                let tickCount = segment.content.prefix { $0 == "`" }.count
+                guard tickCount > 0 && segment.content.count >= tickCount * 2 else {
+                    return FileIconResolver.strippingWeChatDisplayPrefix(in: segment.content)
+                }
+                let ticks = String(repeating: "`", count: tickCount)
+                let inner = String(segment.content.dropFirst(tickCount).dropLast(tickCount))
+                return ticks + FileIconResolver.strippingWeChatDisplayPrefix(in: inner) + ticks
+            }
+            return stripInNonCodeSegment(segment.content)
+        }.joined()
+    }
+
+    private static func renderInlineMarkdownNormalized(_ unwrappedText: String, size: CGFloat = 15, weight: Font.Weight = .regular) -> AttributedString {
+        let displayCleaned = stripWeChatDisplayPrefixes(in: unwrappedText)
+        let cacheKey = displayCleaned.hashValue ^ (Int(size * 100) << 2) ^ weight.hashValue
+        if let cached = InlineMarkdownCache.shared.get(cacheKey) {
+            return cached
+        }
+        
+        let (preprocessedText, hasMarkers) = fixCJKDelimiters(in: displayCleaned)
+        
+        var options = AttributedString.MarkdownParsingOptions()
+        options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+        guard var attr = try? AttributedString(markdown: preprocessedText, options: options) else {
+            let fallback = AttributedString(displayCleaned)
+            InlineMarkdownCache.shared.set(cacheKey, value: fallback)
+            return fallback
+        }
+        
+        if hasMarkers {
+            while let range = attr.range(of: cjkDelimiterMarker) {
+                attr.removeSubrange(range)
+            }
+        }
+        
+        // Antigravity Desktop Code Amber/Yellow color: #E5C07B (RGB: 229, 192, 123)
+        let codeFgColor = Color(red: 229/255, green: 192/255, blue: 123/255)
+        
+        for run in attr.runs {
+            let isBold = (run.inlinePresentationIntent?.contains(.stronglyEmphasized) == true) || weight == .bold
+            let runWeight: Font.Weight = isBold ? .bold : .medium
+            
+            if let intent = run.inlinePresentationIntent, intent.contains(.code) {
+                attr[run.range].foregroundColor = codeFgColor
+                attr[run.range].font = .system(size: size * 0.9, weight: runWeight, design: .monospaced)
+            } else if run.link != nil {
+                attr[run.range].font = .system(size: size * 0.9, weight: runWeight, design: .monospaced)
+                attr[run.range].foregroundColor = Color.blue
+                let linkStr = (run.link?.absoluteString ?? "").lowercased()
+                if linkStr.contains("implementation_plan") || linkStr.contains("walkthrough") {
+                    attr[run.range].backgroundColor = Color.blue.opacity(0.12)
+                }
+            }
+        }
+        InlineMarkdownCache.shared.set(cacheKey, value: attr)
+        return attr
+    }
+    
+}

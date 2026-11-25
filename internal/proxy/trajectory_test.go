@@ -1,0 +1,1964 @@
+package proxy
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"antigravity-mobile/internal/inspector"
+)
+
+func TestParseTrajectoryDetails_CanProceed(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "Please generate a plan"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "Here is the implementation plan"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": {
+							"summary": "Test plan",
+							"requestFeedback": true,
+							"userFacing": true
+						},
+						"actionResult": {
+							"edit": {
+								"absoluteUri": "file:///path/to/implementation_plan.md",
+								"createFile": true
+							}
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if !details.CanProceed {
+		t.Fatalf("expected CanProceed to be true, got false")
+	}
+	if details.ProceedArtifactURI != "file:///path/to/implementation_plan.md" {
+		t.Fatalf("expected ProceedArtifactURI to be 'file:///path/to/implementation_plan.md', got %q", details.ProceedArtifactURI)
+	}
+
+	// Test 2: If subsequent user input exists, CanProceed should be false
+	rawJSONAfterUserMessage := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Please generate a plan" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": { "requestFeedback": true },
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/implementation_plan.md" }
+						}
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "I have reviewed it" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": { "response": "Proceeding with changes..." }
+				}
+			]
+		}
+	}`
+
+	var rawResp2 upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSONAfterUserMessage), &rawResp2); err != nil {
+		t.Fatalf("failed to unmarshal test JSON 2: %v", err)
+	}
+
+	details2 := p.ParseTrajectoryDetails(&rawResp2)
+	if details2.CanProceed {
+		t.Fatalf("expected CanProceed to be false after user response, got true")
+	}
+
+	// Test 3: If non-artifact code files were modified in the same turn, CanProceed should be false
+	rawJSONWithCodeEdits := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Please generate a plan" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": { "requestFeedback": true },
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/implementation_plan.md" }
+						}
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": false,
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/main.go" }
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp3 upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSONWithCodeEdits), &rawResp3); err != nil {
+		t.Fatalf("failed to unmarshal test JSON 3: %v", err)
+	}
+
+	details3 := p.ParseTrajectoryDetails(&rawResp3)
+	if details3.CanProceed {
+		t.Fatalf("expected CanProceed to be false when code files were modified in same turn, got true")
+	}
+
+	// Test 4: Walkthrough document in the current turn must never trigger CanProceed
+	rawJSONWalkthrough := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Remove animations and verify" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": { "response": "Completed task, updating walkthrough" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": {
+							"summary": "Walkthrough delivery report",
+							"requestFeedback": false,
+							"userFacing": true
+						},
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/.gemini/antigravity/brain/test-cascade-123/walkthrough.md" }
+						}
+					}
+				}
+			]
+		}
+	}`
+	var rawResp4 upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSONWalkthrough), &rawResp4); err != nil {
+		t.Fatalf("failed to unmarshal test JSON 4: %v", err)
+	}
+	details4 := p.ParseTrajectoryDetails(&rawResp4)
+	if details4.CanProceed {
+		t.Fatalf("expected CanProceed to be false for walkthrough.md, got true")
+	}
+
+	// Test 5: Scratch scripts in brain/scratch/ should count as code actions, not feedback artifacts
+	rawJSONScratch := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Run scratch script" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/.gemini/antigravity/brain/test-cascade-123/scratch/build.py" }
+						}
+					}
+				}
+			]
+		}
+	}`
+	var rawResp5 upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSONScratch), &rawResp5); err != nil {
+		t.Fatalf("failed to unmarshal test JSON 5: %v", err)
+	}
+	details5 := p.ParseTrajectoryDetails(&rawResp5)
+	if details5.CanProceed {
+		t.Fatalf("expected CanProceed to be false when scratch script was modified, got true")
+	}
+
+	// Test 6: If non-artifact files were modified BEFORE the plan in the same turn, CanProceed should be true
+	rawJSONDocsThenPlan := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Save report to docs and prepare plan" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": false,
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/docs/security_audit_report.md" }
+						}
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": { "requestFeedback": true },
+						"actionResult": {
+							"edit": { "absoluteUri": "file:///path/to/implementation_plan.md" }
+						}
+					}
+				}
+			]
+		}
+	}`
+	var rawResp6 upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSONDocsThenPlan), &rawResp6); err != nil {
+		t.Fatalf("failed to unmarshal test JSON 6: %v", err)
+	}
+	details6 := p.ParseTrajectoryDetails(&rawResp6)
+	if !details6.CanProceed {
+		t.Fatalf("expected CanProceed to be true when non-artifact file was modified before plan, got false")
+	}
+	if details6.ProceedArtifactURI != "file:///path/to/implementation_plan.md" {
+		t.Fatalf("expected ProceedArtifactURI to be 'file:///path/to/implementation_plan.md', got %q", details6.ProceedArtifactURI)
+	}
+
+	// Test 7: Approved artifact modified later via replace_file_content must NOT trigger CanProceed
+	rawJSONApprovedThenEdited := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-cascade-123",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Please generate audit report" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": { "requestFeedback": true },
+						"actionSpec": { "createFile": { "path": { "absoluteUri": "file:///path/to/performance-audit.md" } } },
+						"actionResult": { "edit": { "absoluteUri": "file:///path/to/performance-audit.md", "createFile": true } }
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "",
+						"artifactComments": [
+							{
+								"artifactUri": "file:///path/to/performance-audit.md",
+								"approvalStatus": "ARTIFACT_APPROVAL_STATUS_APPROVED"
+							}
+						]
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Please continue fixing Phase 2 and 3" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": false,
+						"actionResult": { "edit": { "absoluteUri": "file:///path/to/src/app.js" } }
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"actionSpec": { "command": { "instruction": "Update status checklist" } },
+						"actionResult": { "edit": { "absoluteUri": "file:///path/to/performance-audit.md" } }
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": { "response": "All fixes deployed and report updated." }
+				}
+			]
+		}
+	}`
+	var rawResp7 upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSONApprovedThenEdited), &rawResp7); err != nil {
+		t.Fatalf("failed to unmarshal test JSON 7: %v", err)
+	}
+	details7 := p.ParseTrajectoryDetails(&rawResp7)
+	if details7.CanProceed {
+		t.Fatalf("expected CanProceed to be false for already-approved artifact updated via replace_file_content, got true")
+	}
+}
+
+func TestParseTrajectoryDetails_PendingInteraction(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_RUNNING",
+		"trajectory": {
+			"trajectoryId": "traj-test-999",
+			"cascadeId": "cascade-test-999",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "Read the file"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_GENERIC",
+					"status": "CORTEX_STEP_STATUS_WAITING",
+					"requestedInteraction": {
+						"permission": {
+							"resource": {
+								"action": "read_file",
+								"target": "/Applications/ego lite.app/SKILL.md"
+							},
+							"actionDescription": "View ego-browser skill documentation"
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if details.PendingInteraction == nil {
+		t.Fatalf("expected PendingInteraction to be non-nil, got nil")
+	}
+	pi := details.PendingInteraction
+	if pi.Type != "permission" {
+		t.Errorf("expected type 'permission', got %q", pi.Type)
+	}
+	if pi.Title != "Allow read access to this path?" {
+		t.Errorf("expected title 'Allow read access to this path?', got %q", pi.Title)
+	}
+	if pi.Target != "/Applications/ego lite.app/SKILL.md" {
+		t.Errorf("expected target '/Applications/ego lite.app/SKILL.md', got %q", pi.Target)
+	}
+	if len(pi.Options) != 5 {
+		t.Errorf("expected 5 options, got %d", len(pi.Options))
+	}
+	if pi.Options[0].Text != "Yes, allow this time" {
+		t.Errorf("expected first option 'Yes, allow this time', got %q", pi.Options[0].Text)
+	}
+}
+
+func TestParseTrajectoryDetails_AskQuestionMultipleQuestions(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_RUNNING",
+		"trajectory": {
+			"trajectoryId": "traj-test-multi",
+			"cascadeId": "cascade-test-multi",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_GENERIC",
+					"status": "CORTEX_STEP_STATUS_WAITING",
+					"requestedInteraction": {
+						"askQuestion": {
+							"questions": [
+								{
+									"question": "Question 1?",
+									"isMultiSelect": false,
+									"options": [
+										{"id": "1", "text": "Opt 1A"},
+										{"id": "2", "text": "Opt 1B"}
+									]
+								},
+								{
+									"question": "Question 2?",
+									"isMultiSelect": true,
+									"options": [
+										{"id": "1", "text": "Opt 2A"},
+										{"id": "2", "text": "Opt 2B"},
+										{"id": "3", "text": "Opt 2C"}
+									]
+								}
+							]
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if details.PendingInteraction == nil {
+		t.Fatalf("expected PendingInteraction to be non-nil, got nil")
+	}
+	pi := details.PendingInteraction
+	if pi.Type != "ask_question" {
+		t.Errorf("expected type 'ask_question', got %q", pi.Type)
+	}
+	if len(pi.Questions) != 2 {
+		t.Fatalf("expected 2 questions, got %d", len(pi.Questions))
+	}
+	if pi.Questions[0].Question != "Question 1?" {
+		t.Errorf("expected first question 'Question 1?', got %q", pi.Questions[0].Question)
+	}
+	if len(pi.Questions[0].Options) != 2 {
+		t.Errorf("expected 2 options in question 0, got %d", len(pi.Questions[0].Options))
+	}
+	if pi.Questions[1].Question != "Question 2?" {
+		t.Errorf("expected second question 'Question 2?', got %q", pi.Questions[1].Question)
+	}
+	if len(pi.Questions[1].Options) != 3 {
+		t.Errorf("expected 3 options in question 1, got %d", len(pi.Questions[1].Options))
+	}
+	// Verify backward compatibility on top-level fields:
+	if pi.Title != "Question 1?" {
+		t.Errorf("expected backward-compatible title 'Question 1?', got %q", pi.Title)
+	}
+	if len(pi.Options) != 2 {
+		t.Errorf("expected backward-compatible 2 options, got %d", len(pi.Options))
+	}
+}
+
+func TestActualCascade_51dbc1ee(t *testing.T) {
+	insp := inspector.NewInspector(5 * time.Second)
+	info := insp.Scan()
+	if info == nil {
+		t.Skip("Antigravity instance not available")
+	}
+	p := NewProxy(insp)
+	rawResp, err := p.fetchUpstreamTrajectory("51dbc1ee-33a5-4272-a5a6-468901235e0c", info.Port, info.CSRFToken)
+	if err != nil {
+		t.Skipf("debug cascade not found on running instance: %v", err)
+	}
+	details := p.ParseTrajectoryDetails(rawResp)
+	t.Logf("Status: %s, PendingInteraction: %+v", details.Status, details.PendingInteraction)
+	if details.Status == "CASCADE_RUN_STATUS_RUNNING" {
+		if details.PendingInteraction == nil {
+			t.Errorf("expected 51dbc1ee to have active PendingInteraction while waiting")
+		} else {
+			t.Logf("Extracted pending interaction: title=%s, target=%s, options=%d",
+				details.PendingInteraction.Title, details.PendingInteraction.Target, len(details.PendingInteraction.Options))
+		}
+	}
+}
+
+func TestActualCascade_d363164b(t *testing.T) {
+	insp := inspector.NewInspector(5 * time.Second)
+	info := insp.Scan()
+	if info == nil {
+		t.Skip("Antigravity instance not available")
+	}
+	p := NewProxy(insp)
+	rawResp, err := p.fetchUpstreamTrajectory("d363164b-e572-4de3-b4ad-05029eb6a629", info.Port, info.CSRFToken)
+	if err != nil {
+		t.Skipf("debug cascade not found on running instance: %v", err)
+	}
+	details := p.ParseTrajectoryDetails(rawResp)
+	t.Logf("CanProceed: %t, ProceedArtifactURI: %s", details.CanProceed, details.ProceedArtifactURI)
+	if details.CanProceed {
+		t.Errorf("expected completed cascade d363164b to have CanProceed == false, got true")
+	}
+	if details.ProceedArtifactURI != "" {
+		t.Errorf("expected completed cascade d363164b to have empty ProceedArtifactURI, got %q", details.ProceedArtifactURI)
+	}
+}
+
+func TestActualCascade_cd607000(t *testing.T) {
+	insp := inspector.NewInspector(5 * time.Second)
+	info := insp.Scan()
+	if info == nil {
+		t.Skip("Antigravity instance not available")
+	}
+	p := NewProxy(insp)
+	rawResp, err := p.fetchUpstreamTrajectory("cd607000-9793-458c-b7e5-d8640085cb83", info.Port, info.CSRFToken)
+	if err != nil {
+		t.Skipf("debug cascade cd607000 not found on running instance: %v", err)
+	}
+	details := p.ParseTrajectoryDetails(rawResp)
+	t.Logf("cd607000: CanProceed: %t, ProceedArtifactURI: %s", details.CanProceed, details.ProceedArtifactURI)
+	if details.CanProceed {
+		t.Errorf("expected cd607000 (performance-audit) to have CanProceed == false, got true")
+	}
+	if details.ProceedArtifactURI != "" {
+		t.Errorf("expected cd607000 to have empty ProceedArtifactURI, got %q", details.ProceedArtifactURI)
+	}
+}
+
+func TestActualCascade_def5e25a(t *testing.T) {
+	insp := inspector.NewInspector(5 * time.Second)
+	info := insp.Scan()
+	if info == nil {
+		t.Skip("Antigravity instance not available")
+	}
+	p := NewProxy(insp)
+	rawResp, err := p.fetchUpstreamTrajectory("def5e25a-1718-4fd5-9c25-e3d3789fad36", info.Port, info.CSRFToken)
+	if err != nil {
+		t.Skipf("debug cascade def5e25a not found on running instance: %v", err)
+	}
+	details := p.ParseTrajectoryDetails(rawResp)
+	t.Logf("def5e25a details: Status=%s, HasError=%t, TotalTools=%d, TotalMessages=%d",
+		details.Status, details.HasError, details.TotalTools, len(details.AllMessages))
+	for i, msg := range details.AllMessages {
+		t.Logf("  Msg %d: type=%s, text=%q", i, msg.Type, msg.Text)
+	}
+
+	if details.TotalTools != 0 {
+		t.Errorf("expected TotalTools to be 0, got %d", details.TotalTools)
+	}
+	if len(details.AllMessages) < 2 {
+		t.Fatalf("expected at least 2 messages (1 user, 1 final 503 error), got %d", len(details.AllMessages))
+	}
+	if details.AllMessages[0].Type != "user" || details.AllMessages[0].Text != "你是什么模型" {
+		t.Errorf("expected first message to be '你是什么模型', got %+v", details.AllMessages[0])
+	}
+	if details.AllMessages[1].Type != "error" || !strings.Contains(details.AllMessages[1].Text, "503") {
+		t.Errorf("expected second message to be 503 error, got %+v", details.AllMessages[1])
+	}
+}
+
+func TestParseTrajectoryDetails_RunningTasks(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_RUNNING",
+		"trajectory": {
+			"cascadeId": "test-task-cascade",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "Run browser tests"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+					"status": "CORTEX_STEP_STATUS_RUNNING",
+					"metadata": {
+						"createdAt": "2026-09-10T14:46:24Z",
+						"toolSummary": "Check dashboard in browser",
+						"toolAction": "Inspecting dashboard with browser",
+						"toolCall": {
+							"name": "run_command"
+						},
+						"sourceTrajectoryStepInfo": {
+							"stepIndex": 1
+						}
+					},
+					"taskDetails": {
+						"id": "test-task-cascade/task-148",
+						"logUri": "file:///path/to/task-148.log",
+						"description": "ego-browser nodejs test.js"
+					},
+					"runCommand": {
+						"commandLine": "ego-browser nodejs test.js",
+						"cwd": "/Users/test/workspace"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if len(details.RunningTasks) != 1 {
+		t.Fatalf("expected 1 running task, got %d", len(details.RunningTasks))
+	}
+	task := details.RunningTasks[0]
+	if task.ID != "test-task-cascade/task-148" {
+		t.Errorf("expected task ID 'test-task-cascade/task-148', got %q", task.ID)
+	}
+	if task.StepIndex != 1 {
+		t.Errorf("expected stepIndex 1, got %d", task.StepIndex)
+	}
+	if task.CommandLine != "ego-browser nodejs test.js" {
+		t.Errorf("expected commandLine 'ego-browser nodejs test.js', got %q", task.CommandLine)
+	}
+	if task.ToolSummary != "Check dashboard in browser" {
+		t.Errorf("expected toolSummary 'Check dashboard in browser', got %q", task.ToolSummary)
+	}
+}
+
+func TestTrajectoryPagingDefaults(t *testing.T) {
+	// Generate 35 mock messages
+	var allMessages []CascadeMessageItem
+	for i := 0; i < 35; i++ {
+		allMessages = append(allMessages, CascadeMessageItem{
+			ID:   string(rune('A' + i)),
+			Type: "user",
+			Text: "message",
+		})
+	}
+
+	totalMsgs := len(allMessages)
+	defaultLimit := 15
+
+	// 1. Initial fetch (offset < 0)
+	start := totalMsgs - defaultLimit
+	if start < 0 {
+		start = 0
+	}
+	sliced := allMessages[start:totalMsgs]
+	hasMore := start > 0
+	nextOffset := start
+
+	if len(sliced) != 15 {
+		t.Fatalf("expected 15 sliced messages, got %d", len(sliced))
+	}
+	if !hasMore {
+		t.Fatalf("expected hasMore to be true")
+	}
+	if nextOffset != 20 {
+		t.Fatalf("expected nextOffset 20, got %d", nextOffset)
+	}
+
+	// 2. Load older messages (offset = 20)
+	targetEnd := nextOffset
+	targetStart := targetEnd - defaultLimit
+	if targetStart < 0 {
+		targetStart = 0
+	}
+	slicedOlder := allMessages[targetStart:targetEnd]
+	hasMoreOlder := targetStart > 0
+	nextOffsetOlder := targetStart
+
+	if len(slicedOlder) != 15 {
+		t.Fatalf("expected 15 slicedOlder messages, got %d", len(slicedOlder))
+	}
+	if !hasMoreOlder {
+		t.Fatalf("expected hasMoreOlder to be true")
+	}
+	if nextOffsetOlder != 5 {
+		t.Fatalf("expected nextOffsetOlder 5, got %d", nextOffsetOlder)
+	}
+}
+
+func TestParseTrajectoryDetails_ErrorMessage(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-error-cascade",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "你是什么模型"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"userErrorMessage": "Agent execution terminated due to error.",
+							"shortError": "checkpoint config validation failed: max token limit exceeded"
+						},
+						"shouldShowUser": true
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if !details.HasError {
+		t.Errorf("expected HasError to be true, got false")
+	}
+	if details.Status != "CASCADE_RUN_STATUS_ERROR" {
+		t.Errorf("expected Status to be CASCADE_RUN_STATUS_ERROR, got %s", details.Status)
+	}
+	if details.TotalTools != 0 {
+		t.Errorf("expected TotalTools to be 0, got %d", details.TotalTools)
+	}
+
+	if len(details.AllMessages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(details.AllMessages))
+	}
+
+	if details.AllMessages[0].Type != "user" || details.AllMessages[0].Text != "你是什么模型" {
+		t.Errorf("expected first message to be user '你是什么模型', got %+v", details.AllMessages[0])
+	}
+
+	errMsg := details.AllMessages[1]
+	if errMsg.Type != "error" {
+		t.Errorf("expected second message to be error type, got %s", errMsg.Type)
+	}
+	if errMsg.Text == "" || errMsg.Text == "error_message" {
+		t.Errorf("expected descriptive error text, got %q", errMsg.Text)
+	}
+}
+
+func TestParseTrajectoryDetails_HistoricalErrorResolved(t *testing.T) {
+	// Scenario matching LoRA session:
+	// Turn 1 had an error at step 1.
+	// Turn 2 had a user input at step 2 and a successful planner response at step 3.
+	// The session should NOT be marked as an error.
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "lora-session",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "旧指令"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"userErrorMessage": "LoRA 训练执行异常中断。",
+							"shortError": "training stream interrupted"
+						},
+						"shouldShowUser": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "新指令"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "新指令已顺利完成，没有错误。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if details.HasError {
+		t.Errorf("expected HasError to be false for resolved historical error, got true")
+	}
+	if details.Status != "CASCADE_RUN_STATUS_IDLE" {
+		t.Errorf("expected Status to be CASCADE_RUN_STATUS_IDLE, got %s", details.Status)
+	}
+	if details.ErrorMessage != "" {
+		t.Errorf("expected empty ErrorMessage, got %q", details.ErrorMessage)
+	}
+
+	// But historical messages should still include the user-visible error message
+	var hasErrorMessage bool
+	for _, msg := range details.AllMessages {
+		if msg.Type == "error" && strings.Contains(msg.Text, "training stream interrupted") {
+			hasErrorMessage = true
+			break
+		}
+	}
+	if !hasErrorMessage {
+		t.Errorf("expected historical error message to be preserved in AllMessages")
+	}
+}
+
+func TestParseTrajectoryDetails_InternalStreamInterruptedFiltered(t *testing.T) {
+	// Replicates the exact scenario of "def5e25a-1718-4fd5-9c25-e3d3789fad36":
+	// 1 User Input -> 2 transient stream interruptions with shouldShowModel: true -> final 503 error with shouldShowUser: true
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_ERROR",
+		"trajectory": {
+			"cascadeId": "def5e25a-1718-4fd5-9c25-e3d3789fad36",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "你是什么模型"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": ""
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"shortError": "The stream was interrupted. Please continue the task you were working on.",
+							"errorId": "step-2-err"
+						},
+						"shouldShowModel": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": ""
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"shortError": "The stream was interrupted. Please continue the task you were working on.",
+							"errorId": "step-4-err"
+						},
+						"shouldShowModel": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": ""
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"userErrorMessage": "Our servers are experiencing high traffic right now, please try again in a minute.",
+							"shortError": "UNAVAILABLE (code 503): No capacity available for model claude-opus-4-6-thinking on the server",
+							"errorId": "step-6-503"
+						},
+						"shouldShowUser": true
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if !details.HasError {
+		t.Errorf("expected HasError to be true, got false")
+	}
+	if details.Status != "CASCADE_RUN_STATUS_ERROR" {
+		t.Errorf("expected Status to be CASCADE_RUN_STATUS_ERROR, got %s", details.Status)
+	}
+	if details.TotalTools != 0 {
+		t.Errorf("expected TotalTools to be 0 (no phantom tools from planner responses), got %d", details.TotalTools)
+	}
+
+	// Should contain EXACTLY 2 messages: 1 user, 1 error (the 503).
+	// Transient errors and phantom tool batches must NOT appear!
+	if len(details.AllMessages) != 2 {
+		t.Fatalf("expected exactly 2 messages (1 user, 1 final error), got %d: %+v", len(details.AllMessages), details.AllMessages)
+	}
+
+	if details.AllMessages[0].Type != "user" || details.AllMessages[0].Text != "你是什么模型" {
+		t.Errorf("unexpected first message: %+v", details.AllMessages[0])
+	}
+	if details.AllMessages[1].Type != "error" {
+		t.Errorf("expected second message to be error, got %s", details.AllMessages[1].Type)
+	}
+	if !strings.Contains(details.AllMessages[1].Text, "503") {
+		t.Errorf("expected second message to contain 503 error, got %s", details.AllMessages[1].Text)
+	}
+}
+
+func TestParseTrajectoryDetails_TitleFallbackFromUserPrompt(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-title-cascade",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "项目消息子标签页设计\n请帮我优化这个UI布局"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "好的，我们来进行设计。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if details.Title != "项目消息子标签页设计" {
+		t.Errorf("expected title to be '项目消息子标签页设计', got %q", details.Title)
+	}
+}
+
+func TestAnnotationTitle_WriteAndRead(t *testing.T) {
+	testID := "test-annotation-cascade-xyz"
+	expectedTitle := "自动测试标题写入"
+
+	writeAnnotationTitle(testID, expectedTitle)
+	defer func() {
+		if home, err := os.UserHomeDir(); err == nil {
+			_ = os.Remove(filepath.Join(home, ".gemini", "antigravity", "annotations", testID+".pbtxt"))
+		}
+	}()
+
+	readBack := readAnnotationTitle(testID)
+	if readBack != expectedTitle {
+		t.Errorf("expected readBack %q, got %q", expectedTitle, readBack)
+	}
+}
+
+func TestAnnotationPinned_WriteAndRead(t *testing.T) {
+	testID := "test-annotation-pinned-xyz"
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	p := filepath.Join(home, ".gemini", "antigravity", "annotations", testID+".pbtxt")
+	defer func() {
+		_ = os.Remove(p)
+	}()
+
+	writeAnnotationPinned(testID, true)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("failed to read annotation file: %v", err)
+	}
+	if !strings.Contains(string(b), "pinned:true") && !strings.Contains(string(b), "pinned: true") {
+		t.Errorf("expected pinned:true in file, got %q", string(b))
+	}
+
+	writeAnnotationPinned(testID, false)
+	b, err = os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("failed to read annotation file after unpin: %v", err)
+	}
+	if !strings.Contains(string(b), "pinned:false") && !strings.Contains(string(b), "pinned: false") {
+		t.Errorf("expected pinned:false in file, got %q", string(b))
+	}
+}
+
+func TestExtractImageURLsFromText(t *testing.T) {
+	input := `
+长图已成功发送至 **陶九镇** 微信！
+
+* **接收目标**：陶九镇（微信会话）
+* **发送状态**：` + "`成功 (posted)`" + `
+* **发送内容**：一岁半宝宝刷牙与龋齿风险干预指南（高清长图）
+
+---
+
+### 本地预览与放大查看：
+
+[![点击放大查看高清长图](file:///Users/hal9000/Downloads/baby-teeth-brushing-guide_thumb.png)](file:///Users/hal9000/Downloads/baby-teeth-brushing-guide.png)
+
+🔍 **[点击在编辑器中直接放大查看高清原图（1290×12882）](file:///Users/hal9000/Downloads/baby-teeth-brushing-guide.png)**
+
+MEDIA:/Users/hal9000/Downloads/baby-teeth-brushing-guide.png
+`
+	urls := extractImageURLsFromText(input)
+	if len(urls) == 0 {
+		t.Fatalf("expected extracted image URLs, got none")
+	}
+
+	hasOrig := false
+	for _, u := range urls {
+		if strings.Contains(u, "baby-teeth-brushing-guide.png") {
+			hasOrig = true
+			break
+		}
+	}
+	if !hasOrig {
+		t.Errorf("expected baby-teeth-brushing-guide.png to be extracted, got %v", urls)
+	}
+}
+
+func TestSanitizeTitle(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "empty",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "untitled session",
+			input:    "未命名会话",
+			expected: "",
+		},
+		{
+			name:     "normal short title",
+			input:    "雪球雷达扫描与反爬排查",
+			expected: "雪球雷达扫描与反爬排查",
+		},
+		{
+			name:     "long prompt with truncation",
+			input:    "刚才收到反爬提示我已经验证了，但是脚本没有自动反馈结果，请你排查下是没有识别到 cookie 更新还是没有发送提示",
+			expected: "刚才收到反爬提示我已经验证了，但是脚本没有自动反馈结果，请你排查下是没有...",
+		},
+		{
+			name: "xml wrapped prompt",
+			input: `<USER_REQUEST>
+查查雪球雷达进展
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-13T09:50:21+08:00.
+</ADDITIONAL_METADATA>`,
+			expected: "查查雪球雷达进展",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SanitizeTitle(tc.input)
+			if got != tc.expected {
+				t.Errorf("SanitizeTitle(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestAnnotationTitleCache_TTL(t *testing.T) {
+	testID := "perf-test-annotation-cache"
+	defer func() {
+		ClearTrajectoryCache(testID)
+		home, _ := os.UserHomeDir()
+		_ = os.Remove(filepath.Join(home, ".gemini", "antigravity", "annotations", testID+".pbtxt"))
+	}()
+
+	writeAnnotationTitle(testID, "Initial Cached Title")
+	title1 := readAnnotationTitle(testID)
+	if title1 != "Initial Cached Title" {
+		t.Fatalf("expected 'Initial Cached Title', got %q", title1)
+	}
+
+	// Overwrite disk directly behind the cache's back
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".gemini", "antigravity", "annotations", testID+".pbtxt")
+	_ = os.WriteFile(p, []byte("title: \"Direct Disk Title\"\n"), 0600)
+
+	// Within TTL, readAnnotationTitle should return cached title
+	title2 := readAnnotationTitle(testID)
+	if title2 != "Initial Cached Title" {
+		t.Fatalf("expected cached title 'Initial Cached Title', got %q", title2)
+	}
+
+	// Clearing cache should force read from disk
+	ClearTrajectoryCache(testID)
+	title3 := readAnnotationTitle(testID)
+	if title3 != "Direct Disk Title" {
+		t.Fatalf("expected refreshed disk title 'Direct Disk Title', got %q", title3)
+	}
+}
+
+func TestIsValidCascade_CacheTTL(t *testing.T) {
+	testID := "perf-test-valid-cascade"
+	home, _ := os.UserHomeDir()
+	brainDir := filepath.Join(home, ".gemini", "antigravity", "brain", testID)
+	_ = os.MkdirAll(brainDir, 0700)
+	defer func() {
+		_ = os.RemoveAll(brainDir)
+		InvalidateCascadeValidCache(testID)
+	}()
+
+	if !isValidCascade(testID) {
+		t.Fatalf("expected cascade to be valid")
+	}
+
+	// Remove directory behind cache
+	_ = os.RemoveAll(brainDir)
+
+	// Should still be valid from cache within TTL
+	if !isValidCascade(testID) {
+		t.Fatalf("expected cascade to be valid from cache")
+	}
+
+	// Invalidate cache
+	InvalidateCascadeValidCache(testID)
+
+	// Now should be invalid
+	if isValidCascade(testID) {
+		t.Fatalf("expected cascade to be invalid after cache invalidation")
+	}
+}
+
+func TestCheckAndRecordMessageDedup_LazyExpiry(t *testing.T) {
+	p := &Proxy{
+		msgDedup:     make(map[string]time.Time),
+		cascadeDedup: make(map[string]cascadeDedupEntry),
+	}
+
+	key := "test-msg-key"
+	if p.checkAndRecordMessageDedup(key, 50*time.Millisecond) {
+		t.Fatalf("first check should not be duplicate")
+	}
+	if !p.checkAndRecordMessageDedup(key, 50*time.Millisecond) {
+		t.Fatalf("second check within TTL should be duplicate")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// After expiry, should not be duplicate and should reset
+	if p.checkAndRecordMessageDedup(key, 50*time.Millisecond) {
+		t.Fatalf("check after TTL should not be duplicate")
+	}
+}
+
+func TestCascadeDedup_LazyExpiry(t *testing.T) {
+	p := &Proxy{
+		msgDedup:     make(map[string]time.Time),
+		cascadeDedup: make(map[string]cascadeDedupEntry),
+	}
+
+	key := "test-cascade-key"
+	p.setCascadeDedup(key, "cascade-123")
+	if got := p.getCascadeDedup(key, 50*time.Millisecond); got != "cascade-123" {
+		t.Fatalf("expected cascade-123, got %q", got)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// After expiry, getCascadeDedup should return empty string and lazy-expire
+	if got := p.getCascadeDedup(key, 50*time.Millisecond); got != "" {
+		t.Fatalf("expected empty string after expiry, got %q", got)
+	}
+}
+
+func TestParseTrajectoryDetails_UserInputMediaURI(t *testing.T) {
+	p := &Proxy{}
+	resp := &upstreamTrajectoryResp{
+		Trajectory: struct {
+			TrajectoryID  string           `json:"trajectoryId"`
+			CascadeID     string           `json:"cascadeId"`
+			WorkspaceUris []string         `json:"workspaceUris"`
+			Steps         []TrajectoryStep `json:"steps"`
+			Annotations   *struct {
+				Title            string `json:"title"`
+				LastUserViewTime string `json:"lastUserViewTime"`
+			} `json:"annotations"`
+			Summary  string `json:"summary"`
+			Metadata *struct {
+				ParentConversationID string `json:"parentConversationId"`
+				SubagentSpec         *struct {
+					TypeName string `json:"typeName"`
+					Role     string `json:"role"`
+				} `json:"subagentSpec"`
+			} `json:"metadata"`
+			ExecutorMetadatas []struct {
+				CascadeConfig json.RawMessage `json:"cascadeConfig"`
+			} `json:"executorMetadatas"`
+		}{
+			CascadeID: "test-cascade-media",
+			Steps: []TrajectoryStep{
+				{
+					Type: "CORTEX_STEP_TYPE_USER_INPUT",
+					UserInput: &TrajectoryUserInput{
+						UserResponse: "这是附带图片的测试消息",
+						Media: []TrajectoryMediaItem{
+							{
+								MimeType:  "image/png",
+								Thumbnail: "thumb-base64-data",
+								URI:       "/Users/test/.gemini/antigravity/brain/test-cascade-media/.user_uploaded/original.png",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	details := p.ParseTrajectoryDetails(resp)
+	if len(details.AllMessages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(details.AllMessages))
+	}
+	msg := details.AllMessages[0]
+	if msg.Type != "user" {
+		t.Fatalf("expected user message, got %s", msg.Type)
+	}
+	if len(msg.Media) != 1 || msg.Media[0] != "thumb-base64-data" {
+		t.Fatalf("expected thumbnail in Media, got %v", msg.Media)
+	}
+	if len(msg.ImageURLs) != 1 || msg.ImageURLs[0] != "/Users/test/.gemini/antigravity/brain/test-cascade-media/.user_uploaded/original.png" {
+		t.Fatalf("expected original URI in ImageURLs, got %v", msg.ImageURLs)
+	}
+}
+
+func TestParseTrajectoryDetails_RunningStatusWithMidTurnError(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_RUNNING",
+		"trajectory": {
+			"cascadeId": "test-running-error-recovery",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "Commit and Push"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"userErrorMessage": "Agent execution terminated due to error.",
+							"shortError": "FAILED_PRECONDITION (code 400): User location is not supported"
+						},
+						"shouldShowUser": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": ""
+					},
+					"runCommand": {
+						"commandLine": "git push origin main"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if details.HasError {
+		t.Errorf("expected HasError to be false for running cascade, got true")
+	}
+	if details.Status != "CASCADE_RUN_STATUS_RUNNING" {
+		t.Errorf("expected Status to be CASCADE_RUN_STATUS_RUNNING, got %s", details.Status)
+	}
+}
+
+func TestParseTrajectoryDetails_AttemptErrorsMerged(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_RUNNING",
+		"trajectory": {
+			"cascadeId": "test-attempt-cascade",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "Job Failure Troubleshooting Iran Sitrep"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"shortError": "API error (attempt 1): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": Post \"https://oauth2.googleapis.com/token\": EOF"
+						},
+						"shouldShowUser": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"shortError": "API error (attempt 2): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": Post \"https://oauth2.googleapis.com/token\": EOF"
+						},
+						"shouldShowUser": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"shortError": "API error (attempt 3): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": Post \"https://oauth2.googleapis.com/token\": EOF"
+						},
+						"shouldShowUser": true
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"errorMessage": {
+						"error": {
+							"shortError": "API error (attempt 4): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": Post \"https://oauth2.googleapis.com/token\": EOF"
+						},
+						"shouldShowUser": true
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	// Should have exactly 2 messages: 1 user prompt, 1 merged error message
+	if len(details.AllMessages) != 2 {
+		t.Fatalf("expected 2 messages (1 user, 1 merged error), got %d: %+v", len(details.AllMessages), details.AllMessages)
+	}
+
+	errMsg := details.AllMessages[1]
+	if errMsg.Type != "error" {
+		t.Errorf("expected error message type, got %s", errMsg.Type)
+	}
+	if errMsg.AttemptCount != 4 {
+		t.Errorf("expected AttemptCount 4, got %d", errMsg.AttemptCount)
+	}
+	if errMsg.MaxAttempts != 9 {
+		t.Errorf("expected MaxAttempts 9, got %d", errMsg.MaxAttempts)
+	}
+	if !strings.Contains(errMsg.Text, "attempt 4/9") || !strings.Contains(errMsg.Text, "已重试 4 次") {
+		t.Errorf("expected merged text with attempt 4/9 and 已重试 4 次, got: %s", errMsg.Text)
+	}
+}
+
+func TestParseTrajectoryDetails_ArtifactItems(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-artifact-cascade",
+			"trajectoryId": "traj-artifact-1",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "请美化照片"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": {
+							"summary": "照片美化与景深虚化效果展示，包含原图与三种不同风格的景深虚化对比。",
+							"requestFeedback": false,
+							"userFacing": true
+						},
+						"actionResult": {
+							"edit": {
+								"absoluteUri": "file:///path/to/.gemini/antigravity/brain/test-artifact-cascade/photo_enhancement_showcase.md",
+								"createFile": true
+							}
+						}
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "已为您完成照片的美化处理。详细对比已整理至 [photo_enhancement_showcase.md](file:///path/to/.gemini/antigravity/brain/test-artifact-cascade/photo_enhancement_showcase.md)。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	var agentMsg *CascadeMessageItem
+	for i := range details.AllMessages {
+		if details.AllMessages[i].Type == "agent" {
+			agentMsg = &details.AllMessages[i]
+			break
+		}
+	}
+
+	if agentMsg == nil {
+		t.Fatalf("expected agent message, none found")
+	}
+
+	if len(agentMsg.Artifacts) != 1 {
+		t.Fatalf("expected exactly 1 artifact in agent message, got %d: %+v", len(agentMsg.Artifacts), agentMsg.Artifacts)
+	}
+
+	art := agentMsg.Artifacts[0]
+	if art.Title != "Photo Enhancement Showcase" {
+		t.Errorf("expected title 'Photo Enhancement Showcase', got %q", art.Title)
+	}
+	if art.Summary != "照片美化与景深虚化效果展示，包含原图与三种不同风格的景深虚化对比。" {
+		t.Errorf("expected summary, got %q", art.Summary)
+	}
+	if art.URI != "file:///path/to/.gemini/antigravity/brain/test-artifact-cascade/photo_enhancement_showcase.md" {
+		t.Errorf("expected uri, got %q", art.URI)
+	}
+}
+
+// TestParseTrajectoryDetails_WorkspaceDocsExcludedFromArtifacts verifies that ordinary project workspace
+// Markdown files (like docs/relay_plan.md) referenced in agent responses or edited in code actions are NOT
+// extracted as artifact preview cards, strictly matching desktop IDE behavior (Figure 1 in user bug report).
+func TestParseTrajectoryDetails_WorkspaceDocsExcludedFromArtifacts(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-workspace-cascade",
+			"trajectoryId": "traj-workspace-1",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "commit and push"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": false,
+						"actionResult": {
+							"edit": {
+								"absoluteUri": "file:///Users/hal9000/Projects/antigravity-mobile/docs/relay_plan.md"
+							}
+						}
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "已完成提交与推送！全部变更已成功推送到远程仓库：\n- [docs/frontend_roadmap.md](file:///Users/hal9000/Projects/antigravity-mobile/docs/frontend_roadmap.md): 新增忽略\n- [docs/relay_plan.md](file:///Users/hal9000/Projects/antigravity-mobile/docs/relay_plan.md): 从版本追踪中解除缓存\n- [docs/relay_plan.md](file:///Users/hal9000/Projects/antigravity-mobile/docs/relay_plan.md): 再次提及\n- [docs/file_attachments_design.md](file:///Users/hal9000/Projects/antigravity-mobile/docs/file_attachments_design.md): 清理完成。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	var agentMsg *CascadeMessageItem
+	for i := range details.AllMessages {
+		if details.AllMessages[i].Type == "agent" {
+			agentMsg = &details.AllMessages[i]
+			break
+		}
+	}
+
+	if agentMsg == nil {
+		t.Fatalf("expected agent message, none found")
+	}
+
+	if len(agentMsg.Artifacts) != 0 {
+		t.Fatalf("expected 0 artifacts for regular workspace docs, got %d: %+v", len(agentMsg.Artifacts), agentMsg.Artifacts)
+	}
+}
+
+// TestParseTrajectoryDetails_NonUserFacingArtifactsExcluded verifies that artifacts marked with
+// UserFacing = false (e.g. scratch scripts or internal intermediate files) are excluded from cards.
+func TestParseTrajectoryDetails_NonUserFacingArtifactsExcluded(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-hidden-artifact",
+			"trajectoryId": "traj-hidden-1",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "run internal task" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_CODE_ACTION",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"codeAction": {
+						"isArtifactFile": true,
+						"artifactMetadata": {
+							"summary": "Internal scratch state",
+							"userFacing": false
+						},
+						"actionResult": {
+							"edit": {
+								"absoluteUri": "file:///path/to/.gemini/antigravity/brain/test-hidden-artifact/internal_state.md"
+							}
+						}
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "任务已完成。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	for _, msg := range details.AllMessages {
+		if len(msg.Artifacts) > 0 {
+			t.Fatalf("expected 0 artifacts for non-user-facing artifact, got %d: %+v", len(msg.Artifacts), msg.Artifacts)
+		}
+	}
+}
+
+// TestParseTrajectoryDetails_WildcardsAndAsteriskExcluded verifies that wildcard prose like
+// `docs/*.md` or `/*` in agent responses never creates artifact cards with title `*`.
+func TestParseTrajectoryDetails_WildcardsAndAsteriskExcluded(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-asterisk-cascade",
+			"trajectoryId": "traj-asterisk-1",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "check docs" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "说明：严格排除常规工作区（Workspace）项目工程文件（如 docs/*.md、README.md）；包含通配符 *.md 与临时状态。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	for _, msg := range details.AllMessages {
+		if len(msg.Artifacts) > 0 {
+			t.Fatalf("expected 0 artifacts for prose with wildcards like docs/*.md, got %d: %+v", len(msg.Artifacts), msg.Artifacts)
+		}
+	}
+}
+
+func TestParsePermissionGrantV2(t *testing.T) {
+	// 1. git.update permission
+	pg1 := parsePermissionGrant("git.update", `{"branch":"feature/auth","repo":"antigravity-mobile"}`, "push to branch")
+	if pg1 == nil {
+		t.Fatalf("expected non-nil permission grant")
+	}
+	if pg1.Binary != "git" || pg1.Action != "update" || pg1.Branch != "feature/auth" || pg1.Repo != "antigravity-mobile" {
+		t.Errorf("unexpected grant details: %+v", pg1)
+	}
+
+	// 2. gh.create PR permission
+	pg2 := parsePermissionGrant("gh.create", `{"org":"GHSaiMo","repo":"antigravity-mobile","pr":"*"}`, "create pull request")
+	if pg2 == nil {
+		t.Fatalf("expected non-nil permission grant for gh.create")
+	}
+	if pg2.Binary != "gh" || pg2.Action != "create" || pg2.Org != "GHSaiMo" || pg2.PR != "*" {
+		t.Errorf("unexpected grant details for gh: %+v", pg2)
+	}
+
+	// 3. Regular path permission (should return nil)
+	pg3 := parsePermissionGrant("read", "/etc/hosts", "")
+	if pg3 != nil {
+		t.Errorf("expected nil for regular file read, got %+v", pg3)
+	}
+}
+
+func TestParseWorkflowItem(t *testing.T) {
+	stepJSON := `{
+		"type": "CORTEX_STEP_TYPE_TOOL_CALL",
+		"status": "CORTEX_STEP_STATUS_DONE",
+		"toolCall": {
+			"name": "run_workflow",
+			"argumentsJson": "{\"Description\":\"Security audit across modules\",\"Script\":\"phase('scan')\\nagent(role='security auditor')\\nparallel([1,2], fn)\"}"
+		},
+		"plannerResponse": {
+			"response": "Workflow started.\n[phase: code_review]\nStarting security review subagents...\nLogs: all passed\n{\"audit_status\":\"clean\",\"issues\":0}"
+		}
+	}`
+
+	var s TrajectoryStep
+	if err := json.Unmarshal([]byte(stepJSON), &s); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	wf := parseWorkflowFromStep(s, 10)
+	if wf == nil {
+		t.Fatalf("expected non-nil workflow item")
+	}
+	if wf.Description != "Security audit across modules" {
+		t.Errorf("unexpected description: %s", wf.Description)
+	}
+	if len(wf.Phases) != 1 || wf.Phases[0].Name != "code_review" {
+		t.Errorf("unexpected phases: %+v", wf.Phases)
+	}
+	if wf.ResultJSON == "" {
+		t.Errorf("expected resultJson to be extracted, got empty")
+	}
+
+	// Test PendingInteraction workflow_approval
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_RUNNING",
+		"trajectory": {
+			"trajectoryId": "traj-wf-1",
+			"cascadeId": "casc-wf-1",
+			"steps": [
+				{
+					"status": "CORTEX_STEP_STATUS_WAITING",
+					"toolCall": {
+						"name": "run_workflow",
+						"argumentsJson": "{\"Description\":\"Dynamic Multi-agent Refactor\",\"Script\":\"phase('prepare')\\nphase('parallel_build')\\nagent(role='compiler')\"}"
+					},
+					"requestedInteraction": {
+						"permission": {
+							"resource": {"action": "run_workflow", "target": "workflow.py"},
+							"actionDescription": "Allow running dynamic workflow"
+						}
+					}
+				}
+			]
+		}
+	}`
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("unmarshal rawResp: %v", err)
+	}
+	pi := buildPendingInteraction(&rawResp, rawResp.Trajectory.Steps)
+	if pi == nil || pi.Type != "workflow_approval" {
+		t.Fatalf("expected workflow_approval PendingInteraction, got: %+v", pi)
+	}
+	if pi.WorkflowApproval == nil {
+		t.Fatalf("expected WorkflowApproval to be non-nil")
+	}
+	if len(pi.WorkflowApproval.EstimatedPhases) != 2 || pi.WorkflowApproval.EstimatedPhases[0] != "prepare" {
+		t.Errorf("unexpected estimated phases: %+v", pi.WorkflowApproval.EstimatedPhases)
+	}
+}
+
+func TestParseTrajectoryDetails_DaemonRunningTasks(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-daemon-tasks",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": { "userResponse": "Start dev server" }
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_GENERIC",
+					"status": "CORTEX_STEP_STATUS_RUNNING",
+					"metadata": {
+						"createdAt": "2026-11-07T12:05:41Z",
+						"sourceTrajectoryStepInfo": { "stepIndex": 2 },
+						"toolCall": {
+							"id": "call_1",
+							"name": "run_command",
+							"argumentsJson": "{\"CommandLine\":\"npm run dev\",\"IsDaemon\":true,\"toolSummary\":\"Start dev server daemon\"}"
+						}
+					},
+					"taskDetails": {
+						"id": "test-daemon-tasks/task-2",
+						"description": "npm run dev"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": { "response": "Dev server started." }
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	if details.Status != "CASCADE_RUN_STATUS_IDLE" {
+		t.Fatalf("expected IDLE status when only daemon task is running, got %s", details.Status)
+	}
+	if len(details.RunningTasks) != 1 {
+		t.Fatalf("expected 1 running task, got %d", len(details.RunningTasks))
+	}
+	task := details.RunningTasks[0]
+	if !task.IsDaemon {
+		t.Errorf("expected task.IsDaemon=true, got false")
+	}
+	if task.ToolSummary != "Start dev server daemon" {
+		t.Errorf("expected ToolSummary extracted from argumentsJson, got %q", task.ToolSummary)
+	}
+	if HasActiveNonDaemonTasks(details.RunningTasks) {
+		t.Errorf("expected HasActiveNonDaemonTasks=false for daemon-only tasks")
+	}
+	if !HasActiveNonDaemonTasks(append(details.RunningTasks, RunningTaskItem{ID: "task-3", IsDaemon: false})) {
+		t.Errorf("expected HasActiveNonDaemonTasks=true when a non-daemon task is also running")
+	}
+}
+
+func TestCleanInternalSystemMessage(t *testing.T) {
+	// Case 1: Pure <SYSTEM_MESSAGE> tag with task notification
+	input1 := `<SYSTEM_MESSAGE>
+[Message] timestamp=2026-11-09T01:27:01Z sender=20a8b767-2f5e-4bb9-863d-89c879567907/task-155 priority=MESSAGE_PRIORITY_HIGH content=Task id "20a8b767-2f5e-4bb9-863d-89c879567907/task-155" finished with result:
+Command exited with code 0.
+Command output:
+▶ [1/4] 准备 NAS 工作目录
+</SYSTEM_MESSAGE>`
+	if got := CleanInternalSystemMessage(input1); got != "" {
+		t.Fatalf("expected empty string for pure system message, got %q", got)
+	}
+
+	// Case 2: Preamble with unclosed tag
+	input2 := `The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.
+
+<SYSTEM_MESSAGE>
+[Message] timestamp=2026-11-09T01:27:01Z sender=task-1 priority=MESSAGE_PRIORITY_HIGH content=done
+</SYSTEM_MESSAGE>`
+	if got := CleanInternalSystemMessage(input2); got != "" {
+		t.Fatalf("expected empty string for system message with preamble, got %q", got)
+	}
+
+	// Case 3: Mixed text with user-facing message after system message
+	input3 := `<SYSTEM_MESSAGE>
+[Message] timestamp=2026-11-09T01:27:01Z sender=task-1 priority=MESSAGE_PRIORITY_HIGH content=done
+</SYSTEM_MESSAGE>
+测试已经全部通过，可以正常交付。`
+	if got := CleanInternalSystemMessage(input3); got != "测试已经全部通过，可以正常交付。" {
+		t.Fatalf("expected stripped user message, got %q", got)
+	}
+
+	// Case 4: Normal agent response without system tags
+	input4 := "你好！我已经完成了所有的修复工作。"
+	if got := CleanInternalSystemMessage(input4); got != input4 {
+		t.Fatalf("expected normal message to remain unchanged, got %q", got)
+	}
+}
+
+func TestBuildTrajectoryMessages_FilterInternalSystemMessage(t *testing.T) {
+	rawJSON := `{
+		"status": "CASCADE_RUN_STATUS_IDLE",
+		"trajectory": {
+			"cascadeId": "test-filter-system-message",
+			"steps": [
+				{
+					"type": "CORTEX_STEP_TYPE_USER_INPUT",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"userInput": {
+						"userResponse": "free 账号应该只有两个 weekly 的数值"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"metadata": {
+						"toolCall": { "name": "run_command" }
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"metadata": {
+						"toolCall": { "name": "run_command" }
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-09T01:27:01Z sender=task-155 priority=MESSAGE_PRIORITY_HIGH content=Task id \"task-155\" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>"
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"metadata": {
+						"toolCall": { "name": "run_command" }
+					}
+				},
+				{
+					"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+					"status": "CORTEX_STEP_STATUS_DONE",
+					"plannerResponse": {
+						"response": "针对 Free 账号的配额展示与解析逻辑已完成全链路优化与对齐。"
+					}
+				}
+			]
+		}
+	}`
+
+	var rawResp upstreamTrajectoryResp
+	if err := json.Unmarshal([]byte(rawJSON), &rawResp); err != nil {
+		t.Fatalf("failed to unmarshal test JSON: %v", err)
+	}
+
+	p := &Proxy{}
+	details := p.ParseTrajectoryDetails(&rawResp)
+
+	// In desktop alignment:
+	// 1. User message
+	// 2. Tools message (with 3 tool calls merged together, NOT split by the system message)
+	// 3. Agent final response
+	if len(details.AllMessages) != 3 {
+		t.Fatalf("expected exactly 3 messages (user, tools, agent), got %d: %+v", len(details.AllMessages), details.AllMessages)
+	}
+
+	if details.AllMessages[0].Type != "user" {
+		t.Errorf("expected msg 0 to be user, got %s", details.AllMessages[0].Type)
+	}
+
+	if details.AllMessages[1].Type != "tools" {
+		t.Errorf("expected msg 1 to be tools, got %s", details.AllMessages[1].Type)
+	}
+	if details.AllMessages[1].ToolCount != 3 {
+		t.Errorf("expected 3 tools merged into single card (2 before + 1 after system msg), got %d", details.AllMessages[1].ToolCount)
+	}
+
+	if details.AllMessages[2].Type != "agent" {
+		t.Errorf("expected msg 2 to be agent, got %s", details.AllMessages[2].Type)
+	}
+	if strings.Contains(details.AllMessages[2].Text, "SYSTEM_MESSAGE") {
+		t.Errorf("agent message leaked SYSTEM_MESSAGE: %q", details.AllMessages[2].Text)
+	}
+	if details.AllMessages[2].Text != "针对 Free 账号的配额展示与解析逻辑已完成全链路优化与对齐。" {
+		t.Errorf("unexpected agent text: %q", details.AllMessages[2].Text)
+	}
+}
+
+

@@ -1,0 +1,2016 @@
+package proxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ParseTrajectoryDetails extracts messages, tools count, duration and metadata from raw response.
+//
+// It is an orchestrator over small stage functions; stage order matters because some stages
+// have side effects (config/title caches) and some read on-disk metadata.
+func (p *Proxy) ParseTrajectoryDetails(rawResp *upstreamTrajectoryResp) TrajectoryDetails {
+	p.warmLiveModels() // 非阻塞：让新枚举尽快能反查成模型 id / 展示名
+	steps := rawResp.Trajectory.Steps
+	totalSteps := len(steps)
+
+	allMessages, totalToolsCount := buildTrajectoryMessages(steps)
+	turnOutline := buildTurnOutline(allMessages)
+	duration := trajectoryDuration(steps)
+
+	activeModel, activeConfig := resolveActiveModel(rawResp)
+	var activeConfigStr string
+	if len(activeConfig) > 0 {
+		activeConfigStr = string(activeConfig)
+	}
+	modelDisplayName := modelDisplayNameFor(activeModel)
+	activeModelName := liveModels.displayName(activeModel)
+
+	wsURI := ""
+	if len(rawResp.Trajectory.WorkspaceUris) > 0 {
+		wsURI = rawResp.Trajectory.WorkspaceUris[0]
+	}
+
+	title := resolveTrajectoryTitle(rawResp, steps)
+
+	lastUserInputIdx := lastUserInputIndex(steps)
+	canProceed, proceedArtifactURI := detectProceed(rawResp, steps, lastUserInputIdx)
+	pendingInteraction := buildPendingInteraction(rawResp, steps)
+	queuedMessages := p.buildQueuedMessages(rawResp, steps, allMessages)
+	runningTasks := buildRunningTasks(steps)
+	subagents := p.buildSubagents(steps)
+	parentID, subagentRole := subagentIdentity(rawResp)
+	finalStatus, latestTurnErrorText := resolveFinalStatus(rawResp.Status, steps, lastUserInputIdx)
+	hasError := finalStatus == "CASCADE_RUN_STATUS_ERROR"
+	suggestedResponses := extractSuggestedResponses(steps, lastUserInputIdx, finalStatus)
+	taskProgress := extractLatestTaskProgress(steps, lastUserInputIdx)
+	activePlan, activeFocus, activeFocusStartedAt := extractActiveTurnPlanAndFocus(steps, lastUserInputIdx)
+
+	return TrajectoryDetails{
+		CascadeID:          rawResp.Trajectory.CascadeID,
+		Title:              title,
+		Status:             finalStatus,
+		HasError:           hasError,
+		ErrorMessage:       latestTurnErrorText,
+		Duration:           duration,
+		TotalSteps:         totalSteps,
+		TotalTools:         totalToolsCount,
+		WorkspaceURI:       wsURI,
+		Steps:              steps,
+		AllMessages:        allMessages,
+		TurnOutline:        turnOutline,
+		QueuedMessages:     queuedMessages,
+		RunningTasks:       runningTasks,
+		Subagents:          subagents,
+		ParentConversation: parentID,
+		SubagentRole:       subagentRole,
+		ActiveModel:        activeModel,
+		ActiveModelName:    activeModelName,
+		ModelDisplayName:   modelDisplayName,
+		StartedAt:          trajectoryStartedAt(steps),
+		CascadeConfig:      activeConfig,
+		CascadeConfigRaw:   activeConfigStr,
+		CanProceed:         canProceed,
+		ProceedArtifactURI: proceedArtifactURI,
+		PendingInteraction: pendingInteraction,
+		SuggestedResponses: suggestedResponses,
+		TaskProgress:       taskProgress,
+		ActiveFocus:        activeFocus,
+		ActiveFocusStarted: activeFocusStartedAt,
+		ActivePlan:         activePlan,
+	}
+}
+
+func extractSuggestedResponses(steps []TrajectoryStep, lastUserIdx int, status string) []string {
+	if status == "CASCADE_RUN_STATUS_RUNNING" {
+		return nil
+	}
+	for i := len(steps) - 1; i > lastUserIdx && i >= 0; i-- {
+		s := steps[i]
+		if s.Type == "CORTEX_STEP_TYPE_SUGGESTED_RESPONSES" && s.SuggestedResponses != nil && len(s.SuggestedResponses.Suggestions) > 0 {
+			out := make([]string, 0, len(s.SuggestedResponses.Suggestions))
+			for _, sg := range s.SuggestedResponses.Suggestions {
+				if trimmed := strings.TrimSpace(sg); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	return nil
+}
+
+func extractLatestTaskProgress(steps []TrajectoryStep, lastUserIdx int) *TaskProgressItem {
+	for i := len(steps) - 1; i > lastUserIdx && i >= 0; i-- {
+		s := steps[i]
+		if s.Type == "CORTEX_STEP_TYPE_TASK_BOUNDARY" && s.TaskBoundary != nil {
+			return &TaskProgressItem{
+				TaskName:    strings.TrimSpace(s.TaskBoundary.TaskName),
+				TaskStatus:  strings.TrimSpace(s.TaskBoundary.TaskStatus),
+				TaskSummary: strings.TrimSpace(s.TaskBoundary.TaskSummary),
+				Mode:        strings.TrimSpace(s.TaskBoundary.Mode),
+			}
+		}
+	}
+	return nil
+}
+
+func stepDurationLabel(s TrajectoryStep) string {
+	startStr := s.Metadata.StartedAt
+	if startStr == "" {
+		startStr = s.Metadata.CreatedAt
+	}
+	endStr := s.Metadata.CompletedAt
+	if startStr == "" || endStr == "" {
+		return ""
+	}
+	tStart, err1 := time.Parse(time.RFC3339Nano, startStr)
+	if err1 != nil {
+		tStart, err1 = time.Parse(time.RFC3339, startStr)
+	}
+	tEnd, err2 := time.Parse(time.RFC3339Nano, endStr)
+	if err2 != nil {
+		tEnd, err2 = time.Parse(time.RFC3339, endStr)
+	}
+	if err1 != nil || err2 != nil || tEnd.Before(tStart) {
+		return ""
+	}
+	d := tEnd.Sub(tStart)
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+func stepSummaryLabel(s TrajectoryStep) string {
+	if s.Metadata.ToolSummary != "" {
+		return strings.TrimSpace(s.Metadata.ToolSummary)
+	}
+	if s.Metadata.ToolAction != "" {
+		return strings.TrimSpace(s.Metadata.ToolAction)
+	}
+	if s.RunCommand != nil {
+		if s.RunCommand.CommandLine != "" {
+			return strings.TrimSpace(s.RunCommand.CommandLine)
+		}
+		if s.RunCommand.ProposedCommandLine != "" {
+			return strings.TrimSpace(s.RunCommand.ProposedCommandLine)
+		}
+	}
+	if s.TaskBoundary != nil && s.TaskBoundary.TaskName != "" {
+		return strings.TrimSpace(s.TaskBoundary.TaskName)
+	}
+	if args := strings.TrimSpace(extractStepToolArgsJSON(s)); args != "" {
+		if len(args) > 120 {
+			return args[:120] + "..."
+		}
+		return args
+	}
+	return ""
+}
+
+func stepStatusLabel(status string) string {
+	switch status {
+	case "CORTEX_STEP_STATUS_RUNNING":
+		return "running"
+	case "CORTEX_STEP_STATUS_ERROR":
+		return "error"
+	default:
+		return "done"
+	}
+}
+
+// buildTrajectoryMessages folds raw steps into chat messages: user/agent/error messages, with
+// consecutive tool steps collapsed into a single "tools" capsule. It also returns the tool total.
+func buildTrajectoryMessages(steps []TrajectoryStep) ([]CascadeMessageItem, int) {
+	var allMessages []CascadeMessageItem
+	pendingTools := 0
+	var toolNames []string
+	var toolDetails []ToolDetailItem
+	var pendingThinking string
+	var pendingThinkingDuration string
+	var pendingFocus string
+	var pendingToolsStartedAt string
+	totalToolsCount := 0
+
+	// Per-turn live step checklist state (update_steps). One card per turn, updated in place.
+	var turnPlan *StepPlanItem
+	turnPlanAnchorIdx := -1
+	turnPlanTimestamp := ""
+	turnStartMsgIdx := 0
+
+	var turnArtifacts []ArtifactItem
+	seenArtifactURIs := make(map[string]bool)
+
+	addTurnArtifact := func(art ArtifactItem) {
+		norm := strings.TrimSpace(art.URI)
+		if norm == "" {
+			return
+		}
+		if !strings.HasPrefix(norm, "file://") && filepath.IsAbs(norm) {
+			norm = "file://" + norm
+		}
+		if seenArtifactURIs[norm] {
+			return
+		}
+		seenArtifactURIs[norm] = true
+		art.URI = norm
+		turnArtifacts = append(turnArtifacts, art)
+	}
+
+	flushTools := func() {
+		if pendingTools == 0 && pendingThinking == "" {
+			return
+		}
+		text := "💭 已深度思考"
+		if pendingTools > 0 {
+			text = fmt.Sprintf("已思考并执行 %d 项操作", pendingTools)
+		}
+		toolsStartedAt := ""
+		if pendingFocus != "" || turnPlan != nil {
+			toolsStartedAt = pendingToolsStartedAt
+		}
+		item := CascadeMessageItem{
+			ID:               fmt.Sprintf("tools-%d", len(allMessages)),
+			Type:             "tools",
+			Role:             "tools",
+			Text:             text,
+			Content:          text,
+			ToolCount:        pendingTools,
+			ToolNames:        toolNames,
+			ToolDetails:      toolDetails,
+			Thinking:         pendingThinking,
+			ThinkingDuration: pendingThinkingDuration,
+			FocusText:        pendingFocus,
+			StartedAt:        toolsStartedAt,
+		}
+		allMessages = append(allMessages, item)
+		pendingTools = 0
+		toolNames = nil
+		toolDetails = nil
+		pendingThinking = ""
+		pendingThinkingDuration = ""
+		pendingToolsStartedAt = ""
+	}
+
+	// insertTurnPlan inserts the turn's latest StepPlanItem at the desktop-aligned slot:
+	// immediately before the trailing tools group (and before any trailing final agent reply)
+	// so it sits directly above the live focus/elapsed status line while running and collapses
+	// cleanly in-place when the turn finishes.
+	insertTurnPlan := func() {
+		if turnPlan == nil || len(turnPlan.Items) == 0 {
+			return
+		}
+		planCopy := *turnPlan
+		planCopy.Items = append([]StepPlanItemEntry(nil), turnPlan.Items...)
+		fallback := stepPlanFallbackText(&planCopy)
+		planMsg := CascadeMessageItem{
+			ID:        fmt.Sprintf("step-plan-%d", planCopy.AnchorStepIndex),
+			Type:      "step_plan",
+			Role:      "assistant",
+			Text:      fallback,
+			Content:   fallback,
+			StepPlan:  &planCopy,
+			Timestamp: turnPlanTimestamp,
+		}
+
+		pos := len(allMessages)
+		for pos > turnStartMsgIdx && allMessages[pos-1].Type == "agent" {
+			pos--
+		}
+		if pos > turnStartMsgIdx && allMessages[pos-1].Type == "tools" {
+			pos--
+		}
+		if pos >= len(allMessages) {
+			allMessages = append(allMessages, planMsg)
+		} else {
+			allMessages = append(allMessages, CascadeMessageItem{})
+			copy(allMessages[pos+1:], allMessages[pos:])
+			allMessages[pos] = planMsg
+		}
+		turnPlan = nil
+		turnPlanAnchorIdx = -1
+		turnPlanTimestamp = ""
+	}
+
+	for idx, s := range steps {
+		stepType := s.Type
+
+		// Extract any artifacts created or edited in this step
+		for _, art := range extractArtifactsFromStep(s) {
+			addTurnArtifact(art)
+		}
+
+		if stepType == "CORTEX_STEP_TYPE_USER_INPUT" {
+			flushTools()
+			insertTurnPlan()
+			pendingFocus = ""
+			pendingToolsStartedAt = ""
+			turnArtifacts = nil
+			seenArtifactURIs = make(map[string]bool)
+			text, slashCommands := s.UserInput.ExtractTextAndSlashCommands()
+
+			var mediaList []string
+			var userImageURLs []string
+			seenMedia := make(map[string]bool)
+			seenURL := make(map[string]bool)
+
+			addMedia := func(m string) {
+				m = strings.TrimSpace(m)
+				if m != "" && !seenMedia[m] {
+					seenMedia[m] = true
+					mediaList = append(mediaList, m)
+				}
+			}
+			addImageURL := func(u string) {
+				u = strings.TrimSpace(u)
+				if u != "" && !seenURL[u] {
+					seenURL[u] = true
+					userImageURLs = append(userImageURLs, u)
+				}
+			}
+
+			var nonImageMediaFiles []string
+			if s.UserInput != nil {
+				if len(s.UserInput.Media) > 0 {
+					for _, m := range s.UserInput.Media {
+						isImg := isImageMedia(m.URI, m.MimeType) || m.Thumbnail != "" || m.InlineData != ""
+						if isImg {
+							if m.URI != "" && isImageMedia(m.URI, m.MimeType) {
+								addImageURL(m.URI)
+							}
+							if m.Thumbnail != "" {
+								addMedia(m.Thumbnail)
+							} else if m.InlineData != "" {
+								addMedia(m.InlineData)
+							}
+						} else if m.URI != "" {
+							nonImageMediaFiles = append(nonImageMediaFiles, m.URI)
+						}
+					}
+				}
+				if len(s.UserInput.Images) > 0 {
+					for _, img := range s.UserInput.Images {
+						if img.Base64Data != "" {
+							addMedia(img.Base64Data)
+						}
+					}
+				}
+			}
+
+			// If text does not already contain an attachment block, but non-image media files exist,
+			// synthesize the attachment block so clients parse them as file cards!
+			if len(nonImageMediaFiles) > 0 && !strings.Contains(text, attachmentHeader) {
+				var lines []string
+				lines = append(lines, attachmentHeader)
+				for _, rawURI := range nonImageMediaFiles {
+					filePath := strings.TrimPrefix(rawURI, "file://")
+					base := filepath.Base(filePath)
+					ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(base)), ".")
+					sizeStr := "已上传"
+					if st, err := os.Stat(filePath); err == nil && st.Size() > 0 {
+						sizeStr = humanSize(st.Size())
+					}
+					lines = append(lines, fmt.Sprintf("- %s (%s, %s)", filePath, ext, sizeStr))
+				}
+				if strings.TrimSpace(text) == "" {
+					text = strings.Join(lines, "\n")
+				} else {
+					text = strings.TrimRight(text, "\n") + "\n\n" + strings.Join(lines, "\n")
+				}
+			}
+
+			// Also extract any image URLs or MEDIA: tags from user input text
+			for _, u := range extractImageURLsFromText(text) {
+				addImageURL(u)
+			}
+
+			trimmed := strings.TrimSpace(text)
+			isSystemApproval := strings.HasPrefix(trimmed, "Comments on artifact URI:") || strings.Contains(trimmed, "The user has approved this document")
+
+			if (trimmed != "" && !isSystemApproval) || len(mediaList) > 0 || len(userImageURLs) > 0 || len(nonImageMediaFiles) > 0 {
+				stepIdx := idx
+				allMessages = append(allMessages, CascadeMessageItem{
+					ID:              fmt.Sprintf("step-%d", idx),
+					Type:            "user",
+					Role:            "user",
+					Text:            text,
+					Content:         text,
+					StepIndex:       &stepIdx,
+					Media:           mediaList,
+					ImageURLs:       userImageURLs,
+					SlashCommands:   slashCommands,
+					Timestamp:       s.Metadata.CreatedAt,
+					ClientMessageID: s.UserInput.ResolvedClientMessageID(),
+				})
+			}
+			turnStartMsgIdx = len(allMessages)
+		} else if stepType == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" {
+			respText := ""
+			if s.PlannerResponse != nil {
+				respText = CleanInternalSystemMessage(s.PlannerResponse.Response)
+				if th := strings.TrimSpace(s.PlannerResponse.Thinking); th != "" {
+					if pendingThinking == "" {
+						pendingThinking = th
+					} else {
+						pendingThinking += "\n\n" + th
+					}
+					if td := strings.TrimSpace(s.PlannerResponse.ThinkingDuration); td != "" {
+						pendingThinkingDuration = td
+					}
+					if pendingToolsStartedAt == "" {
+						pendingToolsStartedAt = stepStartTimestamp(s)
+					}
+				}
+			}
+
+			if respText != "" {
+				flushTools()
+				pendingFocus = ""
+				modelID, modelName := generatorModelOf(s)
+
+				// Extract image URLs
+				imgURLs := extractImageURLsFromText(respText)
+
+				// Extract any referenced artifacts in text
+				for _, art := range extractArtifactsFromText(respText) {
+					addTurnArtifact(art)
+				}
+
+				var msgArtifacts []ArtifactItem
+				if len(turnArtifacts) > 0 {
+					msgArtifacts = append([]ArtifactItem(nil), turnArtifacts...)
+					turnArtifacts = nil
+					seenArtifactURIs = make(map[string]bool)
+				}
+
+				stepIdx := idx
+				allMessages = append(allMessages, CascadeMessageItem{
+					ID:        fmt.Sprintf("step-%d", idx),
+					Type:      "agent",
+					Role:      "assistant",
+					Text:      respText,
+					Content:   respText,
+					StepIndex: &stepIdx,
+					ImageURLs: imgURLs,
+					Artifacts: msgArtifacts,
+					Model:     modelID,
+					ModelName: modelName,
+					Timestamp: s.Metadata.CreatedAt,
+				})
+			}
+		} else if stepType == stepTypeInvokeSubagent {
+			// 与桌面端一致：在调用位置内联展示每个子代理的卡片，而不是折进「已执行 N 项操作」
+			flushTools()
+			for _, sa := range subagentsOfStep(s, idx) {
+				sa := sa
+				stepIdx := idx
+				label := sa.Role
+				if label == "" {
+					label = sa.TypeName
+				}
+				allMessages = append(allMessages, CascadeMessageItem{
+					ID:        "subagent-" + sa.ConversationID,
+					Type:      "subagent",
+					Role:      "subagent",
+					Text:      label,
+					Content:   label,
+					StepIndex: &stepIdx,
+					Subagent:  &sa,
+					Timestamp: s.Metadata.CreatedAt,
+				})
+			}
+		} else if extractToolNameFromStep(s) == "run_workflow" {
+			// Antigravity 2.26+ 动态多智能体工作流：内联独立呈现工作流阶段卡片与结构化产物
+			flushTools()
+			wf := parseWorkflowFromStep(s, idx)
+			if wf != nil {
+				stepIdx := idx
+				label := wf.Description
+				if label == "" {
+					label = "动态工作流任务"
+				}
+				allMessages = append(allMessages, CascadeMessageItem{
+					ID:        fmt.Sprintf("workflow-step-%d", idx),
+					Type:      "workflow",
+					Role:      "assistant",
+					Text:      label,
+					Content:   label,
+					StepIndex: &stepIdx,
+					Workflow:  wf,
+					Timestamp: s.Metadata.CreatedAt,
+				})
+			}
+		} else if stepType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" {
+			if !isUserVisibleError(s) {
+				continue
+			}
+			flushTools()
+			rawErrText := extractErrorText(s)
+
+			if len(allMessages) > 0 && allMessages[len(allMessages)-1].Type == "error" {
+				if merged, ok := tryMergeAttemptErrors(allMessages[len(allMessages)-1], rawErrText); ok {
+					allMessages[len(allMessages)-1] = merged
+					continue
+				}
+			}
+
+			parsed := parseAttemptError(rawErrText)
+			formatted := rawErrText
+			if parsed.isAttempt {
+				formatted = formatAttemptError(parsed.prefix, parsed.attempt, parsed.maxAttempts, parsed.baseError)
+			}
+			errKind := ClassifyErrorKind(rawErrText)
+
+			allMessages = append(allMessages, CascadeMessageItem{
+				ID:           fmt.Sprintf("step-%d", idx),
+				Type:         "error",
+				Role:         "error",
+				Text:         formatted,
+				Content:      formatted,
+				AttemptCount: parsed.attempt,
+				MaxAttempts:  parsed.maxAttempts,
+				Timestamp:    s.Metadata.CreatedAt,
+				ErrorKind:    errKind,
+				IsOverflow:   errKind == "context_overflow",
+			})
+		} else if stepType == "CORTEX_STEP_TYPE_SUGGESTED_RESPONSES" {
+			// 快捷回复建议不折进工具执行胶囊，统一挂载到 TrajectoryDetails.SuggestedResponses
+			continue
+		} else if isUpdateStepsStep(s) {
+			// 与桌面端一致：update_steps 原地更新本轮步骤清单卡片，不计入普通工具执行计数
+			if p := extractStepPlanFromStep(s, idx); p != nil {
+				if turnPlanAnchorIdx < 0 {
+					turnPlanAnchorIdx = idx
+					turnPlanTimestamp = s.Metadata.CreatedAt
+				}
+				p.AnchorStepIndex = turnPlanAnchorIdx
+				turnPlan = p
+			}
+			continue
+		} else if isUpdateFocusStep(s) {
+			// 与桌面端一致：update_focus 驱动实时状态摘要与计时，不计入普通工具执行计数
+			if f := extractFocusFromStep(s); f != "" {
+				pendingFocus = f
+				if pendingToolsStartedAt == "" {
+					pendingToolsStartedAt = stepStartTimestamp(s)
+				}
+			}
+			continue
+		} else if strings.HasPrefix(stepType, "CORTEX_STEP_TYPE_") && stepType != "CORTEX_STEP_TYPE_SYSTEM_MESSAGE" && stepType != "CORTEX_STEP_TYPE_ERROR_MESSAGE" {
+			if pendingToolsStartedAt == "" {
+				pendingToolsStartedAt = stepStartTimestamp(s)
+			}
+			pendingTools++
+			totalToolsCount++
+			name := extractToolNameFromStep(s)
+			toolNames = append(toolNames, name)
+			toolDetails = append(toolDetails, ToolDetailItem{
+				Name:      name,
+				Summary:   stepSummaryLabel(s),
+				Status:    stepStatusLabel(s.Status),
+				Duration:  stepDurationLabel(s),
+				StepIndex: idx,
+			})
+		}
+	}
+
+	flushTools()
+	insertTurnPlan()
+
+	// If there are still unconsumed artifacts in this turn, attach them to the last agent message
+	if len(turnArtifacts) > 0 && len(allMessages) > 0 {
+		for i := len(allMessages) - 1; i >= 0; i-- {
+			if allMessages[i].Type == "agent" {
+				existingURIs := make(map[string]bool)
+				for _, ea := range allMessages[i].Artifacts {
+					existingURIs[ea.URI] = true
+				}
+				for _, art := range turnArtifacts {
+					if !existingURIs[art.URI] {
+						allMessages[i].Artifacts = append(allMessages[i].Artifacts, art)
+						existingURIs[art.URI] = true
+					}
+				}
+				break
+			}
+		}
+	}
+
+	return allMessages, totalToolsCount
+}
+
+// formatArtifactTitle formats a markdown file URI into a human-friendly Title Case title.
+func formatArtifactTitle(uri string) string {
+	clean := uri
+	if strings.HasPrefix(clean, "file://") {
+		clean = strings.TrimPrefix(clean, "file://")
+	}
+	base := filepath.Base(clean)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+
+	// Normalize underscores and hyphens to spaces
+	name = strings.ReplaceAll(name, "_", " ")
+	name = strings.ReplaceAll(name, "-", " ")
+
+	lower := strings.ToLower(name)
+	if lower == "implementation plan" {
+		return "Implementation Plan"
+	} else if lower == "walkthrough" {
+		return "Walkthrough"
+	}
+
+	// Title-case words
+	words := strings.Fields(name)
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	res := strings.Join(words, " ")
+	cleanedName := strings.Trim(res, " *_-#@!~`+=")
+	if cleanedName == "" {
+		return ""
+	}
+	return res
+}
+
+// isBrainArtifactURI reports whether a file URI points to an artifact within the brain directory.
+func isBrainArtifactURI(uri string) bool {
+	lower := strings.ToLower(strings.TrimSpace(uri))
+	if lower == "" || strings.Contains(lower, "/scratch/") {
+		return false
+	}
+	return strings.Contains(lower, "/brain/") ||
+		strings.Contains(lower, ".gemini/antigravity/brain") ||
+		strings.Contains(lower, "/static/artifacts/")
+}
+
+// extractArtifactsFromStep parses any artifact files created/edited in a trajectory step.
+func extractArtifactsFromStep(s TrajectoryStep) []ArtifactItem {
+	var results []ArtifactItem
+
+	addArtifact := func(uri, summary string, reqFeedback, userFacing bool, isExplicitArtifact bool) {
+		uri = strings.TrimSpace(uri)
+		if uri == "" {
+			return
+		}
+		if !strings.HasPrefix(uri, "file://") && filepath.IsAbs(uri) {
+			uri = "file://" + uri
+		}
+		lower := strings.ToLower(uri)
+		if strings.Contains(lower, "/scratch/") {
+			return
+		}
+
+		isMd := strings.HasSuffix(lower, ".md") || strings.HasSuffix(lower, ".markdown")
+		if !isMd {
+			return
+		}
+
+		isBrain := isBrainArtifactURI(uri)
+		// 严禁将非 brain 目录且非 upstream 明确标记的常规工作区工程代码/文档文件当作 Artifact！
+		if !isBrain && !isExplicitArtifact {
+			return
+		}
+
+		filePath := strings.TrimPrefix(uri, "file://")
+		hasDiskMeta := false
+		if filePath != "" {
+			metaPath := filePath + ".metadata.json"
+			if meta, ok := readCachedArtifactMetadata(metaPath); ok {
+				hasDiskMeta = true
+				if summary == "" {
+					summary = strings.TrimSpace(meta.Summary)
+				}
+				userFacing = meta.IsUserFacing()
+				if meta.RequestFeedback {
+					reqFeedback = true
+				}
+			}
+		}
+
+		// 标准内置产物（如 implementation_plan.md 或 walkthrough.md）若位于 brain 目录亦视作产物
+		isStandardPlan := strings.HasSuffix(lower, "implementation_plan.md") || strings.HasSuffix(lower, "walkthrough.md")
+		if !isExplicitArtifact && !hasDiskMeta && !isStandardPlan {
+			return
+		}
+
+		// 桌面端核心规范：仅用户可见（UserFacing == true）的产物在界面中渲染气泡
+		if !userFacing {
+			return
+		}
+
+		title := formatArtifactTitle(uri)
+		if title == "" {
+			return
+		}
+		results = append(results, ArtifactItem{
+			URI:             uri,
+			Title:           title,
+			Summary:         summary,
+			RequestFeedback: reqFeedback,
+			UserFacing:      userFacing,
+		})
+	}
+
+	if s.CodeAction != nil {
+		ca := s.CodeAction
+		uri := ""
+		if ca.ActionResult != nil {
+			if ca.ActionResult.Edit != nil && ca.ActionResult.Edit.AbsoluteURI != "" {
+				uri = ca.ActionResult.Edit.AbsoluteURI
+			} else if ca.ActionResult.AbsoluteURI != "" {
+				uri = ca.ActionResult.AbsoluteURI
+			}
+		}
+		if uri == "" && ca.ActionSpec != nil && ca.ActionSpec.CreateFile != nil && ca.ActionSpec.CreateFile.Path != nil {
+			uri = ca.ActionSpec.CreateFile.Path.AbsoluteURI
+		}
+		summary := ""
+		userFacing := true
+		reqFeedback := false
+		hasExplicitMeta := false
+		if ca.ArtifactMetadata != nil {
+			hasExplicitMeta = true
+			summary = strings.TrimSpace(ca.ArtifactMetadata.Summary)
+			if ca.ArtifactMetadata.UserFacing != nil {
+				userFacing = *ca.ArtifactMetadata.UserFacing
+			}
+			reqFeedback = ca.ArtifactMetadata.RequestFeedback
+		}
+		isExplicit := ca.IsArtifactFile || hasExplicitMeta
+		if isExplicit || isBrainArtifactURI(uri) {
+			addArtifact(uri, summary, reqFeedback, userFacing, isExplicit)
+		}
+	}
+
+	tcName := ""
+	tcArgs := ""
+	if s.ToolCall != nil {
+		tcName = s.ToolCall.Name
+		tcArgs = s.ToolCall.ArgumentsJson
+	} else if s.Metadata.ToolCall != nil {
+		tcName = s.Metadata.ToolCall.Name
+		tcArgs = s.Metadata.ToolCall.ArgumentsJson
+	}
+
+	if (tcName == "write_to_file" || tcName == "replace_file_content") && tcArgs != "" {
+		var args struct {
+			TargetFile       string `json:"TargetFile"`
+			ArtifactMetadata *struct {
+				Summary         string `json:"Summary"`
+				RequestFeedback bool   `json:"RequestFeedback"`
+				UserFacing      *bool  `json:"UserFacing"`
+			} `json:"ArtifactMetadata"`
+		}
+		if err := json.Unmarshal([]byte(tcArgs), &args); err == nil && args.TargetFile != "" {
+			summary := ""
+			userFacing := true
+			reqFeedback := false
+			hasExplicitMeta := false
+			if args.ArtifactMetadata != nil {
+				hasExplicitMeta = true
+				summary = strings.TrimSpace(args.ArtifactMetadata.Summary)
+				if args.ArtifactMetadata.UserFacing != nil {
+					userFacing = *args.ArtifactMetadata.UserFacing
+				}
+				reqFeedback = args.ArtifactMetadata.RequestFeedback
+			}
+			if hasExplicitMeta || isBrainArtifactURI(args.TargetFile) {
+				addArtifact(args.TargetFile, summary, reqFeedback, userFacing, hasExplicitMeta)
+			}
+		}
+	}
+
+	return results
+}
+
+var (
+	markdownFileLinkRegex   = regexp.MustCompile(`(?i)\[([^\]]+)\]\(((?:file://)?(/[^\s\)><\*` + "`" + `]+\.(?:md|markdown)))\)`)
+	systemMessageIntroRegex = regexp.MustCompile(`(?is)The following is a <SYSTEM_MESSAGE> not actually sent by the user.*?(?:<SYSTEM_MESSAGE>|\z)`)
+	systemMessageTagRegex   = regexp.MustCompile(`(?is)<SYSTEM_MESSAGE>.*?</SYSTEM_MESSAGE>`)
+)
+
+// CleanInternalSystemMessage removes internal system/task protocol messages (<SYSTEM_MESSAGE>...</SYSTEM_MESSAGE>)
+// and returns user-visible content. If the text consists solely of internal notifications, it returns an empty string.
+func CleanInternalSystemMessage(text string) string {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return ""
+	}
+
+	cleaned := t
+	if strings.Contains(t, "SYSTEM_MESSAGE") || strings.Contains(t, "system_message") {
+		// 1. Remove standard system notification preamble first (before stripping <SYSTEM_MESSAGE> tags)
+		cleaned = systemMessageIntroRegex.ReplaceAllString(t, "")
+		// 2. Remove closed <SYSTEM_MESSAGE>...</SYSTEM_MESSAGE> blocks
+		cleaned = systemMessageTagRegex.ReplaceAllString(cleaned, "")
+		cleaned = strings.TrimSpace(cleaned)
+	}
+
+	// 3. If nothing left or only leftover closing/opening tags
+	if cleaned == "" || cleaned == "</SYSTEM_MESSAGE>" || cleaned == "<SYSTEM_MESSAGE>" {
+		return ""
+	}
+
+	// 4. If text starts with unclosed <SYSTEM_MESSAGE> or preamble remnant
+	if strings.HasPrefix(cleaned, "<SYSTEM_MESSAGE>") || strings.HasPrefix(cleaned, "The following is a <SYSTEM_MESSAGE>") {
+		return ""
+	}
+
+	// 5. Unwrapped protocol headers: "[Message] timestamp=... sender=... priority=MESSAGE_PRIORITY_..."
+	if strings.HasPrefix(cleaned, "[Message]") && strings.Contains(cleaned, "priority=MESSAGE_PRIORITY_") {
+		return ""
+	}
+
+	// 6. Task completion notice: Task id "..." finished with result:
+	if strings.HasPrefix(cleaned, "Task id \"") && strings.Contains(cleaned, "finished with result:") {
+		return ""
+	}
+
+	return cleaned
+}
+
+// IsInternalSystemMessage reports whether the non-empty text is solely internal system protocol communication.
+func IsInternalSystemMessage(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	return CleanInternalSystemMessage(t) == ""
+}
+
+// extractArtifactsFromText scans response text for markdown links pointing to markdown artifact files.
+// Desktop client parity: only true brain artifacts with valid on-disk user-facing metadata are extracted.
+// Regular workspace code/doc links (e.g. docs/foo.md) are strictly excluded from artifact cards.
+func extractArtifactsFromText(text string) []ArtifactItem {
+	if !strings.Contains(text, "](") || (!strings.Contains(text, ".md") && !strings.Contains(text, ".MD") && !strings.Contains(text, ".markdown") && !strings.Contains(text, ".MARKDOWN")) {
+		return nil
+	}
+	var results []ArtifactItem
+	matches := markdownFileLinkRegex.FindAllStringSubmatch(text, -1)
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		rawPath := m[2]
+		uri := rawPath
+		if !strings.HasPrefix(uri, "file://") && filepath.IsAbs(rawPath) {
+			uri = "file://" + uri
+		}
+		lower := strings.ToLower(uri)
+		if strings.Contains(lower, "/scratch/") {
+			continue
+		}
+
+		// 必须是 brain 目录下的产物路径，严禁将项目工作区普通文档当做 Artifact
+		if !isBrainArtifactURI(uri) {
+			continue
+		}
+
+		filePath := strings.TrimPrefix(uri, "file://")
+		metaPath := filePath + ".metadata.json"
+		meta, hasMeta := readCachedArtifactMetadata(metaPath)
+		if !hasMeta {
+			// 只有标准内置 plan/walkthrough 允许在无独立 metadata 文件时被识别
+			isStandardPlan := strings.HasSuffix(lower, "implementation_plan.md") || strings.HasSuffix(lower, "walkthrough.md")
+			if !isStandardPlan {
+				continue
+			}
+			title := formatArtifactTitle(uri)
+			if title == "" {
+				continue
+			}
+			results = append(results, ArtifactItem{
+				URI:        uri,
+				Title:      title,
+				UserFacing: true,
+			})
+			continue
+		}
+
+		if !meta.IsUserFacing() {
+			continue
+		}
+
+		title := formatArtifactTitle(uri)
+		if title == "" {
+			continue
+		}
+		results = append(results, ArtifactItem{
+			URI:             uri,
+			Title:           title,
+			Summary:         strings.TrimSpace(meta.Summary),
+			RequestFeedback: meta.RequestFeedback,
+			UserFacing:      meta.IsUserFacing(),
+		})
+	}
+	return results
+}
+
+// trajectoryStartedAt returns the creation time of the first step that carries one, i.e. when the
+// conversation was started. Empty when no step has a timestamp.
+func trajectoryStartedAt(steps []TrajectoryStep) string {
+	for _, s := range steps {
+		if s.Metadata.CreatedAt != "" {
+			if _, err := parseTime(s.Metadata.CreatedAt); err == nil {
+				return s.Metadata.CreatedAt
+			}
+		}
+	}
+	return ""
+}
+
+// generatorModelOf returns the id and display name of the model that produced a step.
+func generatorModelOf(s TrajectoryStep) (id, name string) {
+	enum := strings.TrimSpace(s.Metadata.GeneratorModel)
+	if enum == "" {
+		return "", ""
+	}
+	id = canonicalModelName(enum)
+	if id == enum && strings.HasPrefix(enum, "MODEL_") && liveModels.idForEnum(enum) == "" {
+		// 解析不出可读 id（注册表尚未就绪或未知枚举）：不暴露裸枚举，客户端回退到会话模型
+		return "", ""
+	}
+	return id, liveModels.displayName(id)
+}
+
+// trajectoryDuration formats the span between the first and last parseable step timestamps.
+func trajectoryDuration(steps []TrajectoryStep) string {
+	duration := "0秒"
+	if len(steps) > 0 {
+		var firstTime, lastTime time.Time
+		for _, s := range steps {
+			if s.Metadata.CreatedAt != "" {
+				if t, err := parseTime(s.Metadata.CreatedAt); err == nil {
+					firstTime = t
+					break
+				}
+			}
+		}
+		for i := len(steps) - 1; i >= 0; i-- {
+			if steps[i].Metadata.CreatedAt != "" {
+				if t, err := parseTime(steps[i].Metadata.CreatedAt); err == nil {
+					lastTime = t
+					break
+				}
+			}
+		}
+		if !firstTime.IsZero() && !lastTime.IsZero() {
+			diff := int(lastTime.Sub(firstTime).Seconds())
+			duration = formatDuration(diff)
+		}
+	}
+	return duration
+}
+
+// resolveActiveModel determines the active model name and cascade config. An explicitly
+// recorded model (SetCascadeModel) wins; otherwise the newest valid executor config is used.
+// Side effect: remembers the newest valid config via SetLastKnownCascadeConfig.
+func resolveActiveModel(rawResp *upstreamTrajectoryResp) (string, json.RawMessage) {
+	var activeConfig json.RawMessage
+	var activeModel string
+	if cid := rawResp.Trajectory.CascadeID; cid != "" {
+		if recModel, recCfg := GetCascadeModel(cid); recModel != "" {
+			activeModel = canonicalModelName(recModel)
+			if len(recCfg) > 0 {
+				activeConfig = recCfg
+			}
+		}
+	}
+	for i := len(rawResp.Trajectory.ExecutorMetadatas) - 1; i >= 0; i-- {
+		cfg := rawResp.Trajectory.ExecutorMetadatas[i].CascadeConfig
+		if len(cfg) > 0 && string(cfg) != "null" && string(cfg) != "{}" {
+			if activeModel == "" {
+				var cfgMap map[string]interface{}
+				if err := json.Unmarshal(cfg, &cfgMap); err == nil {
+					if p, ok := cfgMap["plannerConfig"].(map[string]interface{}); ok {
+						if mn, ok := p["modelName"].(string); ok && mn != "" {
+							activeModel = canonicalModelName(mn)
+						} else if pm, ok := p["planModel"].(string); ok && pm != "" {
+							activeModel = canonicalModelName(pm)
+						}
+					}
+				}
+			}
+			if len(activeConfig) == 0 {
+				activeConfig = cfg
+				SetLastKnownCascadeConfig(cfg)
+			}
+			if activeModel != "" && len(activeConfig) > 0 {
+				break
+			}
+		}
+	}
+	return activeModel, activeConfig
+}
+
+// modelDisplayNameFor maps a model name to its short vendor label (Claude/Gemini/GPT) or the name itself.
+func modelDisplayNameFor(activeModel string) string {
+	modelDisplayName := ""
+	if activeModel != "" {
+		lower := strings.ToLower(activeModel)
+		if isClaudeModelOrEnum(activeModel) {
+			modelDisplayName = "Claude"
+		} else if strings.Contains(lower, "orch") {
+			modelDisplayName = "Orchestrator"
+		} else if strings.Contains(lower, "gemini") {
+			modelDisplayName = "Gemini"
+		} else if strings.Contains(lower, "gpt") {
+			modelDisplayName = "GPT"
+		} else {
+			modelDisplayName = activeModel
+		}
+	}
+	return modelDisplayName
+}
+
+// resolveTrajectoryTitle picks the title from annotations, summary, the on-disk annotation file,
+// an authoritative cached title, or the first user prompt, and remembers it in the cascade title cache.
+func resolveTrajectoryTitle(rawResp *upstreamTrajectoryResp, steps []TrajectoryStep) string {
+	title := ""
+	isFallback := false
+	if rawResp.Trajectory.Annotations != nil && rawResp.Trajectory.Annotations.Title != "" {
+		title = rawResp.Trajectory.Annotations.Title
+	} else if rawResp.Trajectory.Summary != "" {
+		title = rawResp.Trajectory.Summary
+	}
+
+	if title == "" || title == "未命名会话" {
+		if t := readAnnotationTitle(rawResp.Trajectory.CascadeID); t != "" && t != "未命名会话" {
+			title = t
+		}
+	}
+
+	if title == "" || title == "未命名会话" {
+		if t := getAuthoritativeCachedCascadeTitle(rawResp.Trajectory.CascadeID); t != "" {
+			title = t
+		}
+	}
+
+	if title == "" || title == "未命名会话" {
+		for _, s := range steps {
+			if s.Type == "CORTEX_STEP_TYPE_USER_INPUT" {
+				if t := extractTitleFromUserInput(s); t != "" && t != "未命名会话" {
+					title = t
+					isFallback = true
+					break
+				}
+			}
+		}
+	}
+
+	if title != "" && title != "未命名会话" && rawResp.Trajectory.CascadeID != "" {
+		if isFallback {
+			setCachedCascadeTitleFallback(rawResp.Trajectory.CascadeID, title)
+		} else {
+			setCachedCascadeTitle(rawResp.Trajectory.CascadeID, title)
+		}
+	}
+	return title
+}
+
+// collectApprovedArtifacts gathers artifact URIs the user already approved anywhere in the
+// conversation (via structured artifact comments or the system approval text).
+func collectApprovedArtifacts(steps []TrajectoryStep) map[string]bool {
+	approvedArtifacts := make(map[string]bool)
+	for _, s := range steps {
+		if s.Type == "CORTEX_STEP_TYPE_USER_INPUT" && s.UserInput != nil {
+			for _, ac := range s.UserInput.ArtifactComments {
+				if ac.ArtifactURI != "" && isArtifactApproval(ac.ApprovalStatus) {
+					approvedArtifacts[ac.ArtifactURI] = true
+					approvedArtifacts[normalizeURI(ac.ArtifactURI)] = true
+				}
+			}
+			text := s.UserInput.UserResponse
+			if text == "" && len(s.UserInput.Items) > 0 {
+				text = s.UserInput.Items[0].Text
+			}
+			trimmed := strings.TrimSpace(text)
+			if strings.Contains(trimmed, "The user has approved this document") && strings.HasPrefix(trimmed, "Comments on artifact URI:") {
+				firstLine := strings.Split(trimmed, "\n")[0]
+				uri := strings.TrimSpace(strings.TrimPrefix(firstLine, "Comments on artifact URI:"))
+				if uri != "" {
+					approvedArtifacts[uri] = true
+					approvedArtifacts[normalizeURI(uri)] = true
+				}
+			}
+		}
+	}
+	return approvedArtifacts
+}
+
+// lastUserInputIndex returns the index of the latest USER_INPUT step, or -1 if there is none.
+func lastUserInputIndex(steps []TrajectoryStep) int {
+	for i := len(steps) - 1; i >= 0; i-- {
+		if steps[i].Type == "CORTEX_STEP_TYPE_USER_INPUT" {
+			return i
+		}
+	}
+	return -1
+}
+
+// detectProceed reports whether the latest turn holds an artifact awaiting user feedback.
+// Desktop Antigravity (Bjb) parity:
+//  1. Must be in the latest turn (after the last USER_INPUT step).
+//  2. Status must not be RUNNING.
+//  3. No non-artifact code files modified after the plan artifact in this turn.
+//  4. An artifact in this turn has requestFeedback == true (step metadata or on-disk metadata).
+//  5. The artifact has NOT already been approved in conversation history.
+func detectProceed(rawResp *upstreamTrajectoryResp, steps []TrajectoryStep, lastUserInputIdx int) (bool, string) {
+	canProceed := false
+	proceedArtifactURI := ""
+	hasModifiedNonArtifactFilesAfterPlan := false
+	approvedArtifacts := collectApprovedArtifacts(steps)
+
+	for i := lastUserInputIdx + 1; i < len(steps); i++ {
+		s := steps[i]
+		if s.Type == "CORTEX_STEP_TYPE_CODE_ACTION" {
+			if s.CodeAction != nil {
+				ca := s.CodeAction
+				uri := ""
+				if ca.ActionResult != nil {
+					if ca.ActionResult.Edit != nil && ca.ActionResult.Edit.AbsoluteURI != "" {
+						uri = ca.ActionResult.Edit.AbsoluteURI
+					} else if ca.ActionResult.AbsoluteURI != "" {
+						uri = ca.ActionResult.AbsoluteURI
+					}
+				}
+				if uri == "" && ca.ActionSpec != nil && ca.ActionSpec.CreateFile != nil && ca.ActionSpec.CreateFile.Path != nil {
+					uri = ca.ActionSpec.CreateFile.Path.AbsoluteURI
+				}
+
+				isScratch := strings.Contains(uri, "/scratch/")
+				isWalkthrough := strings.Contains(uri, "walkthrough.md")
+				isPlan := strings.Contains(uri, "implementation_plan.md")
+
+				isArtifact := (ca.IsArtifactFile ||
+					strings.Contains(uri, "/brain/") ||
+					strings.Contains(uri, ".gemini/antigravity/brain") ||
+					isPlan) && !isScratch
+
+				if isArtifact {
+					reqFeedback := false
+					if !isWalkthrough {
+						if ca.ArtifactMetadata != nil && ca.ArtifactMetadata.RequestFeedback {
+							reqFeedback = true
+						}
+
+						filePath := uri
+						if strings.HasPrefix(filePath, "file://") {
+							filePath = strings.TrimPrefix(filePath, "file://")
+						}
+
+						isCreateFile := (ca.ActionSpec != nil && ca.ActionSpec.CreateFile != nil) ||
+							(ca.ActionResult != nil && ca.ActionResult.Edit != nil && ca.ActionResult.Edit.CreateFile)
+						isApproved := approvedArtifacts[uri] || approvedArtifacts[normalizeURI(uri)]
+
+						// If step metadata was missing but this is an artifact step in the current turn, check its specific metadata file.
+						// Guard: ONLY check disk .metadata.json if:
+						// 1. The step is actually creating/overwriting a file (isCreateFile), not a partial replace_file_content edit.
+						// 2. The artifact was NOT already approved earlier.
+						if !reqFeedback && !isApproved && isCreateFile {
+							if filePath != "" && readMetadataRequestFeedback(filePath+".metadata.json") {
+								reqFeedback = true
+							}
+
+							// Fallback: ONLY check implementation_plan.md.metadata.json if this step actually targets implementation_plan.md
+							if !reqFeedback && isPlan && rawResp.Trajectory.CascadeID != "" {
+								if home, err := os.UserHomeDir(); err == nil && home != "" {
+									planMetaPath := filepath.Join(home, ".gemini/antigravity/brain", rawResp.Trajectory.CascadeID, "implementation_plan.md.metadata.json")
+									if readMetadataRequestFeedback(planMetaPath) {
+										reqFeedback = true
+									}
+								}
+							}
+						}
+					}
+
+					if reqFeedback && uri != "" && !isWalkthrough {
+						canProceed = true
+						proceedArtifactURI = uri
+						hasModifiedNonArtifactFilesAfterPlan = false
+					}
+				} else {
+					if canProceed {
+						hasModifiedNonArtifactFilesAfterPlan = true
+					}
+				}
+			}
+		}
+	}
+
+	// Desktop parity: if non-artifact files were modified after the plan was created,
+	// or if agent is actively running, do not show proceed
+	if hasModifiedNonArtifactFilesAfterPlan || rawResp.Status == "CASCADE_RUN_STATUS_RUNNING" {
+		canProceed = false
+		proceedArtifactURI = ""
+	}
+
+	return canProceed, proceedArtifactURI
+}
+
+// buildPendingInteraction returns the newest step waiting on user input (permission, question,
+// file access or command approval). Interactions only matter while the cascade is RUNNING.
+func buildPendingInteraction(rawResp *upstreamTrajectoryResp, steps []TrajectoryStep) *PendingInteraction {
+	var pendingInteraction *PendingInteraction
+	for idx := len(steps) - 1; idx >= 0; idx-- {
+		s := steps[idx]
+		if s.Status == "CORTEX_STEP_STATUS_WAITING" && s.RequestedInteraction != nil {
+			pi := &PendingInteraction{
+				TrajectoryID: rawResp.Trajectory.TrajectoryID,
+				StepIndex:    idx,
+			}
+			req := s.RequestedInteraction
+			toolName := extractToolNameFromStep(s)
+			isWorkflow := toolName == "run_workflow"
+			if !isWorkflow && req.Permission != nil {
+				actLower := strings.ToLower(req.Permission.Resource.Action)
+				descLower := strings.ToLower(req.Permission.ActionDescription)
+				if strings.Contains(actLower, "workflow") || strings.Contains(descLower, "workflow") {
+					isWorkflow = true
+				}
+			}
+
+			if isWorkflow {
+				pi.Type = "workflow_approval"
+				pi.Title = "动态工作流执行申请"
+				var args struct {
+					Description string `json:"Description"`
+					Script      string `json:"Script"`
+					ScriptPath  string `json:"ScriptPath"`
+				}
+				tcArgs := ""
+				if s.ToolCall != nil {
+					tcArgs = s.ToolCall.ArgumentsJson
+				} else if s.Metadata.ToolCall != nil {
+					tcArgs = s.Metadata.ToolCall.ArgumentsJson
+				}
+				if tcArgs != "" {
+					_ = json.Unmarshal([]byte(tcArgs), &args)
+				}
+				desc := args.Description
+				if desc == "" && req.Permission != nil {
+					desc = req.Permission.ActionDescription
+				}
+				if desc == "" {
+					desc = "执行多智能体动态工作流编排脚本"
+				}
+				pi.Description = desc
+				pi.Target = args.ScriptPath
+
+				phases := extractPhasesFromScript(args.Script)
+				concurrency := estimateConcurrencyFromScript(args.Script)
+				pi.WorkflowApproval = &WorkflowApprovalDetails{
+					Description:     desc,
+					Script:          args.Script,
+					ScriptPath:      args.ScriptPath,
+					EstimatedPhases: phases,
+					MaxConcurrency:  concurrency,
+				}
+				applyPermissionOptions(pi)
+			} else if req.Permission != nil {
+				pi.Type = "permission"
+				pi.Action = req.Permission.Resource.Action
+				pi.Target = req.Permission.Resource.Target
+				pi.Description = req.Permission.ActionDescription
+
+				if pg := parsePermissionGrant(pi.Action, pi.Target, pi.Description); pg != nil {
+					pi.PermissionGrant = pg
+					if pg.Binary == "git" {
+						if pg.Branch != "" {
+							pi.Title = fmt.Sprintf("Git 权限申请：允许向分支 %s 执行 %s？", pg.Branch, pg.Action)
+						} else {
+							pi.Title = fmt.Sprintf("Git 权限申请：允许执行 %s？", pg.Action)
+						}
+					} else if pg.Binary == "gh" {
+						repoStr := pg.Repo
+						if pg.Org != "" && pg.Repo != "" {
+							repoStr = pg.Org + "/" + pg.Repo
+						}
+						if repoStr != "" {
+							pi.Title = fmt.Sprintf("GitHub 权限申请：针对 %s 执行 %s？", repoStr, pg.Action)
+						} else {
+							pi.Title = fmt.Sprintf("GitHub 权限申请：允许 %s 操作？", pg.Action)
+						}
+					} else {
+						pi.Title = fmt.Sprintf("安全权限申请：%s (%s)", pi.Action, pi.Target)
+					}
+				} else {
+					actionLower := strings.ToLower(pi.Action)
+					if strings.Contains(actionLower, "read") {
+						pi.Title = "Allow read access to this path?"
+					} else if strings.Contains(actionLower, "command") {
+						pi.Title = "Allow executing this command?"
+					} else if strings.Contains(actionLower, "write") || strings.Contains(actionLower, "edit") {
+						pi.Title = "Allow write access to this path?"
+					} else if pi.Description != "" {
+						pi.Title = "Allow: " + pi.Description + "?"
+					} else {
+						pi.Title = fmt.Sprintf("Allow %s access?", pi.Action)
+					}
+				}
+
+				applyPermissionOptions(pi)
+			} else if req.AskQuestion != nil && len(req.AskQuestion.Questions) > 0 {
+				pi.Type = "ask_question"
+				var questions []InteractionQuestion
+				for _, qItem := range req.AskQuestion.Questions {
+					iq := InteractionQuestion{
+						Question:           qItem.Question,
+						IsMultiSelect:      qItem.IsMultiSelect,
+						HasWriteIn:         true,
+						WriteInLabel:       "Other",
+						WriteInPlaceholder: "(write in your response)",
+					}
+					for _, opt := range qItem.Options {
+						iq.Options = append(iq.Options, InteractionOption{
+							ID:   opt.ID,
+							Text: opt.Text,
+						})
+					}
+					if len(iq.Options) > 0 {
+						iq.DefaultOptionID = iq.Options[0].ID
+					}
+					questions = append(questions, iq)
+				}
+				pi.Questions = questions
+
+				// For backward compatibility with clients that only inspect top-level single question:
+				q0 := questions[0]
+				pi.Title = q0.Question
+				pi.IsMultiSelect = q0.IsMultiSelect
+				pi.Options = q0.Options
+				pi.DefaultOptionID = q0.DefaultOptionID
+				pi.HasWriteIn = true
+				pi.WriteInLabel = "Other"
+				pi.WriteInPlaceholder = "(write in your response)"
+			} else if req.FilePermission != nil {
+				pi.Type = "file_permission"
+				pi.Target = req.FilePermission.AbsolutePathURI
+				pi.Title = "Allow access to this file outside workspace?"
+				applyPermissionOptions(pi)
+			} else if req.RunCommand != nil {
+				pi.Type = "run_command"
+				pi.Target = req.RunCommand.CommandLine
+				pi.Title = "Confirm command execution"
+				pi.Options = []InteractionOption{
+					{ID: "1", Text: "Yes, run command", Scope: 1},
+					{ID: "2", Text: "No", IsDeny: true},
+				}
+				applyDenyWriteIn(pi)
+			} else if req.ApprovalInteraction != nil {
+				pi.Type = "approval"
+				pi.Title = "操作审批确认"
+				if req.ApprovalInteraction.Title != "" {
+					pi.Title = req.ApprovalInteraction.Title
+				}
+				if req.ApprovalInteraction.Description != "" {
+					pi.Description = req.ApprovalInteraction.Description
+				}
+				descLower := strings.ToLower(pi.Description + " " + pi.Title)
+				if strings.Contains(descLower, "download") || strings.Contains(descLower, "下载") {
+					pi.Type = "browser_download"
+					if pi.Title == "操作审批确认" {
+						pi.Title = "浏览器文件下载审批"
+					}
+				}
+				pi.Options = []InteractionOption{
+					{ID: "1", Text: "允许 (Allow)", Scope: 1},
+					{ID: "2", Text: "拒绝 (Deny)", IsDeny: true},
+				}
+				applyDenyWriteIn(pi)
+			} else if req.Mcp != nil {
+				pi.Type = "mcp"
+				pi.Title = "MCP 工具调用确认"
+				mcpLabel := ""
+				if s.McpTool != nil && s.McpTool.ToolName != "" {
+					if s.McpTool.ServerName != "" {
+						mcpLabel = s.McpTool.ServerName + "/" + s.McpTool.ToolName
+					} else {
+						mcpLabel = s.McpTool.ToolName
+					}
+					if s.McpTool.ArgumentsJson != "" {
+						pi.Target = s.McpTool.ArgumentsJson
+					}
+				} else if tn := extractToolNameFromStep(s); tn != "" && tn != "mcp_tool" && tn != "run_command" {
+					mcpLabel = tn
+				}
+				if mcpLabel != "" {
+					pi.Title = "MCP 工具调用确认：" + mcpLabel
+				}
+				if pi.Target == "" {
+					if args := extractStepToolArgsJSON(s); args != "" {
+						pi.Target = args
+					}
+				}
+				pi.Options = []InteractionOption{
+					{ID: "1", Text: "允许执行", Scope: 1},
+					{ID: "2", Text: "拒绝", IsDeny: true},
+				}
+				applyDenyWriteIn(pi)
+			} else if req.Elicitation != nil {
+				pi.Type = "elicitation"
+				pi.Title = "MCP 补充信息输入"
+				if req.Elicitation.ServerName != "" {
+					pi.Title = fmt.Sprintf("MCP 补充信息 (%s)", req.Elicitation.ServerName)
+				}
+				if req.Elicitation.Message != "" {
+					pi.Description = req.Elicitation.Message
+				}
+				if req.Elicitation.URL != "" {
+					pi.Target = req.Elicitation.URL
+				}
+				applyElicitationSchema(pi, req.Elicitation.RequestedSchemaJSON, req.Elicitation.Message)
+			}
+			pendingInteraction = pi
+			break
+		}
+	}
+	if rawResp.Status != "CASCADE_RUN_STATUS_RUNNING" {
+		pendingInteraction = nil
+	}
+	return pendingInteraction
+}
+
+// buildQueuedMessages lists user messages queued while the agent is busy, dropping internal
+// agent traffic and entries already reflected in the trajectory.
+func (p *Proxy) buildQueuedMessages(rawResp *upstreamTrajectoryResp, steps []TrajectoryStep, allMessages []CascadeMessageItem) []QueuedMessageItem {
+	queuedMessages := []QueuedMessageItem{}
+	for _, pam := range rawResp.PendingAgentMessages {
+		if isInternalAgentMessage(pam.HideFromUser, pam.Sender, pam.SourceMetadata, pam.Content) {
+			continue
+		}
+		if pam.DeliveryStrategy != nil && !isQueuedDeliveryStrategy(pam.DeliveryStrategy) {
+			continue
+		}
+		uMsg := upstreamAgentMessage{
+			ID:               pam.ID,
+			Sender:           pam.Sender,
+			Timestamp:        pam.Timestamp,
+			HideFromUser:     pam.HideFromUser,
+			Content:          pam.Content,
+			StepPayload:      pam.StepPayload,
+			DeliveryStrategy: pam.DeliveryStrategy,
+			SourceMetadata:   pam.SourceMetadata,
+		}
+		text := extractQueuedMessageText(uMsg)
+		media, imageUrls := extractQueuedMessageMedia(uMsg)
+		if (text != "" || len(media) > 0 || len(imageUrls) > 0) && !isInternalAgentMessage(false, "", nil, text) {
+			queuedMessages = append(queuedMessages, QueuedMessageItem{
+				ID:              pam.ID,
+				Text:            text,
+				ClientMessageID: extractQueuedClientMessageID(uMsg),
+				CreatedAt:       parseAgentMessageTimestamp(pam.Timestamp),
+				Media:           media,
+				ImageURLs:       imageUrls,
+			})
+		}
+	}
+	queuedMessages = p.FilterQueuedMessagesAgainstTrajectory(rawResp.Trajectory.CascadeID, queuedMessages, steps, allMessages)
+	return queuedMessages
+}
+
+// buildRunningTasks lists steps still RUNNING (background commands) with their best-effort command line.
+func buildRunningTasks(steps []TrajectoryStep) []RunningTaskItem {
+	var runningTasks []RunningTaskItem
+	for idx, s := range steps {
+		stepIdx := idx
+		if s.Metadata.SourceTrajectoryStepInfo != nil && s.Metadata.SourceTrajectoryStepInfo.StepIndex > 0 {
+			stepIdx = s.Metadata.SourceTrajectoryStepInfo.StepIndex
+		}
+
+		if s.Status == "CORTEX_STEP_STATUS_RUNNING" {
+			cmdLine := ""
+			toolName := "run_command"
+			taskID := fmt.Sprintf("task-%d", stepIdx)
+			logURI := ""
+
+			if s.TaskDetails != nil {
+				if s.TaskDetails.ID != "" {
+					taskID = s.TaskDetails.ID
+				}
+				if s.TaskDetails.Description != "" {
+					cmdLine = s.TaskDetails.Description
+				}
+				if s.TaskDetails.LogURI != "" {
+					logURI = s.TaskDetails.LogURI
+				}
+			}
+			if cmdLine == "" && s.RunCommand != nil {
+				if s.RunCommand.CommandLine != "" {
+					cmdLine = s.RunCommand.CommandLine
+				} else if s.RunCommand.ProposedCommandLine != "" {
+					cmdLine = s.RunCommand.ProposedCommandLine
+				}
+			}
+			if s.Metadata.ToolCall != nil && s.Metadata.ToolCall.Name != "" {
+				toolName = s.Metadata.ToolCall.Name
+			}
+
+			if cmdLine == "" && s.Metadata.ToolCall != nil {
+				cmdLine = s.Metadata.ToolCall.ArgumentsJson
+			}
+			if cmdLine == "" {
+				cmdLine = s.Metadata.ToolAction
+			}
+
+			toolSummary := s.Metadata.ToolSummary
+			if toolSummary == "" {
+				if rawArgs := extractStepToolArgsJSON(s); rawArgs != "" && strings.Contains(rawArgs, "toolSummary") {
+					var argMeta struct {
+						ToolSummary string `json:"toolSummary"`
+					}
+					if err := json.Unmarshal([]byte(rawArgs), &argMeta); err == nil && argMeta.ToolSummary != "" {
+						toolSummary = argMeta.ToolSummary
+					}
+				}
+			}
+
+			runningTasks = append(runningTasks, RunningTaskItem{
+				ID:          taskID,
+				StepIndex:   stepIdx,
+				ToolName:    toolName,
+				CommandLine: cmdLine,
+				ToolSummary: toolSummary,
+				ToolAction:  s.Metadata.ToolAction,
+				LogURI:      logURI,
+				StartedAt:   s.Metadata.CreatedAt,
+				IsDaemon:    IsDaemonStep(s),
+			})
+		}
+	}
+	return runningTasks
+}
+
+// resolveFinalStatus derives the effective run status and error text, scoped strictly to the
+// latest turn: errors from earlier turns that were recovered must not mark the session as errored.
+func resolveFinalStatus(status string, steps []TrajectoryStep, lastUserInputIdx int) (string, string) {
+	latestTurnHasError := false
+	var latestTurnErrorText string
+	for i := len(steps) - 1; i > lastUserInputIdx; i-- {
+		s := steps[i]
+		if s.Type == "CORTEX_STEP_TYPE_ERROR_MESSAGE" {
+			if isUserVisibleError(s) {
+				latestTurnHasError = true
+				raw := extractErrorText(s)
+				parsed := parseAttemptError(raw)
+				if parsed.isAttempt {
+					latestTurnErrorText = formatAttemptError(parsed.prefix, parsed.attempt, parsed.maxAttempts, parsed.baseError)
+				} else {
+					latestTurnErrorText = raw
+				}
+			}
+			break
+		} else if s.Type == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" || s.RunCommand != nil || s.CodeAction != nil || s.TaskDetails != nil {
+			// A subsequent step was executed after any earlier error; not terminated by error
+			break
+		}
+	}
+
+	finalStatus := status
+	if status == "CASCADE_RUN_STATUS_RUNNING" {
+		if len(steps) > 0 && steps[len(steps)-1].Type == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && latestTurnHasError {
+			finalStatus = "CASCADE_RUN_STATUS_ERROR"
+		}
+	} else if latestTurnHasError {
+		finalStatus = "CASCADE_RUN_STATUS_ERROR"
+	}
+
+	return finalStatus, latestTurnErrorText
+}
+
+// applyDenyWriteIn marks the first option as default and turns "No" into a write-in that lets
+// the user tell the agent what to do instead.
+func applyDenyWriteIn(pi *PendingInteraction) {
+	pi.DefaultOptionID = "1"
+	pi.HasWriteIn = true
+	pi.WriteInLabel = "No"
+	pi.WriteInPlaceholder = "(tell the agent what to do instead)"
+}
+
+// applyPermissionOptions installs the standard allow-once / allow-always / deny choices.
+func applyPermissionOptions(pi *PendingInteraction) {
+	pi.Options = []InteractionOption{
+		{ID: "1", Text: "Yes, allow this time", Scope: 1},
+		{ID: "2", Text: "Yes, and always allow in this conversation", Scope: 2},
+		{ID: "3", Text: "Yes, and always allow in this project", Scope: 3},
+		{ID: "4", Text: "Yes, and always allow", Scope: 4},
+		{ID: "5", Text: "No", IsDeny: true},
+	}
+	applyDenyWriteIn(pi)
+}
+
+// applyElicitationSchema maps an MCP Elicitation JSON Schema into PendingInteraction options/questions
+// so existing iOS, Android, and Web cards can collect single-choice, boolean, or free-text answers.
+func applyElicitationSchema(pi *PendingInteraction, schemaJSON string, fallbackMsg string) {
+	type schemaProp struct {
+		Type        string   `json:"type"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Enum        []string `json:"enum"`
+		EnumNames   []string `json:"enumNames"`
+	}
+	var schema struct {
+		Properties map[string]schemaProp `json:"properties"`
+		Required   []string              `json:"required"`
+	}
+	if strings.TrimSpace(schemaJSON) != "" {
+		_ = json.Unmarshal([]byte(schemaJSON), &schema)
+	}
+
+	if len(schema.Properties) > 0 {
+		keys := make([]string, 0, len(schema.Properties))
+		seen := make(map[string]bool, len(schema.Properties))
+		for _, rk := range schema.Required {
+			if _, ok := schema.Properties[rk]; ok && !seen[rk] {
+				keys = append(keys, rk)
+				seen[rk] = true
+			}
+		}
+		rest := make([]string, 0, len(schema.Properties))
+		for k := range schema.Properties {
+			if !seen[k] {
+				rest = append(rest, k)
+			}
+		}
+		sort.Strings(rest)
+		keys = append(keys, rest...)
+
+		questions := make([]InteractionQuestion, 0, len(keys))
+		for _, k := range keys {
+			prop := schema.Properties[k]
+			qLabel := strings.TrimSpace(prop.Title)
+			if qLabel == "" {
+				qLabel = strings.TrimSpace(prop.Description)
+			}
+			if qLabel == "" {
+				qLabel = k
+			}
+			iq := InteractionQuestion{
+				Question: qLabel,
+			}
+			if len(prop.Enum) > 0 {
+				for idx, ev := range prop.Enum {
+					txt := ev
+					if idx < len(prop.EnumNames) && strings.TrimSpace(prop.EnumNames[idx]) != "" {
+						txt = prop.EnumNames[idx]
+					}
+					iq.Options = append(iq.Options, InteractionOption{ID: ev, Text: txt})
+				}
+				iq.DefaultOptionID = iq.Options[0].ID
+			} else if strings.EqualFold(prop.Type, "boolean") {
+				iq.Options = []InteractionOption{
+					{ID: "true", Text: "是 (True)"},
+					{ID: "false", Text: "否 (False)"},
+				}
+				iq.DefaultOptionID = "true"
+			} else {
+				iq.Options = []InteractionOption{}
+				iq.HasWriteIn = true
+				iq.WriteInLabel = "填写 " + k
+				iq.WriteInPlaceholder = "输入 " + qLabel + "..."
+				iq.DefaultOptionID = "__write_in__"
+			}
+			questions = append(questions, iq)
+		}
+
+		pi.Action = strings.Join(keys, ",")
+		pi.Questions = questions
+		q0 := questions[0]
+		if len(questions) == 1 && fallbackMsg != "" {
+			pi.Title = fallbackMsg
+		} else if q0.Question != "" {
+			pi.Title = q0.Question
+		}
+		pi.Options = q0.Options
+		pi.DefaultOptionID = q0.DefaultOptionID
+		pi.HasWriteIn = q0.HasWriteIn
+		pi.WriteInLabel = q0.WriteInLabel
+		pi.WriteInPlaceholder = q0.WriteInPlaceholder
+		return
+	}
+
+	// URL-mode or schema-less confirmation elicitation
+	pi.Options = []InteractionOption{
+		{ID: "1", Text: "确认继续", Scope: 1},
+		{ID: "2", Text: "取消", IsDeny: true},
+	}
+	pi.DefaultOptionID = "1"
+}
+
+func parsePermissionGrant(action, target, desc string) *PermissionGrantDetails {
+	action = strings.TrimSpace(action)
+	target = strings.TrimSpace(target)
+	parts := strings.SplitN(action, ".", 2)
+	binary := ""
+	act := ""
+	if len(parts) == 2 {
+		binary = strings.ToLower(parts[0])
+		act = parts[1]
+	} else {
+		if strings.HasPrefix(action, "git") {
+			binary = "git"
+		} else if strings.HasPrefix(action, "gh") {
+			binary = "gh"
+		}
+	}
+
+	if binary != "git" && binary != "gh" && !strings.HasPrefix(target, "{") {
+		return nil
+	}
+
+	pg := &PermissionGrantDetails{
+		Protocol: "PERMISSION_GRANTS_V2",
+		Binary:   binary,
+		Action:   act,
+		RawScope: target,
+	}
+
+	// Try unmarshaling JSON target
+	if strings.HasPrefix(target, "{") {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(target), &m); err == nil {
+			if v, ok := m["org"].(string); ok {
+				pg.Org = v
+			}
+			if v, ok := m["repo"].(string); ok {
+				pg.Repo = v
+			}
+			if v, ok := m["branch"].(string); ok {
+				pg.Branch = v
+			}
+			if v, ok := m["pr"].(string); ok {
+				pg.PR = v
+			}
+			if v, ok := m["path"].(string); ok {
+				pg.Path = v
+			}
+			if v, ok := m["ref"].(string); ok {
+				pg.Ref = v
+			}
+		}
+	}
+
+	return pg
+}
+
+var (
+	phaseRegex     = regexp.MustCompile(`(?i)phase\s*\(\s*["']([^"']+)["']\s*\)`)
+	agentRoleRegex = regexp.MustCompile(`(?i)agent\s*\([^)]*role\s*=\s*["']([^"']+)["'][^)]*\)`)
+)
+
+func extractPhasesFromScript(script string) []string {
+	if script == "" {
+		return nil
+	}
+	matches := phaseRegex.FindAllStringSubmatch(script, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var phases []string
+	for _, m := range matches {
+		if len(m) > 1 {
+			p := strings.TrimSpace(m[1])
+			if p != "" && !seen[p] {
+				seen[p] = true
+				phases = append(phases, p)
+			}
+		}
+	}
+	return phases
+}
+
+func estimateConcurrencyFromScript(script string) int {
+	if script == "" {
+		return 1
+	}
+	if strings.Contains(script, "parallel") {
+		return 4 // 默认并发预估度
+	}
+	agents := agentRoleRegex.FindAllString(script, -1)
+	if len(agents) > 1 {
+		return len(agents)
+	}
+	return 1
+}
+
+func extractSubagentsFromScript(script string, stepIndex int) []SubagentItem {
+	if script == "" {
+		return nil
+	}
+	matches := agentRoleRegex.FindAllStringSubmatch(script, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var items []SubagentItem
+	for _, m := range matches {
+		if len(m) > 1 {
+			role := strings.TrimSpace(m[1])
+			if role != "" && !seen[role] {
+				seen[role] = true
+				tier := "flash"
+				if strings.Contains(strings.ToLower(script), "pro") {
+					tier = "pro"
+				}
+				items = append(items, SubagentItem{
+					ConversationID: "",
+					TypeName:       "self",
+					Role:           role,
+					ModelTier:      tier,
+					StepIndex:      stepIndex,
+					Status:         "pending",
+					Title:          role,
+				})
+			}
+		}
+	}
+	return items
+}
+
+func parseWorkflowFromStep(s TrajectoryStep, idx int) *WorkflowItem {
+	tcArgs := ""
+	if s.ToolCall != nil {
+		tcArgs = s.ToolCall.ArgumentsJson
+	} else if s.Metadata.ToolCall != nil {
+		tcArgs = s.Metadata.ToolCall.ArgumentsJson
+	}
+
+	wf := &WorkflowItem{
+		Status: "done",
+	}
+
+	if s.Status == "CORTEX_STEP_STATUS_RUNNING" {
+		wf.Status = "running"
+	} else if s.Status == "CORTEX_STEP_STATUS_ERROR" {
+		wf.Status = "error"
+	}
+
+	if tcArgs != "" {
+		var args struct {
+			Description string `json:"Description"`
+			Script      string `json:"Script"`
+			ScriptPath  string `json:"ScriptPath"`
+		}
+		if err := json.Unmarshal([]byte(tcArgs), &args); err == nil {
+			wf.Description = strings.TrimSpace(args.Description)
+			wf.Script = args.Script
+			wf.ScriptPath = args.ScriptPath
+		}
+	}
+
+	// Extract step observation / response output
+	outText := ""
+	if s.PlannerResponse != nil {
+		outText = s.PlannerResponse.Response
+	}
+	if outText == "" && s.Content != "" {
+		outText = s.Content
+	}
+	wf.Output = strings.TrimSpace(outText)
+
+	// Parse phases and logs from output
+	if wf.Output != "" {
+		lines := strings.Split(wf.Output, "\n")
+		var currentPhase *WorkflowPhaseItem
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, "[phase:") && strings.HasSuffix(line, "]") {
+				pName := strings.TrimSuffix(strings.TrimPrefix(line, "[phase:"), "]")
+				pName = strings.TrimSpace(pName)
+				wf.Phases = append(wf.Phases, WorkflowPhaseItem{
+					Name:   pName,
+					Status: "done",
+				})
+				currentPhase = &wf.Phases[len(wf.Phases)-1]
+			} else if strings.HasPrefix(line, "Phase ") && strings.Contains(line, ":") {
+				parts := strings.SplitN(line, ":", 2)
+				pName := strings.TrimSpace(parts[1])
+				if pName == "" {
+					pName = strings.TrimSpace(parts[0])
+				}
+				wf.Phases = append(wf.Phases, WorkflowPhaseItem{
+					Name:   pName,
+					Status: "done",
+				})
+				currentPhase = &wf.Phases[len(wf.Phases)-1]
+			} else if currentPhase != nil {
+				currentPhase.Logs = append(currentPhase.Logs, line)
+			} else {
+				wf.Logs = append(wf.Logs, line)
+			}
+
+			// Check for JSON schema result
+			if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") && wf.ResultJSON == "" {
+				var js json.RawMessage
+				if err := json.Unmarshal([]byte(line), &js); err == nil {
+					wf.ResultJSON = line
+				}
+			}
+		}
+	}
+
+	// 如果输出尚未产生阶段，但 Python 源码包含 phase(...) 声明，静态提取预置阶段
+	if len(wf.Phases) == 0 && wf.Script != "" {
+		estimated := extractPhasesFromScript(wf.Script)
+		for _, pName := range estimated {
+			wf.Phases = append(wf.Phases, WorkflowPhaseItem{
+				Name:   pName,
+				Status: "pending",
+			})
+		}
+	}
+
+	// 动态修正各 Phase 状态
+	if len(wf.Phases) > 0 {
+		if wf.Status == "running" {
+			hasRunning := false
+			for i := range wf.Phases {
+				if wf.Phases[i].Status == "running" {
+					hasRunning = true
+					break
+				}
+			}
+			if !hasRunning {
+				marked := false
+				for i := range wf.Phases {
+					if wf.Phases[i].Status == "pending" {
+						wf.Phases[i].Status = "running"
+						marked = true
+						break
+					}
+				}
+				if !marked {
+					wf.Phases[len(wf.Phases)-1].Status = "running"
+				}
+			}
+		} else if wf.Status == "done" {
+			for i := range wf.Phases {
+				wf.Phases[i].Status = "done"
+			}
+		} else if wf.Status == "error" {
+			if len(wf.Phases) > 0 {
+				wf.Phases[len(wf.Phases)-1].Status = "failed"
+			}
+		}
+	}
+
+	// 挂载当前步骤产生的 Subagents
+	if s.InvokeSubagent != nil && len(s.InvokeSubagent.Subagents) > 0 {
+		var saItems []SubagentItem
+		for saIdx, sa := range s.InvokeSubagent.Subagents {
+			cid := ""
+			if saIdx < len(s.InvokeSubagent.Results) {
+				cid = s.InvokeSubagent.Results[saIdx].ConversationID
+			}
+			saItems = append(saItems, SubagentItem{
+				ConversationID: cid,
+				TypeName:       sa.TypeName,
+				Role:           sa.Role,
+				Prompt:         sa.InitialPrompt,
+				ModelTier:      sa.ModelTier,
+				StepIndex:      idx,
+				Status:         wf.Status,
+				Title:          sa.Role,
+			})
+		}
+		if len(wf.Phases) > 0 {
+			activeIdx := len(wf.Phases) - 1
+			for i := range wf.Phases {
+				if wf.Phases[i].Status == "running" {
+					activeIdx = i
+					break
+				}
+			}
+			wf.Phases[activeIdx].Subagents = append(wf.Phases[activeIdx].Subagents, saItems...)
+		}
+	}
+
+	// 若尚未派生实例且源码含 agent(role=...) 声明，静态挂载预估子代理
+	if len(wf.Phases) > 0 && len(wf.Phases[0].Subagents) == 0 && wf.Script != "" {
+		estimatedSa := extractSubagentsFromScript(wf.Script, idx)
+		if len(estimatedSa) > 0 {
+			wf.Phases[0].Subagents = estimatedSa
+		}
+	}
+
+	return wf
+}

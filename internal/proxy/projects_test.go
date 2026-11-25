@@ -1,0 +1,1081 @@
+package proxy
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"antigravity-mobile/internal/inspector"
+)
+
+func TestProjectsEndpoint(t *testing.T) {
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+
+	req := httptest.NewRequest(http.MethodGet, "/gateway/projects", nil)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /gateway/projects, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var projects []ProjectItem
+	if err := json.NewDecoder(rec.Body).Decode(&projects); err != nil {
+		t.Fatalf("failed to decode projects json: %v", err)
+	}
+
+	t.Logf("Successfully fetched %d projects", len(projects))
+	for idx, prj := range projects {
+		t.Logf("[%d] ID=%s Name=%s -> %s (sessions: %d, ws: %v)", idx, prj.ID, prj.Name, prj.Path, prj.SessionCount, prj.IsWorkspace)
+		if idx >= 5 {
+			break
+		}
+	}
+}
+
+func TestURIHelpers(t *testing.T) {
+	raw := "file:///Users/hal9000/Projects/test%20dir"
+	path := uriToPath(raw)
+	expected := filepath.FromSlash("/Users/hal9000/Projects/test dir")
+	if path != expected {
+		t.Errorf("expected decoded path, got: %s", path)
+	}
+
+	norm := normalizeURI("/Users/hal9000/Projects/foo/")
+	if norm != "file:///Users/hal9000/Projects/foo" {
+		t.Errorf("expected normalized URI, got: %s", norm)
+	}
+
+	// Test Chinese URI decoding
+	chineseURI := "file:///d%3A/OneDrive/%E9%A1%B9%E7%9B%AE/Antigravity"
+	normChinese := normalizeURI(chineseURI)
+	if normChinese != "file:///d:/OneDrive/项目/Antigravity" {
+		t.Errorf("expected normalized Chinese URI, got: %s", normChinese)
+	}
+
+	// Test 2-slash Windows file URI
+	twoSlash := "file://d:/Projects/test-app"
+	normTwoSlash := normalizeURI(twoSlash)
+	if normTwoSlash != "file:///d:/Projects/test-app" {
+		t.Errorf("expected normalized 3-slash URI, got: %s", normTwoSlash)
+	}
+
+	// Test remote workspace URI
+	remoteURI := "vscode-remote://ssh-remote%2B7b22686f73744e616d65223a224e4153227d/home/jiuzai/projects"
+	normRemote := normalizeURI(remoteURI)
+	if normRemote != remoteURI {
+		t.Errorf("expected remote URI preserved, got: %s", normRemote)
+	}
+	remotePath := uriToPath(remoteURI)
+	if remotePath != "/home/jiuzai/projects" {
+		t.Errorf("expected remote path extracted, got: %s", remotePath)
+	}
+}
+
+func TestResolveModelEnum(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"gemini-3.8-flash-high", "MODEL_PLACEHOLDER_M318"},
+		{"gemini-4-carbon-high", "MODEL_PLACEHOLDER_M420"},
+		{"gemini-4-carbon", "MODEL_PLACEHOLDER_M420"},
+		{"gemini-4-argon-high", "MODEL_PLACEHOLDER_M417"},
+		{"gemini-4-argon-medium", "MODEL_PLACEHOLDER_M418"},
+		{"gemini-4-argon-low", "MODEL_PLACEHOLDER_M419"},
+		{"gemini-4-hydrogen-xhigh", "MODEL_PLACEHOLDER_M528"},
+		{"gemini-4-hydrogen-high", "MODEL_PLACEHOLDER_M525"},
+		{"gemini-4-hydrogen-medium", "MODEL_PLACEHOLDER_M526"},
+		{"gemini-4-hydrogen-low", "MODEL_PLACEHOLDER_M527"},
+		{"gemini-pro-orchestrator", "MODEL_PLACEHOLDER_M667"},
+		{"gemini-pro-orchestrator-argon", "MODEL_PLACEHOLDER_M681"},
+		{"claude-opus-5-5-high", "MODEL_PLACEHOLDER_M402"},
+		{"claude-sonnet-5-5-high", "MODEL_PLACEHOLDER_M405"},
+		{"claude-opus-4-6-thinking", "MODEL_PLACEHOLDER_M26"},
+		{"gemini", "MODEL_PLACEHOLDER_M318"},
+		{"claude", "MODEL_PLACEHOLDER_M26"},
+		{"MODEL_PLACEHOLDER_M16", "MODEL_PLACEHOLDER_M16"},
+		{"MODEL_CUSTOM_TEST", "MODEL_CUSTOM_TEST"},
+		{"gemini-2.5-pro", "MODEL_PLACEHOLDER_M318"},
+		{"MODEL_GOOGLE_GEMINI_2_5_PRO", "MODEL_PLACEHOLDER_M318"},
+		{"MODEL_GOOGLE_GEMINI_2_5_FLASH", "MODEL_PLACEHOLDER_M318"},
+		{"claude-3-7-sonnet", "MODEL_PLACEHOLDER_M26"},
+		{"", ""},
+		{"unknown-model-xyz", ""},
+	}
+
+	for _, tc := range tests {
+		got := resolveModelEnum(tc.input)
+		if got != tc.expected {
+			t.Errorf("resolveModelEnum(%q) = %q, expected %q", tc.input, got, tc.expected)
+		}
+	}
+}
+
+func TestHandleCreateCascadeRequestedModel(t *testing.T) {
+	var lastReceivedPayload map[string]interface{}
+	mockUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/StartCascade") {
+			json.NewDecoder(r.Body).Decode(&lastReceivedPayload)
+			w.Write([]byte(`{"cascadeId": "test-cascade-123"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/UpdateConversationAnnotations") {
+			w.Write([]byte(`{}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer mockUpstream.Close()
+
+	port := mockUpstream.Listener.Addr().(*net.TCPAddr).Port
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	p.activePort = port
+	p.activeToken = "test-token"
+
+	testCases := []struct {
+		modelInput    string
+		expectedEnum  string
+		shouldHaveKey bool
+	}{
+		{"gemini-3.8-flash-high", "MODEL_PLACEHOLDER_M318", true},
+		{"claude-opus-4-6-thinking", "MODEL_PLACEHOLDER_M26", true},
+		{"MODEL_PLACEHOLDER_M37", "MODEL_PLACEHOLDER_M37", true},
+		{"", "MODEL_PLACEHOLDER_M318", true},
+		{"unknown-model", "", false},
+	}
+
+	wsDir := t.TempDir()
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", wsDir)
+	wsURI := filePathToURI(wsDir)
+
+	for _, tc := range testCases {
+		lastReceivedPayload = nil
+		body, _ := json.Marshal(CreateCascadeRequest{
+			WorkspaceURI: wsURI,
+			Model:        tc.modelInput,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body)))
+		rec := httptest.NewRecorder()
+
+		p.HandleCreateCascade(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("model %q: expected 200, got %d: %s", tc.modelInput, rec.Code, rec.Body.String())
+		}
+
+		if tc.shouldHaveKey {
+			reqModel, ok := lastReceivedPayload["requestedModel"]
+			if !ok {
+				t.Errorf("model %q: expected requestedModel in payload, but not found", tc.modelInput)
+			} else if reqModelStr, ok := reqModel.(string); !ok || reqModelStr != tc.expectedEnum {
+				t.Errorf("model %q: expected string enum %q, got %v (%T)", tc.modelInput, tc.expectedEnum, reqModel, reqModel)
+			}
+		} else {
+			if _, ok := lastReceivedPayload["requestedModel"]; ok {
+				t.Errorf("model %q: expected requestedModel to be omitted, but found: %v", tc.modelInput, lastReceivedPayload["requestedModel"])
+			}
+		}
+	}
+}
+
+func TestHandleCreateCascadeIdempotency(t *testing.T) {
+	startCascadeCalls := 0
+	mockUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/StartCascade") {
+			startCascadeCalls++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"cascadeId":"cascade-idemp-123"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockUpstream.Close()
+
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	port := mockUpstream.Listener.Addr().(*net.TCPAddr).Port
+	p.updateUpstream(inspector.InstanceInfo{
+		Port:      port,
+		CSRFToken: "test-token",
+		IsHealthy: true,
+	})
+
+	wsDir := t.TempDir()
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", wsDir)
+
+	body, _ := json.Marshal(CreateCascadeRequest{
+		WorkspaceURI: filePathToURI(wsDir),
+		Prompt:       "Initial prompt",
+	})
+
+	clientMsgID := "new-cascade-uuid-456"
+
+	// First request -> should call StartCascade
+	req1 := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body)))
+	req1.Header.Set("X-Client-Message-Id", clientMsgID)
+	rec1 := httptest.NewRecorder()
+	p.HandleCreateCascade(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec1.Code)
+	}
+	var resp1 CreateCascadeResponse
+	_ = json.NewDecoder(rec1.Body).Decode(&resp1)
+	if resp1.CascadeID != "cascade-idemp-123" {
+		t.Fatalf("expected cascadeId 'cascade-idemp-123', got %q", resp1.CascadeID)
+	}
+	if startCascadeCalls != 1 {
+		t.Fatalf("expected startCascadeCalls=1, got %d", startCascadeCalls)
+	}
+
+	// Second request with same X-Client-Message-Id -> should return cached response without calling StartCascade
+	req2 := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body)))
+	req2.Header.Set("X-Client-Message-Id", clientMsgID)
+	rec2 := httptest.NewRecorder()
+	p.HandleCreateCascade(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on repeat, got %d", rec2.Code)
+	}
+	var resp2 CreateCascadeResponse
+	_ = json.NewDecoder(rec2.Body).Decode(&resp2)
+	if resp2.CascadeID != "cascade-idemp-123" {
+		t.Fatalf("expected cached cascadeId 'cascade-idemp-123', got %q", resp2.CascadeID)
+	}
+	if startCascadeCalls != 1 {
+		t.Fatalf("expected startCascadeCalls to remain 1 (deduplicated), got %d", startCascadeCalls)
+	}
+}
+
+func TestCanonicalModelName(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"MODEL_PLACEHOLDER_M26", "claude-opus-4-6-thinking"},
+		{"claude", "claude-opus-4-6-thinking"},
+		{"claude-opus", "claude-opus-4-6-thinking"},
+		{"claude-opus-4-6-thinking", "claude-opus-4-6-thinking"},
+		{"claude-sonnet-4-6", "claude-sonnet-4-6"},
+		{"MODEL_PLACEHOLDER_M318", "gemini-3.8-flash-high"},
+		{"gemini", "gemini-3.8-flash-high"},
+		{"gemini-3.8-flash-high", "gemini-3.8-flash-high"},
+		{"", ""},
+	}
+
+	for _, tc := range tests {
+		got := canonicalModelName(tc.input)
+		if got != tc.expected {
+			t.Errorf("canonicalModelName(%q) = %q, expected %q", tc.input, got, tc.expected)
+		}
+	}
+}
+
+func TestApplyModelToCascadeConfig(t *testing.T) {
+	// 1. Apply to existing config with different model
+	origConfig := map[string]interface{}{
+		"plannerConfig": map[string]interface{}{
+			"planModel": "MODEL_PLACEHOLDER_M318",
+			"requestedModel": map[string]interface{}{
+				"model": "MODEL_PLACEHOLDER_M318",
+			},
+			"modelName": "gemini-3.8-flash-high",
+		},
+		"otherField": "keepMe",
+	}
+
+	updated := applyModelToCascadeConfig(origConfig, "MODEL_PLACEHOLDER_M26", "claude-opus-4-6-thinking")
+	upMap, ok := updated.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map[string]interface{}, got %T", updated)
+	}
+
+	if upMap["otherField"] != "keepMe" {
+		t.Errorf("expected otherField to be preserved")
+	}
+
+	pCfg, ok := upMap["plannerConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected plannerConfig map, got %T", upMap["plannerConfig"])
+	}
+
+	if pCfg["planModel"] != "MODEL_PLACEHOLDER_M26" {
+		t.Errorf("expected planModel MODEL_PLACEHOLDER_M26, got %v", pCfg["planModel"])
+	}
+	if pCfg["modelName"] != "claude-opus-4-6-thinking" {
+		t.Errorf("expected modelName claude-opus-4-6-thinking, got %v", pCfg["modelName"])
+	}
+	reqM, ok := pCfg["requestedModel"].(map[string]interface{})
+	if !ok || reqM["model"] != "MODEL_PLACEHOLDER_M26" {
+		t.Errorf("expected requestedModel.model to be MODEL_PLACEHOLDER_M26, got %v", pCfg["requestedModel"])
+	}
+
+	// 2. Apply to nil config
+	nilUpdated := applyModelToCascadeConfig(nil, "MODEL_PLACEHOLDER_M26", "claude-opus-4-6-thinking")
+	nilMap, ok := nilUpdated.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map from nil config, got %T", nilUpdated)
+	}
+	pCfg2 := nilMap["plannerConfig"].(map[string]interface{})
+	if pCfg2["planModel"] != "MODEL_PLACEHOLDER_M26" {
+		t.Errorf("expected planModel MODEL_PLACEHOLDER_M26 from nil config, got %v", pCfg2["planModel"])
+	}
+}
+
+func TestHandleCreateCascadeWithPromptModelSync(t *testing.T) {
+	var startPayload map[string]interface{}
+	var sendUserMsgPayload map[string]interface{}
+
+	mockUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/StartCascade") {
+			json.NewDecoder(r.Body).Decode(&startPayload)
+			w.Write([]byte(`{"cascadeId": "test-model-sync-123"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/UpdateConversationAnnotations") {
+			w.Write([]byte(`{}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/SendUserCascadeMessage") {
+			json.NewDecoder(r.Body).Decode(&sendUserMsgPayload)
+			w.Write([]byte(`{}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer mockUpstream.Close()
+
+	port := mockUpstream.Listener.Addr().(*net.TCPAddr).Port
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	p.activePort = port
+	p.activeToken = "test-token"
+
+	// Seed lastKnownConfig with Gemini model (simulating a prior session)
+	staleConfig := []byte(`{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M318","modelName":"gemini-3.8-flash-high"}}`)
+	SetLastKnownCascadeConfig(staleConfig)
+
+	wsDir := t.TempDir()
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", wsDir)
+
+	body, _ := json.Marshal(CreateCascadeRequest{
+		WorkspaceURI: filePathToURI(wsDir),
+		Prompt:       "Analyze the codebase",
+		Model:        "claude-opus-4-6-thinking",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+
+	p.HandleCreateCascade(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 1. Verify StartCascade received MODEL_PLACEHOLDER_M26
+	if startPayload["requestedModel"] != "MODEL_PLACEHOLDER_M26" {
+		t.Errorf("StartCascade expected requestedModel MODEL_PLACEHOLDER_M26, got %v", startPayload["requestedModel"])
+	}
+
+	// 2. Verify SendUserCascadeMessage received cascadeConfig patched with Claude model instead of stale Gemini
+	cfg, ok := sendUserMsgPayload["cascadeConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("SendUserCascadeMessage expected cascadeConfig map, got %T", sendUserMsgPayload["cascadeConfig"])
+	}
+	pCfg, ok := cfg["plannerConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected plannerConfig, got %T", cfg["plannerConfig"])
+	}
+
+	if pCfg["planModel"] != "MODEL_PLACEHOLDER_M26" {
+		t.Errorf("initial prompt expected planModel MODEL_PLACEHOLDER_M26, got %v", pCfg["planModel"])
+	}
+	if pCfg["modelName"] != "claude-opus-4-6-thinking" {
+		t.Errorf("initial prompt expected modelName claude-opus-4-6-thinking, got %v", pCfg["modelName"])
+	}
+}
+
+func TestApplyModelToCascadeConfig_ClaudeLimits(t *testing.T) {
+	// 1. Initial Gemini config with 256000 maxTokenLimit
+	initialGeminiConfig := map[string]interface{}{
+		"plannerConfig": map[string]interface{}{
+			"planModel": "MODEL_PLACEHOLDER_M318",
+			"modelName": "gemini-3.8-flash-high",
+		},
+		"checkpointConfig": map[string]interface{}{
+			"maxTokenLimit":       256000,
+			"tokenThreshold":      140000,
+			"isSync":              true,
+			"useLastPlannerModel": true,
+		},
+	}
+
+	// 2. Switch to Claude Opus 4.6 Thinking
+	claudeConfig := applyModelToCascadeConfig(initialGeminiConfig, "MODEL_PLACEHOLDER_M26", "claude-opus-4-6-thinking")
+	cfgMap, ok := claudeConfig.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map, got %T", claudeConfig)
+	}
+
+	cpCfg, ok := cfgMap["checkpointConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected checkpointConfig map, got %T", cfgMap["checkpointConfig"])
+	}
+
+	if limit, ok := cpCfg["maxTokenLimit"].(int); !ok || limit > 186000 || limit != 160000 {
+		t.Errorf("expected Claude maxTokenLimit 160000 (must be <= 186000), got %v", cpCfg["maxTokenLimit"])
+	}
+	if thresh, ok := cpCfg["tokenThreshold"].(int); !ok || thresh != 50000 {
+		t.Errorf("expected Claude tokenThreshold 50000, got %v", cpCfg["tokenThreshold"])
+	}
+	if sync, ok := cpCfg["isSync"].(bool); !ok || sync != false {
+		t.Errorf("expected Claude isSync false, got %v", cpCfg["isSync"])
+	}
+
+	// 3. Switch back to Gemini
+	geminiRestored := applyModelToCascadeConfig(claudeConfig, "MODEL_PLACEHOLDER_M318", "gemini-3.8-flash-high")
+	geminiMap := geminiRestored.(map[string]interface{})
+	geminiCp := geminiMap["checkpointConfig"].(map[string]interface{})
+
+	if limit, ok := geminiCp["maxTokenLimit"].(int); !ok || limit != 256000 {
+		t.Errorf("expected Gemini maxTokenLimit restored to 256000, got %v", geminiCp["maxTokenLimit"])
+	}
+	if thresh, ok := geminiCp["tokenThreshold"].(int); !ok || thresh != 140000 {
+		t.Errorf("expected Gemini tokenThreshold restored to 140000, got %v", geminiCp["tokenThreshold"])
+	}
+}
+
+func TestHandleCreateCascadePureChat(t *testing.T) {
+	var lastPayload map[string]interface{}
+	mockUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/StartCascade") {
+			json.NewDecoder(r.Body).Decode(&lastPayload)
+			w.Write([]byte(`{"cascadeId": "pure-chat-cascade-1"}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer mockUpstream.Close()
+
+	port := mockUpstream.Listener.Addr().(*net.TCPAddr).Port
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	p.activePort = port
+	p.activeToken = "test-token"
+
+	// Case 1: Empty workspaceURI and empty projectID -> defaults to outside-of-project
+	body1, _ := json.Marshal(CreateCascadeRequest{
+		WorkspaceURI: "",
+		ProjectID:    "",
+	})
+	req1 := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body1)))
+	rec1 := httptest.NewRecorder()
+	p.HandleCreateCascade(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	if src, ok := lastPayload["source"].(string); !ok || src != "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT" {
+		t.Errorf("expected source CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT, got %v", lastPayload["source"])
+	}
+	envCfg, ok := lastPayload["projectEnvConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected projectEnvConfig in payload")
+	}
+	if pid, ok := envCfg["projectId"].(string); !ok || pid != "outside-of-project" {
+		t.Errorf("expected projectId outside-of-project, got %v", envCfg["projectId"])
+	}
+
+	// Case 2: Explicit projectID "outside-of-project"
+	lastPayload = nil
+	body2, _ := json.Marshal(CreateCascadeRequest{
+		WorkspaceURI: "",
+		ProjectID:    "outside-of-project",
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body2)))
+	rec2 := httptest.NewRecorder()
+	p.HandleCreateCascade(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	envCfg2, ok := lastPayload["projectEnvConfig"].(map[string]interface{})
+	if !ok || envCfg2["projectId"] != "outside-of-project" {
+		t.Errorf("expected projectId outside-of-project, got %v", envCfg2)
+	}
+}
+
+func TestLiveOfficialProjects(t *testing.T) {
+	insp := inspector.NewInspector(5 * time.Second)
+	info := insp.Scan()
+	if info == nil {
+		t.Skip("Antigravity instance not available, skipping test")
+	}
+	t.Logf("info: PID=%d Port=%d CSRF=%s IsHealthy=%v", info.PID, info.Port, info.CSRFToken, info.IsHealthy)
+
+	p := NewProxy(insp)
+	p.activePort = info.Port
+	p.activeToken = info.CSRFToken
+
+	items, err := p.fetchOfficialProjects(info.Port, info.CSRFToken, nil)
+	t.Logf("fetchOfficialProjects err: %v, items count: %d", err, len(items))
+
+	projects, err := p.GetProjects()
+	t.Logf("GetProjects err: %v, count: %d", err, len(projects))
+	for i, prj := range projects {
+		if i < 3 || prj.Name == "antigravity-mobile" {
+			t.Logf("[%d] ID=%q Name=%q URI=%q Path=%q", i, prj.ID, prj.Name, prj.URI, prj.Path)
+		}
+	}
+}
+
+func TestFetchProjectsFromWorkspaceStorage(t *testing.T) {
+	tmpDir := t.TempDir()
+	wsDir := filepath.Join(tmpDir, "Antigravity", "User", "workspaceStorage", "test-hash-123")
+	if err := os.MkdirAll(wsDir, 0755); err != nil {
+		t.Fatalf("failed to create temp workspaceStorage: %v", err)
+	}
+
+	testProjectDir := filepath.Join(tmpDir, "MyTestProject")
+	if err := os.MkdirAll(testProjectDir, 0755); err != nil {
+		t.Fatalf("failed to create test project dir: %v", err)
+	}
+
+	wsJSON := fmt.Sprintf(`{"folder": "file://%s"}`, filepath.ToSlash(testProjectDir))
+	if err := os.WriteFile(filepath.Join(wsDir, "workspace.json"), []byte(wsJSON), 0644); err != nil {
+		t.Fatalf("failed to write workspace.json: %v", err)
+	}
+
+	origAppData := os.Getenv("APPDATA")
+	os.Setenv("APPDATA", tmpDir)
+	defer os.Setenv("APPDATA", origAppData)
+
+	items := fetchProjectsFromWorkspaceStorage()
+	found := false
+	for _, item := range items {
+		if item.Name == "MyTestProject" {
+			found = true
+			if item.LastActive == nil {
+				t.Errorf("expected LastActive to be set from file ModTime")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected MyTestProject to be discovered from workspaceStorage, got %d items", len(items))
+	}
+}
+
+func TestFetchProjectsFromGeminiConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", tmpDir)
+	cfgDir := filepath.Join(tmpDir, "config", "projects")
+	if err := os.MkdirAll(cfgDir, 0755); err != nil {
+		t.Fatalf("failed to create temp config/projects: %v", err)
+	}
+
+	testProjectDir := filepath.Join(tmpDir, "DemoApp")
+	if err := os.MkdirAll(testProjectDir, 0755); err != nil {
+		t.Fatalf("failed to create test project dir: %v", err)
+	}
+
+	projJSON := fmt.Sprintf(`{
+		"id": "project-uuid-1234-5678",
+		"name": "DemoApp",
+		"projectResources": {
+			"resources": [
+				{
+					"gitFolder": {
+						"folderUri": "file://%s",
+						"defaultBranch": "main"
+					}
+				}
+			]
+		},
+		"isWorkspaceOnly": false
+	}`, filepath.ToSlash(testProjectDir))
+
+	if err := os.WriteFile(filepath.Join(cfgDir, "project-uuid-1234-5678.json"), []byte(projJSON), 0644); err != nil {
+		t.Fatalf("failed to write project config json: %v", err)
+	}
+
+	origAppDataDir := os.Getenv("ANTIGRAVITY_APP_DATA_DIR")
+	os.Setenv("ANTIGRAVITY_APP_DATA_DIR", filepath.Join(tmpDir, "antigravity"))
+	defer os.Setenv("ANTIGRAVITY_APP_DATA_DIR", origAppDataDir)
+
+	items := fetchProjectsFromGeminiConfig()
+	found := false
+	for _, item := range items {
+		if item.ID == "project-uuid-1234-5678" {
+			found = true
+			if item.Name != "DemoApp" {
+				t.Errorf("expected DemoApp, got %s", item.Name)
+			}
+			if !strings.EqualFold(item.Path, testProjectDir) {
+				t.Errorf("expected %s, got %s", testProjectDir, item.Path)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected project-uuid-1234-5678 to be discovered, got %d items", len(items))
+	}
+}
+
+func TestHandleCreateCascade_AutoResolveProjectID(t *testing.T) {
+	var lastReceivedPayload map[string]interface{}
+	mockUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/StartCascade") {
+			json.NewDecoder(r.Body).Decode(&lastReceivedPayload)
+			w.Write([]byte(`{"cascadeId": "test-cascade-pid"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/UpdateConversationAnnotations") {
+			w.Write([]byte(`{}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer mockUpstream.Close()
+
+	tmpDir := t.TempDir()
+	t.Setenv("ALLOWED_WORKSPACE_ROOTS", tmpDir)
+	cfgDir := filepath.Join(tmpDir, "config", "projects")
+	_ = os.MkdirAll(cfgDir, 0755)
+	testProjectDir := filepath.Join(tmpDir, "TargetProject")
+	_ = os.MkdirAll(testProjectDir, 0755)
+
+	projJSON := fmt.Sprintf(`{
+		"id": "target-pid-9999",
+		"name": "TargetProject",
+		"projectResources": {
+			"resources": [
+				{
+					"gitFolder": {
+						"folderUri": "file://%s"
+					}
+				}
+			]
+		}
+	}`, filepath.ToSlash(testProjectDir))
+	_ = os.WriteFile(filepath.Join(cfgDir, "target-pid-9999.json"), []byte(projJSON), 0644)
+
+	origAppDataDir := os.Getenv("ANTIGRAVITY_APP_DATA_DIR")
+	os.Setenv("ANTIGRAVITY_APP_DATA_DIR", filepath.Join(tmpDir, "antigravity"))
+	defer os.Setenv("ANTIGRAVITY_APP_DATA_DIR", origAppDataDir)
+
+	port := mockUpstream.Listener.Addr().(*net.TCPAddr).Port
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	p.activePort = port
+	p.activeToken = "test-token"
+
+	// Request from iOS without explicit projectId, only workspaceUri
+	body, _ := json.Marshal(CreateCascadeRequest{
+		WorkspaceURI: "file://" + filepath.ToSlash(testProjectDir),
+		Prompt:       "hello from ios",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/gateway/cascade/new", strings.NewReader(string(body)))
+	w := httptest.NewRecorder()
+
+	p.HandleCreateCascade(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify that upstream StartCascade received projectEnvConfig with target-pid-9999
+	envCfg, ok := lastReceivedPayload["projectEnvConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected projectEnvConfig in startPayload, got: %+v", lastReceivedPayload)
+	}
+	if envCfg["projectId"] != "target-pid-9999" {
+		t.Errorf("expected projectId 'target-pid-9999', got: %v", envCfg["projectId"])
+	}
+	if lastReceivedPayload["source"] != "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT" {
+		t.Errorf("expected CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT, got: %v", lastReceivedPayload["source"])
+	}
+}
+
+func TestProjectAliasEndpoint(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "multigravity-alias-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	origEnv := os.Getenv("MULTIGRAVITY_DATA_DIR")
+	defer os.Setenv("MULTIGRAVITY_DATA_DIR", origEnv)
+	os.Setenv("MULTIGRAVITY_DATA_DIR", tempDir)
+
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+
+	// 1. Set alias
+	setBody, _ := json.Marshal(map[string]string{
+		"path":  "/Users/test/my-cool-project",
+		"alias": "我的酷项目",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/gateway/projects/alias", bytes.NewReader(setBody))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /gateway/projects/alias, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Verify stored in memory / disk
+	aliases := loadWorkspaceAliases()
+	normKey := normalizeWorkspaceKey("/Users/test/my-cool-project")
+	if aliases[normKey] != "我的酷项目" {
+		t.Errorf("expected '我的酷项目', got: %q", aliases[normKey])
+	}
+
+	// 3. Clear alias
+	clearBody, _ := json.Marshal(map[string]string{
+		"path":  "/Users/test/my-cool-project",
+		"alias": "",
+	})
+	reqClear := httptest.NewRequest(http.MethodPost, "/gateway/projects/alias", bytes.NewReader(clearBody))
+	recClear := httptest.NewRecorder()
+	p.ServeHTTP(recClear, reqClear)
+
+	if recClear.Code != http.StatusOK {
+		t.Fatalf("expected 200 from clear alias, got %d: %s", recClear.Code, recClear.Body.String())
+	}
+
+	aliasesAfter := loadWorkspaceAliases()
+	if _, exists := aliasesAfter[normKey]; exists {
+		t.Errorf("expected alias to be deleted, but still exists: %v", aliasesAfter[normKey])
+	}
+}
+
+func TestSidecarProjectsIgnoredAndNotOverwriting(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+	t.Setenv("APPDATA", tmpHome)
+	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", filepath.Join(tmpHome, ".gemini", "antigravity"))
+	t.Setenv("MULTIGRAVITY_DATA_DIR", filepath.Join(tmpHome, "mgy-data"))
+
+	cfgRoot := filepath.Join(tmpHome, ".gemini", "config")
+	projCfgDir := filepath.Join(cfgRoot, "projects")
+	if err := os.MkdirAll(projCfgDir, 0755); err != nil {
+		t.Fatalf("failed to create projects dir: %v", err)
+	}
+
+	wsDir := filepath.Join(tmpHome, "Websites", "hejvip-deep-research")
+	if err := os.MkdirAll(wsDir, 0755); err != nil {
+		t.Fatalf("failed to create workspace dir: %v", err)
+	}
+	wsURI := "file://" + filepath.ToSlash(wsDir)
+
+	realID := "0446b504-3d27-41e2-9a6b-ed8a5beff1df"
+	sidecarID := "05621556-c9bc-4ea8-a876-58580b28555c"
+
+	// Write config.json with sidecar mapping
+	configJSON := fmt.Sprintf(`{
+		"sidecars": {
+			"deep-research-git": {
+				"enabled": true,
+				"projectId": %q,
+				"schemaVersion": 1
+			}
+		}
+	}`, sidecarID)
+	if err := os.WriteFile(filepath.Join(cfgRoot, "config.json"), []byte(configJSON), 0644); err != nil {
+		t.Fatalf("failed to write config.json: %v", err)
+	}
+
+	// Write both real project JSON and sidecar shadow project JSON pointing to the same folderUri
+	realProjJSON := fmt.Sprintf(`{
+		"id": %q,
+		"name": "hejvip-deep-research",
+		"projectResources": {
+			"resources": [{"gitFolder": {"folderUri": %q}}]
+		}
+	}`, realID, wsURI)
+	sidecarProjJSON := fmt.Sprintf(`{
+		"id": %q,
+		"name": "deep-research-git",
+		"projectResources": {
+			"resources": [{"gitFolder": {"folderUri": %q}}]
+		}
+	}`, sidecarID, wsURI)
+
+	_ = os.WriteFile(filepath.Join(projCfgDir, realID+".json"), []byte(realProjJSON), 0644)
+	_ = os.WriteFile(filepath.Join(projCfgDir, sidecarID+".json"), []byte(sidecarProjJSON), 0644)
+
+	// Write app_storage.json where sidecarID appears after realID in projectsOrder
+	appSupportDir := filepath.Join(tmpHome, "Antigravity")
+	_ = os.MkdirAll(appSupportDir, 0755)
+	appStorageJSON := fmt.Sprintf(`{
+		"projectsOrder": "[%q,%q]"
+	}`, realID, sidecarID)
+	_ = os.WriteFile(filepath.Join(appSupportDir, "app_storage.json"), []byte(appStorageJSON), 0644)
+
+	mockUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/ReadProjects") {
+			resp := fmt.Sprintf(`{
+				"projects": [
+					{
+						"id": %q,
+						"name": "hejvip-deep-research",
+						"projectResources": {"resources": [{"gitFolder": {"folderUri": %q}}]}
+					},
+					{
+						"id": %q,
+						"name": "deep-research-git",
+						"projectResources": {"resources": [{"gitFolder": {"folderUri": %q}}]}
+					}
+				]
+			}`, realID, wsURI, sidecarID, wsURI)
+			w.Write([]byte(resp))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/GetAllCascadeTrajectories") {
+			w.Write([]byte(`{"trajectorySummaries":{}}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer mockUpstream.Close()
+
+	port := mockUpstream.Listener.Addr().(*net.TCPAddr).Port
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	p.activePort = port
+	p.activeToken = "test-token"
+
+	projects, err := p.GetProjects()
+	if err != nil {
+		t.Fatalf("GetProjects failed: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 deduplicated project, got %d: %+v", len(projects), projects)
+	}
+	if projects[0].ID != realID {
+		t.Errorf("expected ID %q, got %q", realID, projects[0].ID)
+	}
+	if projects[0].Name != "hejvip-deep-research" {
+		t.Errorf("expected Name 'hejvip-deep-research', got %q", projects[0].Name)
+	}
+}
+
+func TestIsDriveRoot(t *testing.T) {
+	driveRoots := []string{
+		"C:\\", "c:\\", "D:\\", "d:\\", "Z:\\",
+		"C:", "d:", "D:/", "/", "\\", ".", "",
+	}
+	for _, dr := range driveRoots {
+		if !isDriveRoot(dr) {
+			t.Errorf("expected isDriveRoot(%q) to be true, got false", dr)
+		}
+	}
+
+	validPaths := []string{
+		"C:\\Projects\\app",
+		"D:\\Documents\\Work",
+		"/home/user/project",
+		"/var/www/site",
+	}
+	for _, vp := range validPaths {
+		if isDriveRoot(vp) {
+			t.Errorf("expected isDriveRoot(%q) to be false, got true", vp)
+		}
+	}
+}
+
+func TestGetProjects_StrictOfficialAlignment(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Official project config
+	cfgDir := filepath.Join(tmpDir, "config", "projects")
+	_ = os.MkdirAll(cfgDir, 0755)
+	officialProjDir := filepath.Join(tmpDir, "OfficialApp")
+	_ = os.MkdirAll(officialProjDir, 0755)
+
+	officialJSON := fmt.Sprintf(`{
+		"id": "proj-official-uuid-1",
+		"name": "OfficialApp",
+		"projectResources": {
+			"resources": [
+				{
+					"gitFolder": {
+						"folderUri": "file://%s",
+						"defaultBranch": "main"
+					}
+				}
+			]
+		},
+		"isWorkspaceOnly": false
+	}`, filepath.ToSlash(officialProjDir))
+	_ = os.WriteFile(filepath.Join(cfgDir, "proj-official-uuid-1.json"), []byte(officialJSON), 0644)
+
+	// 2. Dirty workspaceStorage cache (with random folder and drive root)
+	wsDir := filepath.Join(tmpDir, "Antigravity", "User", "workspaceStorage")
+	dirtyFolder1 := filepath.Join(wsDir, "dirty-1")
+	dirtyFolder2 := filepath.Join(wsDir, "dirty-2")
+	_ = os.MkdirAll(dirtyFolder1, 0755)
+	_ = os.MkdirAll(dirtyFolder2, 0755)
+
+	dirtyDir := filepath.Join(tmpDir, "DirtyCachedFolder")
+	_ = os.MkdirAll(dirtyDir, 0755)
+	_ = os.WriteFile(filepath.Join(dirtyFolder1, "workspace.json"), []byte(fmt.Sprintf(`{"folder":"file://%s"}`, filepath.ToSlash(dirtyDir))), 0644)
+	_ = os.WriteFile(filepath.Join(dirtyFolder2, "workspace.json"), []byte(`{"folder":"file:///d%3A/"}`), 0644)
+
+	origAppData := os.Getenv("APPDATA")
+	origAppDataDir := os.Getenv("ANTIGRAVITY_APP_DATA_DIR")
+	origCacheEnv := os.Getenv("MGY_INCLUDE_WORKSPACE_CACHE")
+	origHome := os.Getenv("HOME")
+	origUserProfile := os.Getenv("USERPROFILE")
+
+	os.Setenv("APPDATA", tmpDir)
+	os.Setenv("ANTIGRAVITY_APP_DATA_DIR", filepath.Join(tmpDir, "antigravity"))
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("USERPROFILE", tmpDir)
+	os.Unsetenv("MGY_INCLUDE_WORKSPACE_CACHE")
+	defer func() {
+		os.Setenv("APPDATA", origAppData)
+		os.Setenv("ANTIGRAVITY_APP_DATA_DIR", origAppDataDir)
+		os.Setenv("HOME", origHome)
+		os.Setenv("USERPROFILE", origUserProfile)
+		if origCacheEnv != "" {
+			os.Setenv("MGY_INCLUDE_WORKSPACE_CACHE", origCacheEnv)
+		} else {
+			os.Unsetenv("MGY_INCLUDE_WORKSPACE_CACHE")
+		}
+	}()
+
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+
+	// By default, strict alignment should only yield the official project
+	projects, err := p.GetProjects()
+	if err != nil {
+		t.Fatalf("GetProjects failed: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected strictly 1 official project, got %d: %+v", len(projects), projects)
+	}
+	if projects[0].Name != "OfficialApp" {
+		t.Errorf("expected project name 'OfficialApp', got %q", projects[0].Name)
+	}
+	if projects[0].ID != "proj-official-uuid-1" {
+		t.Errorf("expected project ID 'proj-official-uuid-1', got %q", projects[0].ID)
+	}
+
+	// When MGY_INCLUDE_WORKSPACE_CACHE=true, dirty cache is allowed, but drive root is still filtered out
+	os.Setenv("MGY_INCLUDE_WORKSPACE_CACHE", "true")
+	projectsWithCache, err := p.GetProjects()
+	if err != nil {
+		t.Fatalf("GetProjects with cache failed: %v", err)
+	}
+	if len(projectsWithCache) != 2 {
+		t.Fatalf("expected 2 projects (official + dirty folder, root filtered), got %d: %+v", len(projectsWithCache), projectsWithCache)
+	}
+	for _, prj := range projectsWithCache {
+		if prj.Name == "\\" || prj.Name == "/" || prj.Path == "d:\\" || prj.Path == "d:/" {
+			t.Errorf("drive root was not filtered: %+v", prj)
+		}
+	}
+}
+
+func TestBuildWorkspaceDisplayNameResolver(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", filepath.Join(tmpHome, ".gemini", "antigravity"))
+	t.Setenv("MULTIGRAVITY_DATA_DIR", filepath.Join(tmpHome, ".multigravity"))
+	t.Setenv("APPDATA", "")
+
+	cfgDir := filepath.Join(tmpHome, ".gemini", "config")
+	projDir := filepath.Join(cfgDir, "projects")
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	mkRepo := func(name string) string {
+		dir := filepath.Join(tmpHome, "Projects", name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	fileURI := func(dir string) string { return "file://" + filepath.ToSlash(dir) }
+	writeProject := func(id, name, dir string) {
+		cfg := fmt.Sprintf(`{"id": %q, "name": %q, "projectResources": {"resources": [{"gitFolder": {"folderUri": %q}}]}}`,
+			id, name, fileURI(dir))
+		if err := os.WriteFile(filepath.Join(projDir, id+".json"), []byte(cfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repoDir := mkRepo("wechat-bot")
+	aliasDir := mkRepo("alias-repo")
+	sidecarDir := mkRepo("sidecar-repo")
+	writeProject("proj-truck-9000", "Truck9000", repoDir)
+	writeProject("proj-alias", "AliasProj", aliasDir)
+
+	// Sidecar shadow project: declared in config.json and only visible through the ReadProjects cache.
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"sidecars": {"sc-1": {"projectId": "proj-sidecar"}}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Workspace alias for aliasDir must take priority over the project's official name.
+	if err := saveWorkspaceAlias(aliasDir, "别名项目"); err != nil {
+		t.Fatal(err)
+	}
+
+	insp := inspector.NewInspector(5 * time.Second)
+	p := NewProxy(insp)
+	p.projectsCacheMu.Lock()
+	p.lastReadProjectsResp = []byte(fmt.Sprintf(
+		`{"projects": [{"id": "proj-sidecar", "name": "Scheduled Task", "projectResources": {"resources": [{"folderUri": %q}]}}]}`,
+		fileURI(sidecarDir)))
+	p.projectsCacheMu.Unlock()
+	resolve := p.BuildWorkspaceDisplayNameResolver()
+
+	// 1. Resolve by projectId even when folder name differs ("wechat-bot" vs "Truck9000")
+	if pid, disp := resolve("proj-truck-9000", []string{fileURI(repoDir)}); pid != "proj-truck-9000" || disp != "Truck9000" {
+		t.Fatalf("expected (proj-truck-9000, Truck9000), got (%q, %q)", pid, disp)
+	}
+
+	// 2. Backfill projectId and display name from workspaceURI when projectId is missing
+	if pid, disp := resolve("", []string{fileURI(repoDir)}); pid != "proj-truck-9000" || disp != "Truck9000" {
+		t.Fatalf("expected backfilled (proj-truck-9000, Truck9000), got (%q, %q)", pid, disp)
+	}
+
+	// 3. Workspace alias wins over the official project name
+	if pid, disp := resolve("proj-alias", nil); pid != "proj-alias" || disp != "别名项目" {
+		t.Fatalf("expected (proj-alias, 别名项目), got (%q, %q)", pid, disp)
+	}
+
+	// 4. Sidecar shadow projects must never be resolved or back-filled
+	for _, inputPID := range []string{"", "proj-sidecar", "outside-of-project"} {
+		if pid, disp := resolve(inputPID, []string{fileURI(sidecarDir)}); pid != "" || disp != "" {
+			t.Fatalf("input %q: expected sidecar workspace to stay unresolved, got (%q, %q)", inputPID, pid, disp)
+		}
+	}
+
+	// 5. A known-but-unregistered projectId must not borrow another project's name via its folder
+	if pid, disp := resolve("proj-unknown", []string{fileURI(repoDir)}); pid != "proj-unknown" || disp == "Truck9000" {
+		t.Fatalf("expected (proj-unknown, not Truck9000), got (%q, %q)", pid, disp)
+	}
+}

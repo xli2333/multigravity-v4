@@ -1,0 +1,526 @@
+package proxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type trajectoryCacheEntry struct {
+	fetchedAt time.Time
+	port      int
+	data      *upstreamTrajectoryResp
+	rawJSON   []byte
+	parsedSig string
+	parsed    *TrajectoryDetails
+}
+
+const maxTrajCacheSize = 50 // Maximum number of cached trajectory entries to prevent unbounded memory growth
+
+// metadataCacheEntry caches the result of reading a .metadata.json file.
+type metadataCacheEntry struct {
+	hasMeta         bool
+	meta            ArtifactMetadata
+	requestFeedback bool
+	fetchedAt       time.Time
+}
+
+// annotationTitleCacheEntry caches the parsed title from an annotation .pbtxt file.
+type annotationTitleCacheEntry struct {
+	title     string
+	fetchedAt time.Time
+}
+
+const (
+	maxMetadataMapSize = 256
+	annotationCacheTTL = 5 * time.Second
+)
+
+// TrajectoryCache encapsulates all mutable trajectory-related state with proper synchronization.
+// It replaces scattered package-level vars, enabling clean lifecycle management and testability.
+type TrajectoryCache struct {
+	trajCache   map[string]*trajectoryCacheEntry
+	trajCacheMu sync.RWMutex
+	// genByID tracks per-cascade invalidation generations (under trajCacheMu) so ClearTrajectoryCache(A)
+	// prevents pre-invalidation fetches of A from repopulating trajCache without dropping concurrent fetches of B.
+	genByID map[string]uint64
+
+	cascadeTitles        map[string]string
+	cascadeTitleFallback map[string]bool
+	cascadeTitlesMu      sync.RWMutex
+	lastTitlesFetchTime  time.Time
+
+	lastKnownConfig   json.RawMessage
+	lastKnownConfigMu sync.RWMutex
+
+	cascadeConfigs   map[string]json.RawMessage
+	cascadeConfigsMu sync.RWMutex
+
+	cascadeModels   map[string]string
+	cascadeModelsMu sync.RWMutex
+
+	loadedCascades   map[string]bool
+	loadedCascadesMu sync.RWMutex
+	lastSyncedPort   int
+
+	deletedCascades   map[string]time.Time
+	deletedCascadesMu sync.RWMutex
+
+	// metadataCache caches .metadata.json requestFeedback results (TTL: 10s) to avoid
+	// repeated os.ReadFile calls during the 250ms WebSocket stream polling loop.
+	metadataCache   map[string]*metadataCacheEntry
+	metadataCacheMu sync.RWMutex
+
+	// annotationTitleCache caches parsed .pbtxt annotation titles (TTL: 5s) to eliminate
+	// hot-path disk I/O during stream polling and status inquiries.
+	annotationTitleCache   map[string]*annotationTitleCacheEntry
+	annotationTitleCacheMu sync.RWMutex
+}
+
+// NewTrajectoryCache creates a new TrajectoryCache with initialized maps.
+func NewTrajectoryCache() *TrajectoryCache {
+	return &TrajectoryCache{
+		trajCache:            make(map[string]*trajectoryCacheEntry),
+		genByID:              make(map[string]uint64),
+		cascadeTitles:        make(map[string]string),
+		cascadeTitleFallback: make(map[string]bool),
+		cascadeConfigs:       make(map[string]json.RawMessage),
+		cascadeModels:        make(map[string]string),
+		loadedCascades:       make(map[string]bool),
+		deletedCascades:      make(map[string]time.Time),
+		metadataCache:        make(map[string]*metadataCacheEntry),
+		annotationTitleCache: make(map[string]*annotationTitleCacheEntry),
+	}
+}
+
+const maxCascadeTitlesSize = 1024
+
+// setCachedCascadeTitle records an authoritative title (from annotations, .pbtxt, or upstream summary)
+// using an RLock fast-path when unchanged.
+func setCachedCascadeTitle(cascadeID, title string) {
+	if cascadeID == "" || title == "" || title == "未命名会话" {
+		return
+	}
+	defaultTrajCache.cascadeTitlesMu.RLock()
+	cur, ok := defaultTrajCache.cascadeTitles[cascadeID]
+	isFallback := defaultTrajCache.cascadeTitleFallback[cascadeID]
+	defaultTrajCache.cascadeTitlesMu.RUnlock()
+	if ok && !isFallback && cur == title {
+		return
+	}
+	defaultTrajCache.cascadeTitlesMu.Lock()
+	if defaultTrajCache.cascadeTitleFallback == nil {
+		defaultTrajCache.cascadeTitleFallback = make(map[string]bool)
+	}
+	if len(defaultTrajCache.cascadeTitles) >= maxCascadeTitlesSize {
+		// Batch prune ~25% when bounded cap is reached
+		removed := 0
+		for k := range defaultTrajCache.cascadeTitles {
+			delete(defaultTrajCache.cascadeTitles, k)
+			delete(defaultTrajCache.cascadeTitleFallback, k)
+			removed++
+			if removed >= maxCascadeTitlesSize/4 {
+				break
+			}
+		}
+	}
+	defaultTrajCache.cascadeTitles[cascadeID] = title
+	delete(defaultTrajCache.cascadeTitleFallback, cascadeID)
+	defaultTrajCache.cascadeTitlesMu.Unlock()
+}
+
+// setCachedCascadeTitleFallback records a temporary prompt-derived fallback title.
+// It never overwrites an existing authoritative title for the same cascade.
+func setCachedCascadeTitleFallback(cascadeID, title string) {
+	if cascadeID == "" || title == "" || title == "未命名会话" {
+		return
+	}
+	defaultTrajCache.cascadeTitlesMu.RLock()
+	cur, ok := defaultTrajCache.cascadeTitles[cascadeID]
+	isFallback := defaultTrajCache.cascadeTitleFallback[cascadeID]
+	defaultTrajCache.cascadeTitlesMu.RUnlock()
+	if ok && (!isFallback || cur == title) {
+		return
+	}
+	defaultTrajCache.cascadeTitlesMu.Lock()
+	if defaultTrajCache.cascadeTitleFallback == nil {
+		defaultTrajCache.cascadeTitleFallback = make(map[string]bool)
+	}
+	if cur, exists := defaultTrajCache.cascadeTitles[cascadeID]; exists && cur != "" && !defaultTrajCache.cascadeTitleFallback[cascadeID] {
+		defaultTrajCache.cascadeTitlesMu.Unlock()
+		return
+	}
+	if len(defaultTrajCache.cascadeTitles) >= maxCascadeTitlesSize {
+		removed := 0
+		for k := range defaultTrajCache.cascadeTitles {
+			delete(defaultTrajCache.cascadeTitles, k)
+			delete(defaultTrajCache.cascadeTitleFallback, k)
+			removed++
+			if removed >= maxCascadeTitlesSize/4 {
+				break
+			}
+		}
+	}
+	defaultTrajCache.cascadeTitles[cascadeID] = title
+	defaultTrajCache.cascadeTitleFallback[cascadeID] = true
+	defaultTrajCache.cascadeTitlesMu.Unlock()
+}
+
+// getAuthoritativeCachedCascadeTitle returns a cached title only if it came from an
+// authoritative source (not a first-user-prompt fallback).
+func getAuthoritativeCachedCascadeTitle(cascadeID string) string {
+	if cascadeID == "" {
+		return ""
+	}
+	defaultTrajCache.cascadeTitlesMu.RLock()
+	title := defaultTrajCache.cascadeTitles[cascadeID]
+	isFallback := defaultTrajCache.cascadeTitleFallback[cascadeID]
+	defaultTrajCache.cascadeTitlesMu.RUnlock()
+	if isFallback || title == "" || title == "未命名会话" {
+		return ""
+	}
+	return title
+}
+
+// maxDeletedCascades is the upper bound on in-memory deletion tombstones.
+const maxDeletedCascades = 1024
+
+// RecordDeletedCascade marks a cascade as recently deleted with a TTL.
+func RecordDeletedCascade(cascadeID string) {
+	if cascadeID == "" {
+		return
+	}
+	InvalidateCascadeValidCache(cascadeID)
+
+	defaultTrajCache.cascadeModelsMu.Lock()
+	if defaultTrajCache.cascadeModels != nil {
+		delete(defaultTrajCache.cascadeModels, cascadeID)
+	}
+	defaultTrajCache.cascadeModelsMu.Unlock()
+
+	defaultTrajCache.cascadeConfigsMu.Lock()
+	if defaultTrajCache.cascadeConfigs != nil {
+		delete(defaultTrajCache.cascadeConfigs, cascadeID)
+	}
+	defaultTrajCache.cascadeConfigsMu.Unlock()
+
+	defaultTrajCache.deletedCascadesMu.Lock()
+	defer defaultTrajCache.deletedCascadesMu.Unlock()
+	// PERF-2: evict expired tombstones when map grows too large.
+	if len(defaultTrajCache.deletedCascades) >= maxDeletedCascades {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		for k, t := range defaultTrajCache.deletedCascades {
+			if t.Before(cutoff) {
+				delete(defaultTrajCache.deletedCascades, k)
+			}
+		}
+	}
+	defaultTrajCache.deletedCascades[cascadeID] = time.Now()
+}
+
+// RemoveDeletedCascadeTombstone removes a tombstone if deletion failed upstream.
+func RemoveDeletedCascadeTombstone(cascadeID string) {
+	if cascadeID == "" {
+		return
+	}
+	defaultTrajCache.deletedCascadesMu.Lock()
+	defer defaultTrajCache.deletedCascadesMu.Unlock()
+	delete(defaultTrajCache.deletedCascades, cascadeID)
+}
+
+// IsDeletedCascade returns true if the cascade was recently deleted within tombstone TTL (10m).
+func IsDeletedCascade(cascadeID string) bool {
+	if cascadeID == "" {
+		return false
+	}
+	defaultTrajCache.deletedCascadesMu.RLock()
+	deletedAt, exists := defaultTrajCache.deletedCascades[cascadeID]
+	defaultTrajCache.deletedCascadesMu.RUnlock()
+	if !exists {
+		return false
+	}
+	if time.Since(deletedAt) < 10*time.Minute {
+		return true
+	}
+	// Expired tombstone, clean it up
+	defaultTrajCache.deletedCascadesMu.Lock()
+	delete(defaultTrajCache.deletedCascades, cascadeID)
+	defaultTrajCache.deletedCascadesMu.Unlock()
+	return false
+}
+
+// ResetHistoricalSyncState clears the loaded cascades map and resets the last synced port,
+// allowing a fresh sync of all historical sessions from disk.
+func ResetHistoricalSyncState() {
+	defaultTrajCache.loadedCascadesMu.Lock()
+	defer defaultTrajCache.loadedCascadesMu.Unlock()
+	defaultTrajCache.loadedCascades = make(map[string]bool)
+	defaultTrajCache.lastSyncedPort = 0
+}
+
+// HasSyncedHistoricalTrajectories returns whether historical trajectories have already been synced for this port.
+func HasSyncedHistoricalTrajectories(port int) bool {
+	defaultTrajCache.loadedCascadesMu.RLock()
+	defer defaultTrajCache.loadedCascadesMu.RUnlock()
+	return port > 0 && port == defaultTrajCache.lastSyncedPort
+}
+
+// evictTrajCacheLocked removes the oldest entries when cache exceeds maxTrajCacheSize.
+// MUST be called while holding tc.trajCacheMu.
+// Uses sort-based batch removal: O(n log n) instead of O(n²).
+func (tc *TrajectoryCache) evictTrajCacheLocked() {
+	if len(tc.trajCache) <= maxTrajCacheSize {
+		return
+	}
+	type keyTime struct {
+		key string
+		t   time.Time
+	}
+	items := make([]keyTime, 0, len(tc.trajCache))
+	for k, v := range tc.trajCache {
+		items = append(items, keyTime{key: k, t: v.fetchedAt})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].t.Before(items[j].t)
+	})
+	// Remove oldest entries until we're at the limit
+	removeCount := len(tc.trajCache) - maxTrajCacheSize
+	for i := 0; i < removeCount; i++ {
+		delete(tc.trajCache, items[i].key)
+	}
+}
+
+// defaultTrajCache is the package-level TrajectoryCache instance used by Proxy.
+// It is initialized here and assigned as a field of Proxy in NewProxy.
+var defaultTrajCache = NewTrajectoryCache()
+
+// readMetadataRequestFeedback reads the requestFeedback field from a .metadata.json file,
+// caching results for metadataCacheTTL to avoid repeated os.ReadFile calls during stream polling.
+const metadataCacheTTL = 10 * time.Second
+
+func readCachedArtifactMetadata(filePath string) (ArtifactMetadata, bool) {
+	defaultTrajCache.metadataCacheMu.RLock()
+	if entry, ok := defaultTrajCache.metadataCache[filePath]; ok {
+		if time.Since(entry.fetchedAt) < metadataCacheTTL {
+			meta, hasMeta := entry.meta, entry.hasMeta
+			defaultTrajCache.metadataCacheMu.RUnlock()
+			return meta, hasMeta
+		}
+	}
+	defaultTrajCache.metadataCacheMu.RUnlock()
+
+	var parsed ArtifactMetadata
+	hasMeta := false
+	if metaData, err := os.ReadFile(filePath); err == nil {
+		if err := json.Unmarshal(metaData, &parsed); err == nil {
+			hasMeta = true
+		}
+	}
+
+	defaultTrajCache.metadataCacheMu.Lock()
+	if defaultTrajCache.metadataCache == nil {
+		defaultTrajCache.metadataCache = make(map[string]*metadataCacheEntry)
+	}
+	if len(defaultTrajCache.metadataCache) > maxMetadataMapSize {
+		now := time.Now()
+		for k, v := range defaultTrajCache.metadataCache {
+			if now.Sub(v.fetchedAt) > metadataCacheTTL {
+				delete(defaultTrajCache.metadataCache, k)
+			}
+		}
+	}
+	defaultTrajCache.metadataCache[filePath] = &metadataCacheEntry{
+		hasMeta:         hasMeta,
+		meta:            parsed,
+		requestFeedback: parsed.RequestFeedback,
+		fetchedAt:       time.Now(),
+	}
+	defaultTrajCache.metadataCacheMu.Unlock()
+	return parsed, hasMeta
+}
+
+func readMetadataRequestFeedback(filePath string) bool {
+	meta, ok := readCachedArtifactMetadata(filePath)
+	return ok && meta.RequestFeedback
+}
+
+func (tc *TrajectoryCache) cascadeGenLocked(cascadeID string) uint64 {
+	if tc.genByID == nil {
+		return 0
+	}
+	return tc.genByID[cascadeID]
+}
+
+func (tc *TrajectoryCache) bumpCascadeGenLocked(cascadeID string) {
+	if cascadeID == "" {
+		return
+	}
+	if tc.genByID == nil {
+		tc.genByID = make(map[string]uint64)
+	}
+	if len(tc.genByID) > 1024 {
+		for k := range tc.genByID {
+			if _, active := tc.trajCache[k]; !active && k != cascadeID {
+				delete(tc.genByID, k)
+			}
+		}
+	}
+	tc.genByID[cascadeID] = tc.genByID[cascadeID] + 1
+}
+
+// ClearTrajectoryCache invalidates cached trajectory for an updated cascade.
+func ClearTrajectoryCache(cascadeID string) {
+	if cascadeID == "" {
+		return
+	}
+	defaultTrajCache.trajCacheMu.Lock()
+	delete(defaultTrajCache.trajCache, cascadeID)
+	defaultTrajCache.bumpCascadeGenLocked(cascadeID)
+	defaultTrajCache.trajCacheMu.Unlock()
+	// Callers arriving after the invalidation must not join a fetch that may predate it.
+	trajFlights.forget(cascadeID)
+
+	defaultTrajCache.cascadeTitlesMu.Lock()
+	delete(defaultTrajCache.cascadeTitles, cascadeID)
+	delete(defaultTrajCache.cascadeTitleFallback, cascadeID)
+	defaultTrajCache.lastTitlesFetchTime = time.Time{}
+	defaultTrajCache.cascadeTitlesMu.Unlock()
+
+	defaultTrajCache.loadedCascadesMu.Lock()
+	delete(defaultTrajCache.loadedCascades, cascadeID)
+	defaultTrajCache.loadedCascadesMu.Unlock()
+
+	defaultTrajCache.annotationTitleCacheMu.Lock()
+	if defaultTrajCache.annotationTitleCache != nil {
+		delete(defaultTrajCache.annotationTitleCache, cascadeID)
+	}
+	defaultTrajCache.annotationTitleCacheMu.Unlock()
+
+	InvalidateCascadeValidCache(cascadeID)
+}
+
+func readAnnotationTitle(cascadeID string) string {
+	if cascadeID == "" || !cascadeIDRe.MatchString(cascadeID) {
+		return ""
+	}
+
+	// 1. Check in-memory annotation title cache (TTL: 5s)
+	defaultTrajCache.annotationTitleCacheMu.RLock()
+	if entry, ok := defaultTrajCache.annotationTitleCache[cascadeID]; ok {
+		if time.Since(entry.fetchedAt) < annotationCacheTTL {
+			defaultTrajCache.annotationTitleCacheMu.RUnlock()
+			return entry.title
+		}
+	}
+	defaultTrajCache.annotationTitleCacheMu.RUnlock()
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	p := filepath.Join(home, ".gemini", "antigravity", "annotations", cascadeID+".pbtxt")
+	b, err := os.ReadFile(p)
+	title := ""
+	if err == nil {
+		m := titleRegex.FindSubmatch(b)
+		if len(m) > 1 {
+			title = string(m[1])
+		}
+	}
+
+	// Update cache
+	defaultTrajCache.annotationTitleCacheMu.Lock()
+	if defaultTrajCache.annotationTitleCache == nil {
+		defaultTrajCache.annotationTitleCache = make(map[string]*annotationTitleCacheEntry)
+	}
+	if len(defaultTrajCache.annotationTitleCache) > maxMetadataMapSize {
+		cutoff := time.Now().Add(-annotationCacheTTL)
+		for k, v := range defaultTrajCache.annotationTitleCache {
+			if v.fetchedAt.Before(cutoff) {
+				delete(defaultTrajCache.annotationTitleCache, k)
+			}
+		}
+	}
+	defaultTrajCache.annotationTitleCache[cascadeID] = &annotationTitleCacheEntry{
+		title:     title,
+		fetchedAt: time.Now(),
+	}
+	defaultTrajCache.annotationTitleCacheMu.Unlock()
+
+	return title
+}
+
+func writeAnnotationTitle(cascadeID, title string) {
+	if cascadeID == "" || !cascadeIDRe.MatchString(cascadeID) || strings.TrimSpace(title) == "" || title == "未命名会话" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".gemini", "antigravity", "annotations")
+	_ = os.MkdirAll(dir, 0700)
+	p := filepath.Join(dir, cascadeID+".pbtxt")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		content := fmt.Sprintf("title: %q\n", title)
+		// SEC-8: 0600 — annotation files contain conversation titles, owner-only.
+		_ = os.WriteFile(p, []byte(content), 0600)
+	} else {
+		s := string(b)
+		if titleRegex.MatchString(s) {
+			newContent := titleRegex.ReplaceAllString(s, fmt.Sprintf("title: %q", title))
+			_ = os.WriteFile(p, []byte(newContent), 0600)
+		} else {
+			newContent := fmt.Sprintf("title: %q\n%s", title, s)
+			_ = os.WriteFile(p, []byte(newContent), 0600)
+		}
+	}
+
+	// Immediately update annotationTitleCache
+	defaultTrajCache.annotationTitleCacheMu.Lock()
+	if defaultTrajCache.annotationTitleCache != nil {
+		defaultTrajCache.annotationTitleCache[cascadeID] = &annotationTitleCacheEntry{
+			title:     title,
+			fetchedAt: time.Now(),
+		}
+	}
+	defaultTrajCache.annotationTitleCacheMu.Unlock()
+}
+
+var pinnedRegex = regexp.MustCompile(`pinned:\s*(true|false)`)
+
+func writeAnnotationPinned(cascadeID string, pinned bool) {
+	if cascadeID == "" || !cascadeIDRe.MatchString(cascadeID) {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".gemini", "antigravity", "annotations")
+	_ = os.MkdirAll(dir, 0700)
+	p := filepath.Join(dir, cascadeID+".pbtxt")
+	b, err := os.ReadFile(p)
+	pinnedStr := fmt.Sprintf("pinned:%t", pinned)
+	if err != nil {
+		// SEC-8: 0600 — annotation files contain conversation metadata, owner-only.
+		_ = os.WriteFile(p, []byte(pinnedStr+"\n"), 0600)
+	} else {
+		s := string(b)
+		if pinnedRegex.MatchString(s) {
+			newContent := pinnedRegex.ReplaceAllString(s, pinnedStr)
+			_ = os.WriteFile(p, []byte(newContent), 0600)
+		} else {
+			newContent := strings.TrimRight(s, "\n") + " " + pinnedStr + "\n"
+			_ = os.WriteFile(p, []byte(newContent), 0600)
+		}
+	}
+}
+

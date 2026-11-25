@@ -1,0 +1,181 @@
+import SwiftUI
+import Photos
+
+public struct MessageBubbleView: View {
+    @Environment(\.openURL) var openURL
+    @Environment(\.colorScheme) var colorScheme
+    public let message: ChatMessage
+    public let isActiveToolBatch: Bool
+    public let isActivePlan: Bool
+    public let canProceed: Bool
+    public let proceedArtifactUri: String?
+    public let onProceed: (() -> Void)?
+    public let onUndo: ((ChatMessage) -> Void)?
+    let onExportMarkdown: (() -> Void)?
+    let onCompact: (() -> Void)?
+    let onStartNewSession: (() -> Void)?
+    let onStopWorkflow: (() async -> Void)?
+    let onSelectSubagent: ((SubagentItem) -> Void)?
+    let onFork: ((ChatMessage) -> Void)?
+    let onNarrate: ((String) -> Void)?
+    let onAskBtw: ((String) -> Void)?
+    let makeShareContext: (() -> ShareCardContext)?
+    @State var showShareCard: Bool = false
+    @State var isThinkingExpanded: Bool = false
+    
+    @State var previewGallery: ImageGalleryData? = nil
+    @State var showTextSelectionSheet: Bool = false
+    
+    init(
+        message: ChatMessage,
+        isActiveToolBatch: Bool = false,
+        isActivePlan: Bool = false,
+        canProceed: Bool = false,
+        proceedArtifactUri: String? = nil,
+        onProceed: (() -> Void)? = nil,
+        onUndo: ((ChatMessage) -> Void)? = nil,
+        onExportMarkdown: (() -> Void)? = nil,
+        onCompact: (() -> Void)? = nil,
+        onStartNewSession: (() -> Void)? = nil,
+        onStopWorkflow: (() async -> Void)? = nil,
+        onSelectSubagent: ((SubagentItem) -> Void)? = nil,
+        onFork: ((ChatMessage) -> Void)? = nil,
+        onNarrate: ((String) -> Void)? = nil,
+        onAskBtw: ((String) -> Void)? = nil,
+        makeShareContext: (() -> ShareCardContext)? = nil
+    ) {
+        self.message = message
+        self.isActiveToolBatch = isActiveToolBatch
+        self.isActivePlan = isActivePlan
+        self.canProceed = canProceed
+        self.proceedArtifactUri = proceedArtifactUri
+        self.onProceed = onProceed
+        self.onUndo = onUndo
+        self.onExportMarkdown = onExportMarkdown
+        self.onCompact = onCompact
+        self.onStartNewSession = onStartNewSession
+        self.onStopWorkflow = onStopWorkflow
+        self.onSelectSubagent = onSelectSubagent
+        self.onFork = onFork
+        self.onNarrate = onNarrate
+        self.onAskBtw = onAskBtw
+        self.makeShareContext = makeShareContext
+    }
+    
+    public var body: some View {
+        Group {
+            switch message.sender {
+            case .user:
+                HStack(alignment: .bottom, spacing: 8) {
+                    Spacer(minLength: 40)
+                    userBubble
+                }
+            case .agent:
+                HStack(alignment: .bottom, spacing: 8) {
+                    agentBubble
+                    Spacer(minLength: 20)
+                }
+            case .toolBatch(let count, let tools):
+                if isActiveToolBatch {
+                    activeToolBatchCard(count: count, tools: tools)
+                } else if AppSettings.shared.shouldCollapseTools {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                        Text("已完成 \(max(count, tools.count)) 项检索与命令操作")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .padding(.vertical, 2)
+                } else {
+                    ToolBatchAccordionView(
+                        count: count,
+                        tools: tools,
+                        thinking: message.thinking,
+                        thinkingDuration: message.thinkingDuration,
+                        toolDetails: message.toolDetails
+                    )
+                }
+            case .error:
+                if message.isContextOverflow {
+                    rescueOverflowCard
+                } else {
+                    errorCard
+                }
+            case .subagent:
+                if let sa = message.subagent {
+                    SubagentInlineCardView(item: sa)
+                }
+            case .workflow:
+                if let wf = message.workflow {
+                    WorkflowStageCardView(
+                        workflow: wf,
+                        onStopWorkflow: onStopWorkflow,
+                        onSelectSubagent: onSelectSubagent
+                    )
+                }
+            case .stepPlan:
+                if let plan = message.stepPlan {
+                    StepPlanCardView(
+                        plan: plan,
+                        isActivePlan: isActivePlan
+                    )
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 4)
+        .fullScreenCover(item: $previewGallery) { gallery in
+            ImageViewerSheet(gallery: gallery)
+                .presentationBackground(.clear)
+                .ignoresSafeArea()
+        }
+        .sheet(isPresented: $showShareCard) {
+            MessageShareCardSheet(
+                message: message,
+                context: makeShareContext?() ?? ShareCardContext(sessionTitle: "", modelName: nil, previousMessage: nil),
+                extraImages: shareCardImages
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showTextSelectionSheet) {
+            TextSelectionSheet(
+                title: String(localized: "选择文本"),
+                content: agentPlainText
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+    }
+}
+
+extension MessageBubbleView {
+    var shareCardImages: [IdentifiableImage] {
+        if case .user = message.sender { return userAttachmentItems }
+        return fallbackAgentImageURLs.compactMap { URL(string: $0) }.map { IdentifiableImage(url: $0) }
+    }
+    
+    @ViewBuilder
+    var shareLongImageButton: some View {
+        Button {
+            showShareCard = true
+        } label: {
+            Label("分享长图", systemImage: "photo.badge.plus")
+        }
+    }
+    
+    var agentPlainText: String {
+        let converted = MarkdownPlainText.convert(message.content)
+        return converted.isEmpty ? message.content : converted
+    }
+    
+    func copyWholeText(_ text: String) {
+        let formatted = text.hasSuffix("\n") ? text : "\(text)\n"
+        UIPasteboard.general.string = formatted
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        CopiedHUD.show()
+    }
+}

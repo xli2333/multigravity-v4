@@ -1,0 +1,396 @@
+package auth
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func TestWSTicketStore_IssueAndValidate(t *testing.T) {
+	store := NewWSTicketStore()
+
+	ticket, err := store.Issue("device-123")
+	if err != nil {
+		t.Fatalf("Issue failed: %v", err)
+	}
+	if len(ticket) != 40 {
+		t.Fatalf("expected 40-char hex ticket, got %q", ticket)
+	}
+
+	// First validation: should succeed and return deviceID
+	deviceID, ok := store.Validate(ticket)
+	if !ok || deviceID != "device-123" {
+		t.Fatalf("expected validation success for device-123, got ok=%v deviceID=%q", ok, deviceID)
+	}
+
+	// Second validation: should fail (one-time use)
+	deviceID, ok = store.Validate(ticket)
+	if ok || deviceID != "" {
+		t.Fatalf("expected one-time ticket to be consumed, got ok=%v deviceID=%q", ok, deviceID)
+	}
+}
+
+func TestWSTicketStore_Expiration(t *testing.T) {
+	store := NewWSTicketStore()
+
+	ticket, err := store.Issue("device-expired")
+	if err != nil {
+		t.Fatalf("Issue failed: %v", err)
+	}
+
+	// Artificially age the ticket past TTL
+	store.mu.Lock()
+	store.tickets[ticket].createdAt = time.Now().Add(-1 * time.Hour)
+	store.mu.Unlock()
+
+	deviceID, ok := store.Validate(ticket)
+	if ok || deviceID != "" {
+		t.Fatalf("expected expired ticket to fail validation, got ok=%v deviceID=%q", ok, deviceID)
+	}
+}
+
+func TestAuthMiddleware_WSTicketAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewAuthStore(tmpDir + "/auth.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+
+	deviceToken := "valid-device-token-12345"
+	dev := PairedDevice{
+		DeviceID:   "dev-abc",
+		DeviceName: "iPhone 15",
+		Platform:   "ios",
+		TokenHash:  HashToken(deviceToken),
+		CreatedAt:  time.Now(),
+	}
+	if err := store.AddDevice(dev); err != nil {
+		t.Fatal(err)
+	}
+
+	pm := NewPairingManager()
+	authHandler := NewAuthHandler(store, pm, "127.0.0.1", 58900, false)
+
+	// Step 1: Exchange device token for a WS ticket via /api/v1/auth/ws-ticket
+	ticketReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil)
+	ticketReq.Header.Set("Authorization", "Bearer "+deviceToken)
+	ticketRec := httptest.NewRecorder()
+	authHandler.HandleWSTicket(ticketRec, ticketReq)
+
+	if ticketRec.Code != http.StatusOK {
+		t.Fatalf("HandleWSTicket failed with code %d: %s", ticketRec.Code, ticketRec.Body.String())
+	}
+
+	var ticketResp struct {
+		Ticket    string `json:"ticket"`
+		ExpiresIn int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(ticketRec.Body).Decode(&ticketResp); err != nil {
+		t.Fatalf("failed to parse ticket response: %v", err)
+	}
+	if ticketResp.Ticket == "" {
+		t.Fatal("empty ticket returned")
+	}
+
+	// Protected handler
+	var authedDevice *PairedDevice
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authedDevice, _ = DeviceFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	router := AuthMiddlewareWithPolicy(store, next, AuthPolicy{
+		TunnelEnabled:  false,
+		ListenLoopback: false,
+	})
+
+	// Step 2: Use ticket to access WebSocket route /gateway/cascade/stream?cascadeId=test&ticket=...
+	wsReq := httptest.NewRequest(http.MethodGet, "/gateway/cascade/stream?cascadeId=test&ticket="+ticketResp.Ticket, nil)
+	wsReq.Header.Set("Upgrade", "websocket")
+	wsReq.Header.Set("Connection", "Upgrade")
+	wsRec := httptest.NewRecorder()
+
+	router.ServeHTTP(wsRec, wsReq)
+
+	if wsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK using valid ticket, got %d: %s", wsRec.Code, wsRec.Body.String())
+	}
+	if authedDevice == nil || authedDevice.DeviceID != "dev-abc" {
+		t.Fatalf("expected authenticated device dev-abc, got %+v", authedDevice)
+	}
+
+	// Step 3: Reusing the same ticket must fail (one-time use)
+	wsReq2 := httptest.NewRequest(http.MethodGet, "/gateway/cascade/stream?cascadeId=test&ticket="+ticketResp.Ticket, nil)
+	wsReq2.Header.Set("Upgrade", "websocket")
+	wsReq2.Header.Set("Connection", "Upgrade")
+	wsRec2 := httptest.NewRecorder()
+
+	router.ServeHTTP(wsRec2, wsReq2)
+
+	if wsRec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when reusing ticket, got %d", wsRec2.Code)
+	}
+
+	// Give background worker a moment to finish any async last-seen updates before TempDir cleanup
+	time.Sleep(30 * time.Millisecond)
+}
+
+func TestWSTicketStore_DeviceQuotaEviction(t *testing.T) {
+	store := NewWSTicketStore()
+	deviceID := "dev-overflow"
+
+	// Issue maxTicketsPerDevice tickets
+	var tickets []string
+	for i := 0; i < maxTicketsPerDevice; i++ {
+		tkt, err := store.Issue(deviceID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		tickets = append(tickets, tkt)
+		time.Sleep(2 * time.Millisecond) // ensure distinct created times
+	}
+
+	// 6th ticket should evict the 1st ticket (oldest)
+	tkt6, err := store.Issue(deviceID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// First ticket must now be invalid
+	if _, ok := store.Validate(tickets[0]); ok {
+		t.Fatalf("expected oldest ticket to be evicted")
+	}
+
+	// 6th ticket must be valid
+	if id, ok := store.Validate(tkt6); !ok || id != deviceID {
+		t.Fatalf("expected newest ticket to be valid")
+	}
+}
+
+func TestIsWebSocketPath(t *testing.T) {
+	for path, want := range map[string]bool{
+		"/connect-websocket":        true,
+		"/gateway/events":           true,
+		"/gateway/cascade/stream":   true,
+		"/gateway/rpc-mux":          true,
+		"/gateway/terminal/stream":  true,
+		"/gateway/audio/dictate":    true,
+		"/gateway/status":           false,
+		"/gateway/events/extra":     false,
+		"/api/v1/cockpit/quotas":    false,
+	} {
+		if got := isWebSocketPath(path); got != want {
+			t.Errorf("isWebSocketPath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+// /gateway/events must accept a one-time ticket by path alone (no Upgrade header needed to pick the
+// ticket branch), while an ordinary gateway path must not honor a ticket.
+func TestAuthMiddleware_EventsEndpointTicket(t *testing.T) {
+	store, err := NewAuthStore(t.TempDir() + "/auth.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	deviceToken := "valid-device-token-67890"
+	if err := store.AddDevice(PairedDevice{DeviceID: "dev-evt", DeviceName: "Pixel", Platform: "android", TokenHash: HashToken(deviceToken), CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	authHandler := NewAuthHandler(store, NewPairingManager(), "127.0.0.1", 58900, false)
+
+	issue := func() string {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil)
+		req.Header.Set("Authorization", "Bearer "+deviceToken)
+		rec := httptest.NewRecorder()
+		authHandler.HandleWSTicket(rec, req)
+		var resp struct {
+			Ticket string `json:"ticket"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil || resp.Ticket == "" {
+			t.Fatalf("ticket issue failed: %v", err)
+		}
+		return resp.Ticket
+	}
+
+	router := AuthMiddlewareWithPolicy(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), AuthPolicy{})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/gateway/events?ticket="+issue(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/gateway/events with valid ticket: got %d, want 200", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/gateway/status?ticket="+issue(), nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/gateway/status must not accept a ticket: got %d, want 401", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/gateway/events", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/gateway/events without credentials: got %d, want 401", rec.Code)
+	}
+	time.Sleep(30 * time.Millisecond)
+}
+
+func TestHandleWSTicket_ImplicitTrustLoopbackAndRebinding(t *testing.T) {
+	store, err := NewAuthStore(t.TempDir() + "/auth.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	policy := AuthPolicy{ListenLoopback: true}
+	authHandler := NewAuthHandler(store, NewPairingManager(), "127.0.0.1", 58900, false)
+	authHandler.SetAuthPolicy(policy)
+
+	// 1. DNS-rebinding Host on loopback must be rejected (SEC-07)
+	rebindReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil)
+	rebindReq.RemoteAddr = "127.0.0.1:41234"
+	rebindReq.Host = "evil.example.com:58900"
+	rebindRR := httptest.NewRecorder()
+	authHandler.HandleWSTicket(rebindRR, rebindReq)
+	if rebindRR.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for DNS-rebinding ws-ticket request, got %d", rebindRR.Code)
+	}
+
+	// 2. Legitimate loopback ws-ticket request issues an admin-local ticket usable on /gateway/rpc-mux
+	okReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil)
+	okReq.RemoteAddr = "127.0.0.1:41234"
+	okReq.Host = "127.0.0.1:58900"
+	okReq.Header.Set("Origin", "http://127.0.0.1:58900")
+	okRR := httptest.NewRecorder()
+	authHandler.HandleWSTicket(okRR, okReq)
+	if okRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 for legitimate loopback ws-ticket, got %d: %s", okRR.Code, okRR.Body.String())
+	}
+	var resp struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.NewDecoder(okRR.Body).Decode(&resp); err != nil || resp.Ticket == "" {
+		t.Fatalf("failed to decode ws-ticket response: %v", err)
+	}
+
+	router := AuthMiddlewareWithPolicy(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), AuthPolicy{})
+
+	muxReq := httptest.NewRequest(http.MethodGet, "/gateway/rpc-mux?ticket="+resp.Ticket, nil)
+	muxReq.RemoteAddr = "203.0.113.99:5555"
+	muxRR := httptest.NewRecorder()
+	router.ServeHTTP(muxRR, muxReq)
+	if muxRR.Code != http.StatusOK {
+		t.Fatalf("expected /gateway/rpc-mux to accept admin-local ticket, got %d", muxRR.Code)
+	}
+}
+
+func TestAuthMiddleware_SidecarUITicket(t *testing.T) {
+	store, err := NewAuthStore(t.TempDir() + "/auth.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	deviceToken := "valid-device-token-sidecar"
+	if err := store.AddDevice(PairedDevice{DeviceID: "dev-sidecar", DeviceName: "iPhone", Platform: "ios", TokenHash: HashToken(deviceToken), CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	authHandler := NewAuthHandler(store, NewPairingManager(), "127.0.0.1", 58900, false)
+
+	issue := func() string {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/ws-ticket", nil)
+		req.Header.Set("Authorization", "Bearer "+deviceToken)
+		rec := httptest.NewRecorder()
+		authHandler.HandleWSTicket(rec, req)
+		var resp struct {
+			Ticket string `json:"ticket"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil || resp.Ticket == "" {
+			t.Fatalf("ticket issue failed: %v", err)
+		}
+		return resp.Ticket
+	}
+
+	router := SecurityHeadersMiddleware(AuthMiddlewareWithPolicy(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), AuthPolicy{}))
+
+	// 1. Missing token/ticket returns 401
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/gateway/sidecar-ui/test-plugin/", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/gateway/sidecar-ui/test-plugin/ without credentials: got %d, want 401", rec.Code)
+	}
+
+	// 2. Valid one-time ticket returns 200 and issues scoped sidecar session cookie + SAMEORIGIN headers
+	ticket := issue()
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/gateway/sidecar-ui/test-plugin/?ticket="+ticket, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/gateway/sidecar-ui/test-plugin/ with valid ticket: got %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Frame-Options"); got != "SAMEORIGIN" {
+		t.Fatalf("expected X-Frame-Options=SAMEORIGIN on sidecar-ui, got %q", got)
+	}
+	var sidecarCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == SidecarSessionCookieName {
+			sidecarCookie = c
+			break
+		}
+	}
+	if sidecarCookie == nil || sidecarCookie.Value == "" {
+		t.Fatalf("expected %s cookie to be issued on valid sidecar-ui ticket", SidecarSessionCookieName)
+	}
+	if sidecarCookie.Path != "/gateway/sidecar-ui/" || !sidecarCookie.HttpOnly {
+		t.Fatalf("unexpected sidecar cookie attributes: path=%q httpOnly=%v", sidecarCookie.Path, sidecarCookie.HttpOnly)
+	}
+
+	// 3. Reusing the same one-time ticket without cookie returns 401
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/gateway/sidecar-ui/test-plugin/?ticket="+ticket, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/gateway/sidecar-ui/test-plugin/ reusing consumed ticket: got %d, want 401", rec.Code)
+	}
+
+	// 4. Subsequent CSS/JS sub-requests and refreshes with scoped sidecar cookie succeed without ?ticket=
+	for _, subPath := range []string{"/gateway/sidecar-ui/test-plugin/styles.css", "/gateway/sidecar-ui/test-plugin/app.js"} {
+		subReq := httptest.NewRequest(http.MethodGet, subPath, nil)
+		subReq.AddCookie(sidecarCookie)
+		subRec := httptest.NewRecorder()
+		router.ServeHTTP(subRec, subReq)
+		if subRec.Code != http.StatusOK {
+			t.Fatalf("%s with sidecar session cookie: got %d, want 200", subPath, subRec.Code)
+		}
+	}
+
+	// 5. Sidecar cookie CANNOT authenticate non-sidecar gateway/API routes
+	apiReq := httptest.NewRequest(http.MethodGet, "/gateway/models", nil)
+	apiReq.AddCookie(sidecarCookie)
+	apiRec := httptest.NewRecorder()
+	router.ServeHTTP(apiRec, apiReq)
+	if apiRec.Code != http.StatusUnauthorized {
+		t.Fatalf("/gateway/models with sidecar cookie must be rejected: got %d, want 401", apiRec.Code)
+	}
+	if got := apiRec.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("expected X-Frame-Options=DENY outside sidecar-ui, got %q", got)
+	}
+
+	// 6. Unpairing the device immediately invalidates active sidecar session cookies
+	if err := store.RemoveDevice("dev-sidecar"); err != nil {
+		t.Fatalf("RemoveDevice failed: %v", err)
+	}
+	revokedReq := httptest.NewRequest(http.MethodGet, "/gateway/sidecar-ui/test-plugin/app.js", nil)
+	revokedReq.AddCookie(sidecarCookie)
+	revokedRec := httptest.NewRecorder()
+	router.ServeHTTP(revokedRec, revokedReq)
+	if revokedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("sidecar cookie after device removal: got %d, want 401", revokedRec.Code)
+	}
+}

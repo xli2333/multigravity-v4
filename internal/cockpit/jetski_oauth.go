@@ -1,0 +1,800 @@
+package cockpit
+
+import (
+	"log/slog"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"antigravity-mobile/internal/localtls"
+)
+
+var (
+	ya29RE     = regexp.MustCompile(`ya29\.[A-Za-z0-9._-]+`)
+	refreshRE  = regexp.MustCompile(`1//[A-Za-z0-9_-]+`)
+	jwtRE      = regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
+	lsCSRFRE   = regexp.MustCompile(`--csrf_token\s+([0-9a-fA-F-]+)`)
+	lsListenRE = regexp.MustCompile(`127\.0\.0\.1:(\d+)`)
+)
+
+type jetskiOAuthFile struct {
+	Token struct {
+		AccessToken  string `json:"access_token"`
+		TokenType    string `json:"token_type"`
+		RefreshToken string `json:"refresh_token"`
+		Expiry       string `json:"expiry"`
+	} `json:"token"`
+	AuthMethod string `json:"auth_method"`
+	IDToken    string `json:"id_token,omitempty"`
+}
+
+type parsedOAuth struct {
+	AccessToken  string
+	RefreshToken string
+	IDToken      string
+	Email        string
+	Expiry       time.Time
+}
+
+// applyLanguageServerOAuth is the post-Cockpit hook. Tests replace it.
+var applyLanguageServerOAuth = applyJetskiOAuthAndRelaunch
+
+func jetskiOAuthPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".gemini", "jetski-standalone-oauth-token")
+}
+
+func googleAccountsPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".gemini", "google_accounts.json")
+}
+
+func applyJetskiOAuthAndRelaunch(accountID string) error {
+	tok, err := fetchAccountOAuth(accountID)
+	if err != nil {
+		slog.Warn(fmt.Sprintf("[Cockpit] cockpit token fetch failed (%v); falling back to vscdb", err))
+		tok, err = loadOAuthFromVscdb()
+	}
+	if err != nil {
+		return fmt.Errorf("no oauth for %s: %w", accountID, err)
+	}
+	if err := writeJetskiOAuthFile(tok); err != nil {
+		slog.Warn("[Cockpit] jetski oauth write failed", "err", err)
+	}
+	if tok.Email != "" {
+		syncGeminiGoogleAccounts(tok.Email)
+	}
+	if err := writeGeminiKeychainOAuth(tok); err != nil {
+		return fmt.Errorf("write gemini keychain oauth: %w", err)
+	}
+
+	want := resolveAccountEmail(accountID)
+	if want == "" {
+		want = tok.Email
+	}
+	slog.Info(fmt.Sprintf("[Cockpit] wrote language-server oauth for %s; relaunching Antigravity.app with proxy", want))
+	if err := quitRunningAntigravity(); err != nil {
+		slog.Info("[Cockpit] quit before proxy relaunch", "err", err)
+	}
+	time.Sleep(800 * time.Millisecond)
+	if err := launchAntigravityWithCockpitProxy(); err != nil {
+		return err
+	}
+	live, err := waitLiveUserEmail(30 * time.Second)
+	if err != nil {
+		slog.Info("[Cockpit] GetUserStatus after keychain relaunch", "err", err)
+		return nil
+	}
+	if want != "" && !strings.EqualFold(strings.TrimSpace(live), want) {
+		return fmt.Errorf("Antigravity still signed in as %s, expected %s", live, want)
+	}
+	slog.Info(fmt.Sprintf("[Cockpit] live Language Server is %s", live))
+	return nil
+}
+
+func writeGeminiKeychainOAuth(tok *parsedOAuth) error {
+	env := map[string]any{
+		"token": map[string]any{
+			"access_token":  tok.AccessToken,
+			"token_type":    "Bearer",
+			"refresh_token": tok.RefreshToken,
+			"expiry":        tok.Expiry.UTC().Format("2006-01-02T15:04:05.000000Z"),
+		},
+		"auth_method": "consumer",
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	secret := "go-keyring-base64:" + base64.StdEncoding.EncodeToString(raw)
+
+	if runtime.GOOS == "windows" {
+		if err := writeWindowsGenericCredential("gemini:antigravity", "antigravity", secret); err != nil {
+			return fmt.Errorf("windows credential write: %w", err)
+		}
+		slog.Info(fmt.Sprintf("[Cockpit] updated Windows Credential Manager gemini/antigravity for %s", tok.Email))
+		return nil
+	}
+
+	if runtime.GOOS == "darwin" {
+		if strings.ContainsAny(secret, " \t\r\n\"'\\") {
+			return fmt.Errorf("invalid characters in encoded keychain secret")
+		}
+		stdinCmd := fmt.Sprintf("add-generic-password -U -s gemini -a antigravity -w \"%s\"\n", secret)
+		out, err := runCmdCombinedStdinTimeout(5*time.Second, stdinCmd, "security", "-i")
+		if err != nil {
+			cleanOut := strings.ReplaceAll(strings.TrimSpace(string(out)), secret, "[REDACTED]")
+			return fmt.Errorf("%w: %s", err, cleanOut)
+		}
+		slog.Info(fmt.Sprintf("[Cockpit] updated keychain gemini/antigravity for %s", tok.Email))
+		return nil
+	}
+
+	// Linux / Headless:
+	// Secret Service (secret-tool) is optional.
+	// Primary credential store for language_server is jetski-standalone-oauth-token and google_accounts.json.
+	if _, err := exec.LookPath("secret-tool"); err == nil {
+		_, _ = runCmdStdinTimeout(5*time.Second, secret, "secret-tool", "store", "--label=antigravity", "service", "gemini", "account", "antigravity")
+		slog.Info(fmt.Sprintf("[Cockpit] updated secret-tool gemini/antigravity for %s", tok.Email))
+	}
+	return nil
+}
+
+func isSafeProxyURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, "\r\n\x00") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return scheme == "http" || scheme == "https" || scheme == "socks5" || scheme == "socks5h"
+}
+
+func redactProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Redacted()
+	}
+	if idx := strings.Index(raw, "@"); idx != -1 {
+		return "***@" + raw[idx+1:]
+	}
+	return raw
+}
+
+func launchAntigravityWithCockpitProxy() error {
+	var proxy, noProxy string
+	hasProxy := false
+	if cfg, err := getCockpitConfig(); err == nil && cfg.GlobalProxyEnabled && strings.TrimSpace(cfg.GlobalProxyURL) != "" {
+		p := strings.TrimSpace(cfg.GlobalProxyURL)
+		if !isSafeProxyURL(p) {
+			slog.Warn(fmt.Sprintf("[Cockpit] ⚠️ rejected unsafe GlobalProxyURL %q; launching without proxy", redactProxyURL(p)))
+		} else {
+			proxy = p
+			noProxy = strings.TrimSpace(cfg.GlobalProxyNoProxy)
+			if noProxy == "" || strings.ContainsAny(noProxy, "\r\n\x00") {
+				noProxy = "127.0.0.1,localhost,::1"
+			}
+			hasProxy = true
+		}
+	}
+
+	if runtime.GOOS == "windows" {
+		var candidatePaths []string
+		if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+			candidatePaths = append(candidatePaths, filepath.Join(localApp, "Programs", "antigravity", "Antigravity.exe"))
+		}
+		if progFiles := os.Getenv("ProgramFiles"); progFiles != "" {
+			candidatePaths = append(candidatePaths, filepath.Join(progFiles, "Antigravity", "Antigravity.exe"))
+		}
+		if progFilesX86 := os.Getenv("ProgramFiles(x86)"); progFilesX86 != "" {
+			candidatePaths = append(candidatePaths, filepath.Join(progFilesX86, "Antigravity", "Antigravity.exe"))
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			candidatePaths = append(candidatePaths, filepath.Join(home, "AppData", "Local", "Programs", "antigravity", "Antigravity.exe"))
+		}
+
+		var exePath string
+		for _, p := range candidatePaths {
+			if _, err := os.Stat(p); err == nil {
+				exePath = p
+				break
+			}
+		}
+		if exePath == "" {
+			if looked, err := exec.LookPath("Antigravity.exe"); err == nil {
+				exePath = looked
+			}
+		}
+		if exePath == "" {
+			return fmt.Errorf("Antigravity.exe executable not found on Windows")
+		}
+
+		cmd := exec.Command(exePath)
+		if hasProxy {
+			cmd.Env = os.Environ()
+			for _, key := range []string{"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"} {
+				cmd.Env = append(cmd.Env, key+"="+proxy)
+			}
+			cmd.Env = append(cmd.Env, "no_proxy="+noProxy, "NO_PROXY="+noProxy)
+			slog.Info(fmt.Sprintf("[Cockpit] launching Antigravity.exe with proxy %s", redactProxyURL(proxy)))
+		} else {
+			slog.Info("[Cockpit] launching Antigravity.exe without global proxy")
+		}
+		return cmd.Start()
+	}
+
+	if runtime.GOOS == "linux" {
+		if runCmdRunTimeout(3*time.Second, "systemctl", "--user", "cat", "antigravity-ls.service") == nil {
+			slog.Info("[Cockpit] starting systemd service antigravity-ls")
+			if err := runCmdRunTimeout(5*time.Second, "systemctl", "--user", "start", "antigravity-ls"); err != nil {
+				return fmt.Errorf("start antigravity-ls: %w", err)
+			}
+			return nil
+		}
+		if lsPath, err := exec.LookPath("language_server"); err == nil {
+			slog.Info("[Cockpit] launching standalone language_server")
+			cmd := exec.Command(lsPath, "--standalone", "--headless", "--persistent_mode", "--http_server_port=50005")
+			return cmd.Start()
+		}
+		slog.Info("[Cockpit] no language_server or antigravity-ls service found on Linux")
+		return nil
+	}
+
+	args := []string{"-a", "Antigravity"}
+	if hasProxy {
+		for _, key := range []string{"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"} {
+			args = append(args, "--env", key+"="+proxy)
+		}
+		args = append(args, "--env", "no_proxy="+noProxy, "--env", "NO_PROXY="+noProxy)
+		slog.Info(fmt.Sprintf("[Cockpit] launching Antigravity.app with proxy %s", redactProxyURL(proxy)))
+	} else {
+		slog.Info("[Cockpit] launching Antigravity.app without global proxy")
+	}
+	out, err := runCmdCombinedTimeout(5*time.Second, "open", args...)
+	if err != nil {
+		return fmt.Errorf("open Antigravity.app: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func resolveAccountEmail(accountID string) string {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return ""
+	}
+	if strings.Contains(accountID, "@") {
+		return strings.ToLower(accountID)
+	}
+	dataDir, err := GetCockpitDataDir()
+	if err != nil {
+		return ""
+	}
+	idx, err := LoadAccountIndex(dataDir)
+	if err != nil {
+		return ""
+	}
+	for _, acc := range idx.Accounts {
+		if acc.ID == accountID {
+			return strings.ToLower(strings.TrimSpace(acc.Email))
+		}
+	}
+	return ""
+}
+
+var (
+	cachedOAuthMu    sync.RWMutex
+	cachedOAuthPath  string
+	cachedOAuthMTime time.Time
+	cachedOAuthToken *parsedOAuth
+)
+
+func loadOAuthFromVscdb() (*parsedOAuth, error) {
+	var lastErr error
+	for _, dbPath := range antigravityStateDBPaths() {
+		fi, err := os.Stat(dbPath)
+		if err != nil {
+			continue
+		}
+
+		cachedOAuthMu.RLock()
+		if cachedOAuthPath == dbPath && cachedOAuthMTime.Equal(fi.ModTime()) && cachedOAuthToken != nil {
+			tok := cachedOAuthToken
+			cachedOAuthMu.RUnlock()
+			return tok, nil
+		}
+		cachedOAuthMu.RUnlock()
+
+		const oauthQuerySQL = "SELECT value FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.oauthToken';"
+		cleanDB, pathErr := safeSQLitePathArg(dbPath)
+		if pathErr != nil {
+			continue
+		}
+		var out []byte
+		if p, lookErr := exec.LookPath("sqlite3"); lookErr == nil && isExecutableValid(p) {
+			out, err = runCmdCombinedTimeout(5*time.Second, p, "-readonly", "-batch", "-noheader", "-cmd", ".timeout 3000", cleanDB, oauthQuerySQL)
+		}
+		if len(out) == 0 {
+			pyScript := "import pathlib, sqlite3, sys; uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro'; conn = sqlite3.connect(uri, uri=True, timeout=3.0); cur = conn.cursor(); cur.execute('SELECT value FROM ItemTable WHERE key = ?', (sys.argv[2],)); row = cur.fetchone(); conn.close(); sys.stdout.write(row[0] if row and row[0] else '')"
+			for _, pyExe := range pythonCandidates() {
+				p, lookErr := exec.LookPath(pyExe)
+				if lookErr != nil || !isExecutableValid(p) {
+					continue
+				}
+				if pyOut, pyErr := runCmdTimeout(5*time.Second, p, "-c", pyScript, cleanDB, "antigravityUnifiedStateSync.oauthToken"); pyErr == nil && len(pyOut) > 0 {
+					out = pyOut
+					err = nil
+					break
+				}
+			}
+		}
+		if err != nil || len(out) == 0 {
+			if err != nil {
+				lastErr = fmt.Errorf("%s: %w (%s)", dbPath, err, strings.TrimSpace(string(out)))
+			}
+			continue
+		}
+		tok, err := parseJetskiOAuth(string(out))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		cachedOAuthMu.Lock()
+		cachedOAuthPath = dbPath
+		cachedOAuthMTime = fi.ModTime()
+		cachedOAuthToken = tok
+		cachedOAuthMu.Unlock()
+
+		return tok, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("oauth token not found in state.vscdb")
+	}
+	return nil, lastErr
+}
+
+func parseJetskiOAuth(raw string) (*parsedOAuth, error) {
+	blob := strings.Join(collectOAuthHaystacks(raw), "\n")
+	access := ya29RE.FindString(blob)
+	refresh := refreshRE.FindString(blob)
+	idToken := jwtRE.FindString(blob)
+	if access == "" || idToken == "" {
+		return nil, fmt.Errorf("vscdb oauth missing access_token or id_token")
+	}
+	email, exp := jwtEmailAndExp(idToken)
+	tok := &parsedOAuth{
+		AccessToken:  access,
+		RefreshToken: refresh,
+		IDToken:      idToken,
+		Email:        email,
+		Expiry:       exp,
+	}
+	if tok.Expiry.IsZero() {
+		tok.Expiry = time.Now().Add(50 * time.Minute)
+	}
+	return tok, nil
+}
+
+var innerB64RE = regexp.MustCompile(`[A-Za-z0-9+/]{48,}={0,2}`)
+
+func compactBase64(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r <= ' ' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func collectOAuthHaystacks(raw string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	queue := []string{raw, compactBase64(raw)}
+	for i := 0; i < len(queue) && i < 12; i++ {
+		cur := queue[i]
+		add(cur)
+		if decoded := tryBase64(compactBase64(cur)); decoded != "" {
+			if _, ok := seen[decoded]; !ok {
+				queue = append(queue, decoded)
+			}
+			add(decoded)
+			for _, m := range innerB64RE.FindAllString(decoded, 12) {
+				if inner := tryBase64(m); inner != "" {
+					if _, ok := seen[inner]; !ok {
+						queue = append(queue, inner)
+					}
+					add(inner)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func tryBase64(s string) string {
+	s = compactBase64(s)
+	if len(s) < 16 {
+		return ""
+	}
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if b, err := enc.DecodeString(s); err == nil && len(b) > 16 {
+			return string(b)
+		}
+	}
+	return ""
+}
+
+func jwtEmailAndExp(idToken string) (string, time.Time) {
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return "", time.Time{}
+	}
+	payload := parts[1]
+	if pad := len(payload) % 4; pad != 0 {
+		payload += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return "", time.Time{}
+		}
+	}
+	var claims struct {
+		Email string `json:"email"`
+		Exp   int64  `json:"exp"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return "", time.Time{}
+	}
+	var exp time.Time
+	if claims.Exp > 0 {
+		exp = time.Unix(claims.Exp, 0)
+	}
+	return strings.ToLower(strings.TrimSpace(claims.Email)), exp
+}
+
+func writeJetskiOAuthFile(tok *parsedOAuth) error {
+	path := jetskiOAuthPath()
+	if path == "" {
+		return fmt.Errorf("cannot resolve home for jetski oauth file")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	doc := jetskiOAuthFile{AuthMethod: "consumer", IDToken: tok.IDToken}
+	doc.Token.AccessToken = tok.AccessToken
+	doc.Token.TokenType = "Bearer"
+	doc.Token.RefreshToken = tok.RefreshToken
+	doc.Token.Expiry = tok.Expiry.In(time.Local).Format(time.RFC3339Nano)
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic0600(path, raw); err != nil {
+		return err
+	}
+	slog.Info(fmt.Sprintf("[Cockpit] wrote jetski-standalone-oauth-token for %s", tok.Email))
+	return nil
+}
+
+func syncGeminiGoogleAccounts(email string) {
+	path := googleAccountsPath()
+	if path == "" || email == "" {
+		return
+	}
+	doc := map[string]any{"active": email, "old": []any{}}
+	if raw, err := os.ReadFile(path); err == nil {
+		var existing map[string]any
+		if json.Unmarshal(raw, &existing) == nil {
+			if old, ok := existing["old"]; ok {
+				doc["old"] = old
+			}
+		}
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic0600(path, append(raw, '\n'))
+}
+
+func waitLiveUserEmail(d time.Duration) (string, error) {
+	deadline := time.Now().Add(d)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		email, err := liveUserEmail()
+		if err == nil && strings.TrimSpace(email) != "" {
+			return email, nil
+		}
+		lastErr = err
+		time.Sleep(400 * time.Millisecond)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timed out waiting for GetUserStatus")
+	}
+	return "", lastErr
+}
+
+var liveUserHTTPClient = &http.Client{
+	Timeout: 2 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig:     localtls.ClientConfig(),
+		DialContext:         localtls.DialContext,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
+
+func liveUserEmail() (string, error) {
+	port, csrf, err := lookupLanguageServer()
+	if err != nil {
+		return "", err
+	}
+	url := fmt.Sprintf("https://127.0.0.1:%d/exa.language_server_pb.LanguageServerService/GetUserStatus", port)
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader("{}"))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	if csrf != "" {
+		req.Header.Set("x-codeium-csrf-token", csrf)
+	}
+	resp, err := liveUserHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GetUserStatus status %d", resp.StatusCode)
+	}
+	var data struct {
+		UserStatus struct {
+			Email string `json:"email"`
+		} `json:"userStatus"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(data.UserStatus.Email), nil
+}
+
+var (
+	lsLookupMu      sync.Mutex
+	cachedLSPort    int
+	cachedLSCSRF    string
+	cachedLSUntil   time.Time
+	lastLSFailScan  time.Time
+)
+
+func cacheFoundLS(port int, csrf string) {
+	lsLookupMu.Lock()
+	cachedLSPort = port
+	cachedLSCSRF = csrf
+	cachedLSUntil = time.Now().Add(5 * time.Second)
+	lastLSFailScan = time.Time{}
+	lsLookupMu.Unlock()
+}
+
+func lookupLanguageServer() (int, string, error) {
+	// Fast path 1: check daemon discovery files (hub_*.json preferred, newest first, verified listening)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		daemonDir := filepath.Join(home, ".gemini", "antigravity", "daemon")
+		var files []string
+		for _, pattern := range []string{"hub_*.json", "ls_*.json"} {
+			if matches, err := filepath.Glob(filepath.Join(daemonDir, pattern)); err == nil {
+				files = append(files, matches...)
+			}
+		}
+		if len(files) > 0 {
+			type fileEntry struct {
+				path    string
+				isHub   bool
+				modTime time.Time
+			}
+			var entries []fileEntry
+			for _, f := range files {
+				if st, err := os.Stat(f); err == nil {
+					entries = append(entries, fileEntry{
+						path:    f,
+						isHub:   strings.HasPrefix(filepath.Base(f), "hub_"),
+						modTime: st.ModTime(),
+					})
+				}
+			}
+			sort.Slice(entries, func(a, b int) bool {
+				if entries[a].isHub != entries[b].isHub {
+					return entries[a].isHub
+				}
+				return entries[a].modTime.After(entries[b].modTime)
+			})
+			type daemonInfo struct {
+				HTTPSPort int    `json:"httpsPort"`
+				CSRFToken string `json:"csrfToken"`
+			}
+			for _, entry := range entries {
+				if data, err := os.ReadFile(entry.path); err == nil {
+					var d daemonInfo
+					if json.Unmarshal(data, &d) == nil && d.HTTPSPort > 0 && IsCockpitListening(d.HTTPSPort, 300*time.Millisecond) {
+						cacheFoundLS(d.HTTPSPort, d.CSRFToken)
+						return d.HTTPSPort, d.CSRFToken, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Fast path 2: short TTL positive cache & 1.5s negative backoff to prevent 400ms ps+lsof storms
+	now := time.Now()
+	lsLookupMu.Lock()
+	cPort, cCSRF, cUntil, failAt := cachedLSPort, cachedLSCSRF, cachedLSUntil, lastLSFailScan
+	lsLookupMu.Unlock()
+
+	if cPort > 0 && now.Before(cUntil) && IsCockpitListening(cPort, 200*time.Millisecond) {
+		return cPort, cCSRF, nil
+	}
+	if !failAt.IsZero() && now.Sub(failAt) < 1500*time.Millisecond {
+		return 0, "", fmt.Errorf("language_server scan backed off")
+	}
+
+	if runtime.GOOS == "windows" {
+		psScript := `Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server*' } | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`
+		out, err := runCmdTimeout(5*time.Second, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", psScript)
+		if err != nil {
+			return 0, "", err
+		}
+		trimmed := strings.TrimSpace(string(out))
+		if trimmed == "" || trimmed == "null" {
+			return 0, "", fmt.Errorf("language_server not found")
+		}
+		type winProc struct {
+			ProcessID   int    `json:"ProcessId"`
+			CommandLine string `json:"CommandLine"`
+		}
+		var procs []winProc
+		if strings.HasPrefix(trimmed, "[") {
+			_ = json.Unmarshal([]byte(trimmed), &procs)
+		} else if strings.HasPrefix(trimmed, "{") {
+			var s winProc
+			if json.Unmarshal([]byte(trimmed), &s) == nil {
+				procs = append(procs, s)
+			}
+		}
+		var pid int
+		var csrf string
+		for _, p := range procs {
+			if strings.Contains(p.CommandLine, "language_server") &&
+				!strings.Contains(p.CommandLine, "--headless") &&
+				!strings.Contains(p.CommandLine, "groupchat-runtime") {
+				pid = p.ProcessID
+				if m := lsCSRFRE.FindStringSubmatch(p.CommandLine); len(m) > 1 {
+					csrf = m[1]
+				}
+				break
+			}
+		}
+		if pid == 0 {
+			return 0, "", fmt.Errorf("language_server not found")
+		}
+		netstatOut, err := runCmdTimeout(5*time.Second, "netstat", "-ano", "-p", "tcp")
+		if err != nil {
+			return 0, "", err
+		}
+		pidStr := strconv.Itoa(pid)
+		for _, rawLine := range bytes.Split(netstatOut, []byte("\n")) {
+			line := strings.TrimSpace(string(rawLine))
+			if !strings.HasPrefix(line, "TCP") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 5 && strings.EqualFold(fields[3], "LISTENING") && fields[4] == pidStr {
+				localAddr := fields[1]
+				if idx := strings.LastIndex(localAddr, ":"); idx != -1 {
+					if p, convErr := strconv.Atoi(localAddr[idx+1:]); convErr == nil && p > 0 {
+						cacheFoundLS(p, csrf)
+						return p, csrf, nil
+					}
+				}
+			}
+		}
+		lsLookupMu.Lock()
+		lastLSFailScan = time.Now()
+		lsLookupMu.Unlock()
+		return 0, "", fmt.Errorf("language_server has no listen port")
+	}
+
+	out, err := runCmdTimeout(5*time.Second, "ps", "-axo", "pid=,command=")
+	if err != nil {
+		lsLookupMu.Lock()
+		lastLSFailScan = time.Now()
+		lsLookupMu.Unlock()
+		return 0, "", err
+	}
+	var pid, csrf string
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "language_server") {
+			continue
+		}
+		if strings.Contains(line, "multicall") || strings.Contains(line, "--headless") || strings.Contains(line, "groupchat-runtime") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		pid = fields[0]
+		if m := lsCSRFRE.FindStringSubmatch(line); len(m) > 1 {
+			csrf = m[1]
+		}
+		break
+	}
+	if pid == "" {
+		lsLookupMu.Lock()
+		lastLSFailScan = time.Now()
+		lsLookupMu.Unlock()
+		return 0, "", fmt.Errorf("language_server not found")
+	}
+	lsof, err := runCmdTimeout(5*time.Second, "lsof", "-nP", "-p", pid, "-a", "-iTCP", "-sTCP:LISTEN")
+	if err != nil {
+		lsLookupMu.Lock()
+		lastLSFailScan = time.Now()
+		lsLookupMu.Unlock()
+		return 0, "", fmt.Errorf("lsof language_server: %w", err)
+	}
+	var ports []int
+	for _, line := range strings.Split(string(lsof), "\n") {
+		m := lsListenRE.FindStringSubmatch(line)
+		if len(m) < 2 {
+			continue
+		}
+		p, convErr := strconv.Atoi(m[1])
+		if convErr == nil {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) == 0 {
+		lsLookupMu.Lock()
+		lastLSFailScan = time.Now()
+		lsLookupMu.Unlock()
+		return 0, "", fmt.Errorf("language_server has no listen port")
+	}
+	cacheFoundLS(ports[0], csrf)
+	return ports[0], csrf, nil
+}

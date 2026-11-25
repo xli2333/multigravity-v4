@@ -1,0 +1,430 @@
+package cockpit
+
+import (
+	"log/slog"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"time"
+)
+
+var antigravityIdentityKeys = []string{
+	"antigravityAuthStatus",
+	"antigravityUnifiedStateSync.userStatus",
+}
+
+var validSQLiteKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+
+// validateSQLiteKey ensures a key string only contains standard alphanumeric, dot, underscore, or hyphen characters.
+func validateSQLiteKey(key string) error {
+	if !validSQLiteKeyPattern.MatchString(key) {
+		return fmt.Errorf("invalid sqlite key: %q", key)
+	}
+	return nil
+}
+
+func antigravityStateDBPaths() []string {
+	var paths []string
+	seen := make(map[string]bool)
+	addPath := func(p string) {
+		clean := filepath.Clean(p)
+		if !seen[clean] {
+			seen[clean] = true
+			paths = append(paths, clean)
+		}
+	}
+
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		addPath(filepath.Join(appData, "Antigravity", "User", "globalStorage", "state.vscdb"))
+		addPath(filepath.Join(appData, "Antigravity IDE", "User", "globalStorage", "state.vscdb"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if runtime.GOOS == "darwin" {
+			addPath(filepath.Join(home, "Library", "Application Support", "Antigravity", "User", "globalStorage", "state.vscdb"))
+			addPath(filepath.Join(home, "Library", "Application Support", "Antigravity IDE", "User", "globalStorage", "state.vscdb"))
+		} else if runtime.GOOS == "windows" {
+			addPath(filepath.Join(home, "AppData", "Roaming", "Antigravity", "User", "globalStorage", "state.vscdb"))
+			addPath(filepath.Join(home, "AppData", "Roaming", "Antigravity IDE", "User", "globalStorage", "state.vscdb"))
+		} else {
+			configDir := os.Getenv("XDG_CONFIG_HOME")
+			if configDir == "" {
+				configDir = filepath.Join(home, ".config")
+			}
+			addPath(filepath.Join(configDir, "Antigravity", "User", "globalStorage", "state.vscdb"))
+			addPath(filepath.Join(configDir, "Antigravity IDE", "User", "globalStorage", "state.vscdb"))
+		}
+	}
+	return paths
+}
+
+// ensureAntigravityStateDBs initializes the directories and SQLite state.vscdb
+// with ItemTable if missing, ensuring Cockpit Tools' profile injection succeeds.
+func ensureAntigravityStateDBs() {
+	home, homeErr := os.UserHomeDir()
+	if homeErr == nil && runtime.GOOS == "darwin" {
+		agDir := filepath.Join(home, "Library", "Application Support", "Antigravity")
+		agIdeDir := filepath.Join(home, "Library", "Application Support", "Antigravity IDE")
+		if _, statErr := os.Stat(agDir); statErr == nil {
+			if _, ideErr := os.Lstat(agIdeDir); os.IsNotExist(ideErr) {
+				_ = os.Symlink("Antigravity", agIdeDir)
+			}
+		}
+	}
+
+	for _, dbPath := range antigravityStateDBPaths() {
+		parentDir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(parentDir, 0o700); err != nil {
+			continue
+		}
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			const initSQL = "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);"
+			if err := execSQLite(dbPath, initSQL); err != nil {
+				slog.Warn(fmt.Sprintf("[Cockpit] failed to initialize state.vscdb at %s", dbPath), "err", err)
+			} else {
+				enforceSQLiteDBPermissions(dbPath)
+				slog.Info(fmt.Sprintf("[Cockpit] initialized state.vscdb at %s", dbPath))
+			}
+		} else {
+			enforceSQLiteDBPermissions(dbPath)
+		}
+	}
+}
+
+func enforceSQLiteDBPermissions(dbPath string) {
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		p := dbPath + suffix
+		if _, err := os.Stat(p); err == nil {
+			_ = os.Chmod(p, 0o600)
+		}
+	}
+}
+
+func sqliteQuote(s string) string {
+	// SEC: Strip NULL bytes to prevent premature string truncation in SQLite
+	cleaned := strings.ReplaceAll(s, "\x00", "")
+	return "'" + strings.ReplaceAll(cleaned, "'", "''") + "'"
+}
+
+// prepareAntigravityProfileForSwitch runs after Antigravity has been quit and
+// before Cockpit injects the new account. Do not wipe userStatus/authStatus:
+// Cockpit's own UI switch leaves those keys in place, and deleting them leaves
+// the workbench without a hydrated identity (black window). Only align the
+// legacy Antigravity.app bind slot, which Cockpit otherwise leaves stale.
+func prepareAntigravityProfileForSwitch(accountID string) (prevAccountID string) {
+	prevAccountID = getLegacyBindAccount()
+	syncLegacyBindAccount(accountID)
+	return prevAccountID
+}
+
+func clearStaleAntigravityIdentity() {
+	inList := make([]string, 0, len(antigravityIdentityKeys))
+	for _, key := range antigravityIdentityKeys {
+		if err := validateSQLiteKey(key); err != nil {
+			slog.Info(fmt.Sprintf("[Cockpit] skipping invalid key %q", key), "err", err)
+			continue
+		}
+		inList = append(inList, sqliteQuote(key))
+	}
+	if len(inList) == 0 {
+		return
+	}
+	sql := "DELETE FROM ItemTable WHERE key IN (" + strings.Join(inList, ",") + ");"
+
+	for _, dbPath := range antigravityStateDBPaths() {
+		if _, err := os.Stat(dbPath); err != nil {
+			continue
+		}
+		if err := execSQLite(dbPath, sql); err != nil {
+			slog.Warn(fmt.Sprintf("[Cockpit] failed to clear identity keys in %s", dbPath), "err", err)
+			continue
+		}
+		slog.Info(fmt.Sprintf("[Cockpit] cleared stale Antigravity identity keys in %s", dbPath))
+	}
+}
+
+func pythonCandidates() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"python", "py", "python3"}
+	}
+	return []string{"python3", "python"}
+}
+
+func isExecutableValid(path string) bool {
+	resolved := path
+	if !filepath.IsAbs(resolved) && !strings.ContainsRune(resolved, filepath.Separator) && !strings.ContainsRune(resolved, '/') {
+		if p, err := exec.LookPath(resolved); err == nil {
+			resolved = p
+		}
+	}
+	if fi, err := os.Stat(resolved); err != nil || fi.Size() == 0 {
+		return false
+	}
+	return true
+}
+
+func execSQLite(dbPath, sql string) error {
+	cleanDB, pathErr := safeSQLitePathArg(dbPath)
+	if pathErr != nil || (!strings.HasSuffix(cleanDB, ".vscdb") && !strings.HasSuffix(cleanDB, ".db")) {
+		return fmt.Errorf("invalid sqlite database path: %q", dbPath)
+	}
+	if p, lookErr := exec.LookPath("sqlite3"); lookErr == nil && isExecutableValid(p) {
+		if _, err := runCmdCombinedTimeout(5*time.Second, p, "-batch", "-cmd", ".timeout 3000", cleanDB, sql); err == nil {
+			return nil
+		}
+	}
+	pyScript := "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1], timeout=3.0); conn.executescript(sys.argv[2]); conn.commit(); conn.close()"
+	var lastErr error
+	for _, py := range pythonCandidates() {
+		p, lookErr := exec.LookPath(py)
+		if lookErr != nil || !isExecutableValid(p) {
+			continue
+		}
+		out, err := runCmdCombinedTimeout(5*time.Second, p, "-c", pyScript, cleanDB, sql)
+		if err == nil {
+			return nil
+		}
+		lastErr = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("neither sqlite3 nor a functioning python runtime found to execute sqlite query")
+}
+
+func getLegacyBindAccount() string {
+	dataDir, err := GetCockpitDataDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(dataDir, "antigravity_legacy_instances.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	ds, _ := doc["defaultSettings"].(map[string]any)
+	if ds == nil {
+		return ""
+	}
+	val, _ := ds["bindAccountId"].(string)
+	return strings.TrimSpace(val)
+}
+
+func syncLegacyBindAccount(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	dataDir, err := GetCockpitDataDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(dataDir, "antigravity_legacy_instances.json")
+	var doc map[string]any
+	fileExists := false
+	if raw, err := os.ReadFile(path); err == nil {
+		fileExists = true
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			slog.Warn(fmt.Sprintf("[Cockpit] failed to parse %s", path), "err", err)
+			return
+		}
+	}
+	if doc == nil {
+		doc = map[string]any{
+			"instances": []any{},
+			"defaultSettings": map[string]any{
+				"bindAccountId": accountID,
+			},
+		}
+	}
+	ds, _ := doc["defaultSettings"].(map[string]any)
+	if ds == nil {
+		ds = map[string]any{}
+		doc["defaultSettings"] = ds
+	}
+	prev, _ := ds["bindAccountId"].(string)
+	if fileExists && prev == accountID {
+		return
+	}
+	ds["bindAccountId"] = accountID
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := writeFileAtomic0600(path, append(out, '\n')); err != nil {
+		slog.Warn(fmt.Sprintf("[Cockpit] failed to write %s", path), "err", err)
+		return
+	}
+	slog.Info(fmt.Sprintf("[Cockpit] synced antigravity_legacy_instances bindAccountId %s -> %s", prev, accountID))
+}
+
+// wait is kept tiny so tests can override if needed.
+var afterProfilePrepare = func() { time.Sleep(50 * time.Millisecond) }
+
+func querySQLite(dbPath, sql string) (string, error) {
+	cleanDB, pathErr := safeSQLitePathArg(dbPath)
+	if pathErr != nil {
+		return "", pathErr
+	}
+	if p, lookErr := exec.LookPath("sqlite3"); lookErr == nil && isExecutableValid(p) {
+		out, err := runCmdCombinedTimeout(5*time.Second, p, "-readonly", "-batch", "-noheader", "-cmd", ".timeout 3000", cleanDB, sql)
+		if err == nil {
+			return strings.TrimSpace(string(out)), nil
+		}
+	}
+	pyScript := "import pathlib, sqlite3, sys; uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro'; conn = sqlite3.connect(uri, uri=True, timeout=3.0); cur = conn.cursor(); cur.execute(sys.argv[2]); row = cur.fetchone(); conn.close(); sys.stdout.write(str(row[0]) if row and row[0] is not None else '')"
+	var lastErr error
+	for _, py := range pythonCandidates() {
+		p, lookErr := exec.LookPath(py)
+		if lookErr != nil || !isExecutableValid(p) {
+			continue
+		}
+		out, err := runCmdCombinedTimeout(5*time.Second, p, "-c", pyScript, cleanDB, sql)
+		if err == nil {
+			return strings.TrimSpace(string(out)), nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("sqlite query runner not found")
+}
+
+// InjectAccountToAntigravityStateDB writes unified OAuth token protobuf and flags into state.vscdb.
+func InjectAccountToAntigravityStateDB(acc *CockpitAccountDetail) error {
+	if acc == nil {
+		return fmt.Errorf("cannot inject nil account")
+	}
+
+	ensureAntigravityStateDBs()
+
+	isGCP := false
+	if acc.Token.IsGCPToS != nil {
+		isGCP = *acc.Token.IsGCPToS
+	}
+
+	expiry := acc.Token.ExpiryTimestamp
+	if expiry <= 0 {
+		expiry = time.Now().Unix() + 3600
+	}
+
+	oauthPayload := CreateOAuthInfoWithMetadata(
+		acc.Token.AccessToken,
+		acc.Token.RefreshToken,
+		expiry,
+		isGCP,
+		acc.Token.IDToken,
+	)
+
+	dbs := antigravityStateDBPaths()
+	for _, dbPath := range dbs {
+		if _, err := os.Stat(dbPath); err != nil {
+			continue
+		}
+
+		var currentTopic []byte
+		if val, err := querySQLite(dbPath, "SELECT value FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.oauthToken';"); err == nil && val != "" {
+			if b, bErr := base64.StdEncoding.DecodeString(val); bErr == nil {
+				currentTopic = b
+			}
+		}
+
+		topic, _ := RemoveUnifiedTopicEntry(currentTopic, "oauthTokenInfoSentinelKey")
+		topic, _ = RemoveUnifiedTopicEntry(topic, "authStateWithContextSentinelKey")
+
+		entry := CreateUnifiedTopicEntry("oauthTokenInfoSentinelKey", oauthPayload)
+		topic = append(topic, entry...)
+		topicB64 := base64.StdEncoding.EncodeToString(topic)
+
+		// Inject minimal userStatus if missing
+		userStatusCount, _ := querySQLite(dbPath, "SELECT COUNT(*) FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.userStatus';")
+
+		var batchSQL strings.Builder
+		batchSQL.WriteString("BEGIN TRANSACTION;\n")
+		fmt.Fprintf(&batchSQL, "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityUnifiedStateSync.oauthToken', %s);\n", sqliteQuote(topicB64))
+		if userStatusCount == "0" || userStatusCount == "" {
+			minPayload := CreateMinimalUserStatusPayload(acc.Email)
+			userTopic := CreateUnifiedTopicEntry("userStatusSentinelKey", minPayload)
+			userTopicB64 := base64.StdEncoding.EncodeToString(userTopic)
+			fmt.Fprintf(&batchSQL, "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityUnifiedStateSync.userStatus', %s);\n", sqliteQuote(userTopicB64))
+		}
+		batchSQL.WriteString("INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityOnboarding', 'true');\n")
+		batchSQL.WriteString("COMMIT;\n")
+
+		if err := execSQLite(dbPath, batchSQL.String()); err != nil {
+			slog.Warn(fmt.Sprintf("[Cockpit] failed to write unified tokens to %s", dbPath), "err", err)
+		} else {
+			enforceSQLiteDBPermissions(dbPath)
+		}
+		slog.Info(fmt.Sprintf("[Cockpit] Injected account %s tokens into %s", acc.Email, dbPath))
+	}
+	return nil
+}
+
+// SyncCockpitLocalState updates accounts.json, current_account.json, and legacy instance binding.
+func SyncCockpitLocalState(accountID, email string) error {
+	accountID = strings.TrimSpace(accountID)
+	email = strings.TrimSpace(email)
+	if accountID == "" && email == "" {
+		return nil
+	}
+
+	dataDir, err := GetCockpitDataDir()
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().Unix()
+
+	// 1. Update current_account.json
+	if email != "" {
+		curDoc := map[string]any{
+			"email":      email,
+			"updated_at": now,
+		}
+		if raw, err := json.MarshalIndent(curDoc, "", "  "); err == nil {
+			curPath := filepath.Join(dataDir, "current_account.json")
+			_ = writeFileAtomic0600(curPath, append(raw, '\n'))
+		}
+	}
+
+	// 2. Update accounts.json (current_account_id & last_used)
+	accPath := filepath.Join(dataDir, "accounts.json")
+	if raw, err := os.ReadFile(accPath); err == nil {
+		var idx map[string]any
+		if json.Unmarshal(raw, &idx) == nil {
+			if accountID != "" {
+				idx["current_account_id"] = accountID
+			}
+			if accList, ok := idx["accounts"].([]any); ok {
+				for _, item := range accList {
+					if m, ok := item.(map[string]any); ok {
+						if (accountID != "" && m["id"] == accountID) || (email != "" && strings.EqualFold(fmt.Sprint(m["email"]), email)) {
+							m["last_used"] = now
+						}
+					}
+				}
+			}
+			if updated, err := json.MarshalIndent(idx, "", "  "); err == nil {
+				_ = writeFileAtomic0600(accPath, append(updated, '\n'))
+			}
+		}
+	}
+
+	// 3. Update legacy bind account
+	if accountID != "" {
+		syncLegacyBindAccount(accountID)
+	}
+	return nil
+}
+

@@ -1,0 +1,777 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// 动态模型列表。
+//
+// language_server 的 GetAvailableModels 返回当前账号可用的全部模型（含内部占位、已改名的旧 id）。
+// 过去网关用两张手写表（modelEnumMap / enumToCanonicalMap）做 id ↔ 枚举映射，官方一换模型就过期。
+// 这里把实时列表缓存成注册表：
+//   - /gateway/models 给客户端「默认模型」选择用，只返回去重后的推荐模型，按 Gemini / Claude 分组；
+//   - resolveModelEnum 优先用实时列表把 id 解析成枚举，canonicalModelName 在静态表未命中时用它反查，
+//     所以新模型无需改代码即可被选择、发送和在界面上显示。
+
+const (
+	liveModelsTTL     = 5 * time.Minute
+	liveModelsTimeout = 4 * time.Second
+	liveModelsRetry   = 30 * time.Second // 失败后至少间隔多久再试，避免每条消息都等 4 秒超时
+)
+
+// ModelOption is one selectable model as exposed to clients.
+type ModelOption struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Provider       string `json:"provider"` // "gemini" | "claude" | "orchestrator" | "other"
+	Enum           string `json:"enum,omitempty"`
+	SupportsImages bool   `json:"supportsImages,omitempty"`
+	Thinking       bool   `json:"thinking,omitempty"`
+	Tag            string `json:"tag,omitempty"`
+	MaxTokens      int64  `json:"maxTokens,omitempty"`
+}
+
+// ModelsResponse is the response of /gateway/models.
+type ModelsResponse struct {
+	Models []ModelOption `json:"models"`
+	// Defaults are the gateway's suggested defaults per provider; clients may override them in settings.
+	Defaults map[string]string `json:"defaults"`
+	// Live is false when the list is a built-in fallback because language_server could not be queried.
+	Live bool `json:"live"`
+	// DesktopActiveModel is the canonical model ID currently selected in the desktop Antigravity client.
+	DesktopActiveModel     string `json:"desktopActiveModel,omitempty"`
+	DesktopActiveModelName string `json:"desktopActiveModelName,omitempty"`
+}
+
+// 兜底默认值候选（按优先级排列）：实时列表里存在时才会被采用。
+var preferredDefaults = map[string][]string{
+	"gemini":       {"gemini-4-neon-high", "gemini-4-hydrogen-high", "gemini-4-carbon-high", "gemini-3.8-flash-high", "gemini-4-argon-high"},
+	"claude":       {"claude-opus-4-6-thinking", "claude-opus-5-5-high"},
+	"orchestrator": {"gemini-pro-orchestrator-neon", "gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"},
+}
+
+// fallbackModels is used until the first successful query, or when language_server is unreachable.
+var fallbackModels = []ModelOption{
+	{ID: "gemini-4-neon-xhigh", Name: "Gemini 4 Neon (Extra)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M535", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-neon-high", Name: "Gemini 4 Neon (High)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M532", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-neon-medium", Name: "Gemini 4 Neon (Medium)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M533", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-neon-low", Name: "Gemini 4 Neon (Low)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M534", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-hydrogen-xhigh", Name: "Gemini 4 Hydrogen (Extra)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M528", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-hydrogen-high", Name: "Gemini 4 Hydrogen (High)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M525", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-hydrogen-medium", Name: "Gemini 4 Hydrogen (Medium)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M526", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-hydrogen-low", Name: "Gemini 4 Hydrogen (Low)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M527", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-carbon-high", Name: "Gemini 4 Carbon (High)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M427", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-carbon-medium", Name: "Gemini 4 Carbon (Medium)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M437", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-carbon-low", Name: "Gemini 4 Carbon (Low)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M438", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M417", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M418", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M419", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M318", SupportsImages: true, Thinking: true},
+	{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M319", SupportsImages: true, Thinking: true},
+	{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)", Provider: "gemini", Enum: "MODEL_PLACEHOLDER_M320", SupportsImages: true, Thinking: true},
+	{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M402", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "claude-opus-5-5-medium", Name: "Claude Opus 5.5 (Medium)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M401", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "claude-opus-5-5-low", Name: "Claude Opus 5.5 (Low)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M400", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M405", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "claude-sonnet-5-5-medium", Name: "Claude Sonnet 5.5 (Medium)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M404", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "claude-sonnet-5-5-low", Name: "Claude Sonnet 5.5 (Low)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M403", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 (Thinking)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M26", SupportsImages: true, Thinking: true},
+	{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6 (Thinking)", Provider: "claude", Enum: "MODEL_PLACEHOLDER_M35", SupportsImages: true, Thinking: true},
+	{ID: "gemini-pro-orchestrator-neon", Name: "Orchestrator (Neon)", Provider: "orchestrator", Enum: "MODEL_PLACEHOLDER_M537", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-pro-orchestrator", Name: "Orchestrator (Carbon)", Provider: "orchestrator", Enum: "MODEL_PLACEHOLDER_M667", SupportsImages: true, Thinking: true, Tag: "New"},
+	{ID: "gemini-pro-orchestrator-argon", Name: "Orchestrator (Argon)", Provider: "orchestrator", Enum: "MODEL_PLACEHOLDER_M681", SupportsImages: true, Thinking: true, Tag: "New"},
+}
+
+// upstreamModel mirrors the fields of GetAvailableModels we care about.
+type upstreamModel struct {
+	DisplayName    string    `json:"displayName"`
+	Model          string    `json:"model"`
+	ModelProvider  string    `json:"modelProvider"`
+	Recommended    bool      `json:"recommended"`
+	IsInternal     bool      `json:"isInternal"`
+	SupportsImages bool      `json:"supportsImages"`
+	Thinking       bool      `json:"supportsThinking"`
+	TagTitle       string    `json:"tagTitle"`
+	MaxTokens      flexInt64 `json:"maxTokens"`
+}
+
+// upstreamModelList is the whole GetAvailableModels payload: the model map plus the vendor's own
+// picker curation (agentModelSorts) and default (defaultAgentModelId).
+type upstreamModelList struct {
+	Models         map[string]upstreamModel
+	CuratedIDs     []string // ids of the vendor's "Recommended" agent picker, in display order
+	DefaultAgentID string
+}
+
+// modelRegistry caches the curated and the full model tables.
+type modelRegistry struct {
+	mu          sync.RWMutex
+	fetchedAt   time.Time // last successful refresh
+	lastAttempt time.Time // last refresh attempt, successful or not (failure back-off)
+	inflight    bool
+	options     []ModelOption          // curated: the vendor's picker list (or a heuristic fallback)
+	officialDef string                 // vendor's defaultAgentModelId
+	byID        map[string]ModelOption // every named model, keyed by lower-case id
+	byEnum      map[string]ModelOption // enum -> preferred option
+}
+
+var liveModels = &modelRegistry{}
+
+func providerOf(modelProvider, id string) string {
+	lower := strings.ToLower(modelProvider + " " + id)
+	switch {
+	case strings.Contains(lower, "orch"):
+		return "orchestrator"
+	case strings.Contains(lower, "anthropic") || strings.Contains(lower, "claude"):
+		return "claude"
+	case strings.Contains(lower, "google") || strings.Contains(lower, "gemini"):
+		return "gemini"
+	default:
+		return "other"
+	}
+}
+
+// isLeavingSoon reports the vendor's "about to be removed" or unavailable label.
+func isLeavingSoon(tag string) bool {
+	t := strings.TrimSpace(tag)
+	return strings.EqualFold(t, "Leaving Soon") || strings.EqualFold(t, "Unavailable")
+}
+
+// isIgnoredModelTag reports redundant display badges (such as "Notice") that shouldn't appear in pickers.
+func isIgnoredModelTag(tag string) bool {
+	t := strings.TrimSpace(tag)
+	return strings.EqualFold(t, "Notice") || strings.EqualFold(t, "提示")
+}
+
+// isRetiredEnum reports enums that language_server still lists but the gateway remaps elsewhere.
+func isRetiredEnum(enum string) bool {
+	return strings.HasPrefix(enum, "MODEL_GOOGLE_GEMINI_2_5_")
+}
+
+// legacyRank orders duplicate ids that share one display name: lower is preferred.
+// Legacy 2.5 aliases and "-agent" aliases lose to the id that carries the real version.
+func legacyRank(id string) int {
+	switch {
+	case strings.Contains(id, "2.5"):
+		return 2
+	case strings.HasSuffix(id, "-agent"):
+		return 1
+	default:
+		return 0
+	}
+}
+
+var (
+	versionRe  = regexp.MustCompile(`\d+(?:\.\d+)*`)
+	effortRank = map[string]int{"xhigh": 0, "extra": 0, "high": 1, "medium": 2, "low": 3}
+)
+
+// versionKey extracts the numeric version from a display name ("Gemini 3.8 Flash (High)" -> [3 8]).
+func versionKey(name string) []int {
+	m := versionRe.FindString(name)
+	if m == "" {
+		return nil
+	}
+	var out []int
+	for _, part := range strings.Split(m, ".") {
+		n, _ := strconv.Atoi(part)
+		out = append(out, n)
+	}
+	return out
+}
+
+func effortOf(name string) int {
+	lower := strings.ToLower(name)
+	for k, v := range effortRank {
+		if strings.Contains(lower, "("+k+")") {
+			return v
+		}
+	}
+	return 3
+}
+
+func lessVersionDesc(a, b []int) (less, decided bool) {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] > b[i], true
+		}
+	}
+	if len(a) != len(b) {
+		return len(a) > len(b), true
+	}
+	return false, false
+}
+
+func normalizeModelDisplayName(name string) string {
+	// Align "(XHigh)" with the desktop client's "(Extra)" label.
+	if strings.HasSuffix(name, "(XHigh)") {
+		return strings.TrimSuffix(name, "(XHigh)") + "(Extra)"
+	}
+	return name
+}
+
+func isExcludedPickerModel(id string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(id)), "gpt-oss")
+}
+
+// buildModelTables turns raw upstream models into client options plus lookup tables.
+//
+// When curatedIDs (the vendor's own "Recommended" picker list) is present it decides both membership
+// and order, so the phone shows exactly what the desktop app offers. Otherwise a heuristic is used:
+// recommended models, de-duplicated by display name, newest version first.
+func buildModelTables(raw map[string]upstreamModel, curatedIDs []string) (options []ModelOption, byID, byEnum map[string]ModelOption) {
+	byID = map[string]ModelOption{}
+	byEnum = map[string]ModelOption{}
+
+	// 稳定遍历顺序，保证去重结果可复现
+	ids := make([]string, 0, len(raw))
+	for id := range raw {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	bestByName := map[string]ModelOption{}
+	leavingSoon := map[string]bool{} // 厂商标了「Leaving Soon」的模型：仍可按 id 解析（旧会话还在用），但不再提供选择
+	for _, id := range ids {
+		m := raw[id]
+		if m.DisplayName == "" || m.IsInternal || strings.HasPrefix(id, "chat_") {
+			continue
+		}
+		tag := strings.TrimSpace(m.TagTitle)
+		if isLeavingSoon(tag) || isIgnoredModelTag(tag) {
+			tag = ""
+		}
+		opt := ModelOption{
+			ID:             id,
+			Name:           normalizeModelDisplayName(m.DisplayName),
+			Provider:       providerOf(m.ModelProvider, id),
+			Enum:           m.Model,
+			SupportsImages: m.SupportsImages,
+			Thinking:       m.Thinking,
+			Tag:            tag,
+			MaxTokens:      int64(m.MaxTokens),
+		}
+		byID[strings.ToLower(id)] = opt
+		if isLeavingSoon(m.TagTitle) {
+			leavingSoon[opt.ID] = true
+		}
+
+		if prev, ok := byEnum[opt.Enum]; !ok || legacyRank(opt.ID) < legacyRank(prev.ID) {
+			if opt.Enum != "" {
+				byEnum[opt.Enum] = opt
+			}
+		}
+		// 退役的 2.5 枚举会被 normalizeLegacyEnum 改映射到别的模型，列出来只会让用户选 A 跑 B
+		if !m.Recommended || isRetiredEnum(opt.Enum) || isLeavingSoon(m.TagTitle) || isExcludedPickerModel(opt.ID) {
+			continue
+		}
+		if prev, ok := bestByName[opt.Name]; !ok || legacyRank(opt.ID) < legacyRank(prev.ID) {
+			bestByName[opt.Name] = opt
+		}
+	}
+
+	if len(curatedIDs) > 0 {
+		seen := map[string]bool{}
+		for _, id := range curatedIDs {
+			opt, ok := byID[strings.ToLower(id)]
+			if !ok || seen[opt.ID] || isRetiredEnum(opt.Enum) || leavingSoon[opt.ID] || isExcludedPickerModel(opt.ID) {
+				continue
+			}
+			seen[opt.ID] = true
+			options = append(options, opt)
+		}
+		if len(options) > 0 {
+			// 厂商分组（gemini / claude / orchestrator / other），组内保持官方顺序
+			rank := map[string]int{"gemini": 0, "claude": 1, "orchestrator": 2, "other": 3}
+			sort.SliceStable(options, func(i, j int) bool { return rank[options[i].Provider] < rank[options[j].Provider] })
+			return options, byID, byEnum
+		}
+	}
+
+	for _, opt := range bestByName {
+		options = append(options, opt)
+	}
+	rank := map[string]int{"gemini": 0, "claude": 1, "orchestrator": 2, "other": 3}
+	sort.SliceStable(options, func(i, j int) bool {
+		a, b := options[i], options[j]
+		if a.Provider != b.Provider {
+			return rank[a.Provider] < rank[b.Provider]
+		}
+		if less, decided := lessVersionDesc(versionKey(a.Name), versionKey(b.Name)); decided {
+			return less
+		}
+		if ea, eb := effortOf(a.Name), effortOf(b.Name); ea != eb {
+			return ea < eb
+		}
+		return a.Name < b.Name
+	})
+	return options, byID, byEnum
+}
+
+func (r *modelRegistry) set(options []ModelOption, byID, byEnum map[string]ModelOption, officialDefault string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.options, r.byID, r.byEnum, r.officialDef = options, byID, byEnum, officialDefault
+	r.fetchedAt = time.Now()
+}
+
+// invalidate drops cached picker options and freshness timestamps so the next query
+// fetches the newly active account's models instead of serving a stale 5-minute cache.
+// Existing byID/byEnum entries remain as lookup fallback until the fresh fetch lands.
+func (r *modelRegistry) invalidate() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.options = nil
+	r.officialDef = ""
+	r.fetchedAt = time.Time{}
+	r.lastAttempt = time.Time{}
+}
+
+func (r *modelRegistry) enumForID(id string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.byID[strings.ToLower(strings.TrimSpace(id))].Enum
+}
+
+func (r *modelRegistry) idForEnum(enum string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.byEnum[enum].ID
+}
+
+// displayName resolves an id or enum to its human-readable name ("" when unknown).
+func (r *modelRegistry) displayName(idOrEnum string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := strings.TrimSpace(idOrEnum)
+	if o, ok := r.byID[strings.ToLower(key)]; ok {
+		return o.Name
+	}
+	if o, ok := r.byEnum[key]; ok {
+		return o.Name
+	}
+	for _, o := range fallbackModels {
+		if strings.EqualFold(o.ID, key) || o.Enum == key {
+			return o.Name
+		}
+	}
+	return ""
+}
+
+// maxTokensFor returns the live context window token limit reported by GetAvailableModels
+// for the given model ID or enum (0 when unknown).
+func (r *modelRegistry) maxTokensFor(idOrEnum string) int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := strings.TrimSpace(idOrEnum)
+	if key == "" {
+		return 0
+	}
+	if o, ok := r.byID[strings.ToLower(key)]; ok && o.MaxTokens > 0 {
+		return o.MaxTokens
+	}
+	if o, ok := r.byEnum[key]; ok && o.MaxTokens > 0 {
+		return o.MaxTokens
+	}
+	return 0
+}
+
+func (r *modelRegistry) snapshot() (ModelsResponse, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	options := r.options
+	live := len(options) > 0
+	if !live {
+		options = fallbackModels
+	}
+	out := ModelsResponse{Models: append([]ModelOption(nil), options...), Defaults: map[string]string{}, Live: live}
+	// 厂商给的默认 agent 模型优先，其次是网关内置的偏好候选列表，最后是该厂商列表里的第一个
+	wanted := map[string][]string{}
+	for provider, ids := range preferredDefaults {
+		wanted[provider] = append([]string(nil), ids...)
+	}
+	if r.officialDef != "" {
+		for _, o := range out.Models {
+			if o.ID == r.officialDef && o.Provider != "other" {
+				wanted[o.Provider] = append([]string{o.ID}, wanted[o.Provider]...)
+			}
+		}
+	}
+	for provider, candidates := range wanted {
+		chosen := ""
+		for _, want := range candidates {
+			for _, o := range out.Models {
+				if o.Provider == provider && o.ID == want {
+					chosen = o.ID
+					break
+				}
+			}
+			if chosen != "" {
+				break
+			}
+		}
+		if chosen == "" {
+			for _, o := range out.Models {
+				if o.Provider == provider {
+					chosen = o.ID
+					break
+				}
+			}
+		}
+		if chosen != "" {
+			out.Defaults[provider] = chosen
+		}
+	}
+	return out, live
+}
+
+// beginRefresh reserves a refresh slot. It refuses when the cache is fresh, another refresh is
+// running, or the last attempt failed less than liveModelsRetry ago.
+func (r *modelRegistry) beginRefresh(force bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inflight {
+		return false
+	}
+	fresh := len(r.options) > 0 && time.Since(r.fetchedAt) <= liveModelsTTL
+	if fresh && !force {
+		return false
+	}
+	if !force && time.Since(r.lastAttempt) < liveModelsRetry {
+		return false
+	}
+	r.inflight = true
+	r.lastAttempt = time.Now()
+	return true
+}
+
+// needsRefresh is a cheap read-only check so hot paths can skip spawning a goroutine.
+func (r *modelRegistry) needsRefresh() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.inflight {
+		return false
+	}
+	if len(r.options) > 0 && time.Since(r.fetchedAt) <= liveModelsTTL {
+		return false
+	}
+	return time.Since(r.lastAttempt) >= liveModelsRetry
+}
+
+func (r *modelRegistry) endRefresh() {
+	r.mu.Lock()
+	r.inflight = false
+	r.mu.Unlock()
+}
+
+// fetchUpstreamModels queries GetAvailableModels.
+func (p *Proxy) fetchUpstreamModels(ctx context.Context, port int, token string) (*upstreamModelList, error) {
+	apiURL := fmt.Sprintf("https://127.0.0.1:%d/exa.language_server_pb.LanguageServerService/GetAvailableModels", port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader("{}"))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	if token != "" {
+		req.Header.Set("x-codeium-csrf-token", token)
+	}
+	client := p.mediumClient
+	if client == nil {
+		client = p.shortClient
+	}
+	if client == nil {
+		return nil, fmt.Errorf("upstream http client not initialized")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GetAvailableModels returned HTTP %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Response struct {
+			Models              map[string]upstreamModel `json:"models"`
+			DefaultAgentModelID string                   `json:"defaultAgentModelId"`
+			AgentModelSorts     []struct {
+				DisplayName string `json:"displayName"`
+				Groups      []struct {
+					ModelIDs []string `json:"modelIds"`
+				} `json:"groups"`
+			} `json:"agentModelSorts"`
+		} `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+	out := &upstreamModelList{Models: parsed.Response.Models, DefaultAgentID: parsed.Response.DefaultAgentModelID}
+	// 取第一个排序方案（"Recommended"）作为选择器列表
+	if len(parsed.Response.AgentModelSorts) > 0 {
+		for _, g := range parsed.Response.AgentModelSorts[0].Groups {
+			out.CuratedIDs = append(out.CuratedIDs, g.ModelIDs...)
+		}
+	}
+	return out, nil
+}
+
+// ensureLiveModels refreshes the registry when it is stale, blocking for at most liveModelsTimeout.
+// Cheap when the cache is fresh; failures keep whatever was cached before. Call it before resolving
+// a client-supplied model id.
+func (p *Proxy) ensureLiveModels(ctx context.Context) {
+	port, token := p.ActiveUpstream()
+	if port == 0 || !liveModels.beginRefresh(false) {
+		return
+	}
+	defer liveModels.endRefresh()
+	ctx, cancel := context.WithTimeout(ctx, liveModelsTimeout)
+	defer cancel()
+	if err := p.refreshLiveModels(ctx, port, token); err != nil {
+		slog.Warn("[Models] refresh failed, keeping previous list", "err", err)
+	}
+}
+
+// warmLiveModels refreshes in the background; used on hot paths that must not block.
+func (p *Proxy) warmLiveModels() {
+	if !liveModels.needsRefresh() {
+		return
+	}
+	go p.ensureLiveModels(context.Background())
+}
+
+// refreshLiveModels does the actual fetch + table build.
+func (p *Proxy) refreshLiveModels(ctx context.Context, port int, token string) error {
+	list, err := p.fetchUpstreamModels(ctx, port, token)
+	if err != nil {
+		return err
+	}
+	options, byID, byEnum := buildModelTables(list.Models, list.CuratedIDs)
+	if len(byID) == 0 {
+		return fmt.Errorf("GetAvailableModels returned no named models")
+	}
+	liveModels.set(options, byID, byEnum, list.DefaultAgentID)
+	return nil
+}
+
+// RefreshLiveModelsAfterSwitch invalidates cached models and fetches the new account's
+// available models once Antigravity has relaunched and signed in.
+func (p *Proxy) RefreshLiveModelsAfterSwitch(ctx context.Context) {
+	liveModels.invalidate()
+	p.userStatusMu.Lock()
+	p.cachedUserEmail = ""
+	p.cachedUserName = ""
+	p.cachedUserPort = 0
+	p.cachedUserAt = time.Time{}
+	p.userStatusMu.Unlock()
+
+	deadline := time.Now().Add(6 * time.Second)
+	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		port, token := p.ActiveUpstream()
+		if port != 0 && liveModels.beginRefresh(true) {
+			rctx, cancel := context.WithTimeout(ctx, liveModelsTimeout)
+			err := p.refreshLiveModels(rctx, port, token)
+			cancel()
+			liveModels.endRefresh()
+			if err == nil {
+				return
+			}
+			slog.Warn("[Models] post-switch refresh attempt failed", "attempt", attempt+1, "err", err)
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+type desktopSelectedModelCacheState struct {
+	mu          sync.RWMutex
+	path        string
+	checkedAt   time.Time
+	exists      bool
+	modTimeNano int64
+	size        int64
+	rawModel    string
+}
+
+var desktopSelectedModelCache desktopSelectedModelCacheState
+
+func extractLastSelectedAgentModelBytes(data []byte) string {
+	const needle = "last_selected_agent_model:"
+	rem := data
+	for len(rem) > 0 {
+		idx := bytes.Index(rem, []byte(needle))
+		if idx < 0 {
+			return ""
+		}
+		// Ensure needle starts at beginning of line (ignoring leading spaces/tabs).
+		validLineStart := true
+		for i := idx - 1; i >= 0; i-- {
+			b := rem[i]
+			if b == '\n' || b == '\r' {
+				break
+			}
+			if b != ' ' && b != '\t' {
+				validLineStart = false
+				break
+			}
+		}
+		after := rem[idx+len(needle):]
+		lineEnd := bytes.IndexAny(after, "\r\n")
+		var valBytes []byte
+		if lineEnd >= 0 {
+			valBytes = after[:lineEnd]
+			rem = after[lineEnd+1:]
+		} else {
+			valBytes = after
+			rem = nil
+		}
+		if !validLineStart {
+			continue
+		}
+		val := strings.TrimSpace(string(valBytes))
+		val = strings.Trim(val, `"'`)
+		if val == "" || strings.EqualFold(val, "MODEL_UNSPECIFIED") {
+			return ""
+		}
+		return val
+	}
+	return ""
+}
+
+func resolveDesktopSelectedModelIDAndName(raw string) (id, displayName string) {
+	if raw == "" {
+		return "", ""
+	}
+	id = canonicalModelName(raw)
+	if id == "" {
+		id = raw
+	}
+	displayName = liveModels.displayName(id)
+	if displayName == "" && id != raw {
+		displayName = liveModels.displayName(raw)
+	}
+	return id, displayName
+}
+
+// readDesktopSelectedModelCached reads Antigravity Desktop's currently selected model
+// with an optional statSkipTTL fast window (e.g. 1s on streaming hot paths) plus (mtime, size) caching
+// and zero-allocation bytes.Index scanning on file change.
+func readDesktopSelectedModelCached(statSkipTTL time.Duration) (id, displayName string) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", ""
+	}
+	statePath := filepath.Join(home, ".gemini", "antigravity", "antigravity_state.pbtxt")
+	now := time.Now()
+
+	if statSkipTTL > 0 {
+		desktopSelectedModelCache.mu.RLock()
+		if desktopSelectedModelCache.path == statePath && now.Sub(desktopSelectedModelCache.checkedAt) < statSkipTTL {
+			raw := desktopSelectedModelCache.rawModel
+			desktopSelectedModelCache.mu.RUnlock()
+			return resolveDesktopSelectedModelIDAndName(raw)
+		}
+		desktopSelectedModelCache.mu.RUnlock()
+	}
+
+	fi, statErr := os.Stat(statePath)
+	exists := statErr == nil && !fi.IsDir()
+	var modNano, size int64
+	if exists {
+		modNano = fi.ModTime().UnixNano()
+		size = fi.Size()
+	}
+
+	desktopSelectedModelCache.mu.RLock()
+	if desktopSelectedModelCache.path == statePath &&
+		desktopSelectedModelCache.exists == exists &&
+		desktopSelectedModelCache.modTimeNano == modNano &&
+		desktopSelectedModelCache.size == size {
+		raw := desktopSelectedModelCache.rawModel
+		desktopSelectedModelCache.mu.RUnlock()
+		if statSkipTTL > 0 {
+			desktopSelectedModelCache.mu.Lock()
+			if desktopSelectedModelCache.path == statePath &&
+				desktopSelectedModelCache.exists == exists &&
+				desktopSelectedModelCache.modTimeNano == modNano &&
+				desktopSelectedModelCache.size == size {
+				desktopSelectedModelCache.checkedAt = now
+			}
+			desktopSelectedModelCache.mu.Unlock()
+		}
+		return resolveDesktopSelectedModelIDAndName(raw)
+	}
+	desktopSelectedModelCache.mu.RUnlock()
+
+	raw := ""
+	if exists && size > 0 {
+		if data, readErr := os.ReadFile(statePath); readErr == nil && len(data) > 0 {
+			raw = extractLastSelectedAgentModelBytes(data)
+		}
+	}
+
+	desktopSelectedModelCache.mu.Lock()
+	desktopSelectedModelCache.path = statePath
+	desktopSelectedModelCache.checkedAt = now
+	desktopSelectedModelCache.exists = exists
+	desktopSelectedModelCache.modTimeNano = modNano
+	desktopSelectedModelCache.size = size
+	desktopSelectedModelCache.rawModel = raw
+	desktopSelectedModelCache.mu.Unlock()
+
+	return resolveDesktopSelectedModelIDAndName(raw)
+}
+
+// readDesktopSelectedModel reads Antigravity Desktop's currently selected model
+// from ~/.gemini/antigravity/antigravity_state.pbtxt (`last_selected_agent_model`).
+func readDesktopSelectedModel() (id, displayName string) {
+	return readDesktopSelectedModelCached(0)
+}
+
+// HandleModels handles GET/POST /gateway/models.
+func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if port, token := p.ActiveUpstream(); port != 0 && liveModels.beginRefresh(r.URL.Query().Get("refresh") == "1") {
+		ctx, cancel := context.WithTimeout(r.Context(), liveModelsTimeout)
+		if err := p.refreshLiveModels(ctx, port, token); err != nil {
+			slog.Warn("[Models] refresh failed, serving cached/fallback list", "err", err)
+		}
+		cancel()
+		liveModels.endRefresh()
+	}
+	res, _ := liveModels.snapshot()
+	res.DesktopActiveModel, res.DesktopActiveModelName = readDesktopSelectedModel()
+	data, err := json.Marshal(res)
+	if err != nil {
+		writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}

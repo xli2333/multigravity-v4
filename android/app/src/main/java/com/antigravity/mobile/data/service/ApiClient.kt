@@ -1,0 +1,2119 @@
+package com.antigravity.mobile.data.service
+
+import com.antigravity.mobile.ui.util.loc
+import android.content.Context
+import android.os.Build
+import android.util.Base64
+import android.util.Log
+import com.antigravity.mobile.data.model.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.*
+import okhttp3.Cache
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.ConnectionPool
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okio.source
+import java.io.File
+import java.io.IOException
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.time.Instant
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+private suspend fun Call.await(): Response = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation {
+        try {
+            cancel()
+        } catch (_: Throwable) {}
+    }
+    enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            if (continuation.isCancelled) {
+                response.close()
+            } else {
+                continuation.resume(response)
+            }
+        }
+        override fun onFailure(call: Call, e: IOException) {
+            continuation.resumeWithException(e)
+        }
+    })
+}
+
+class ApiClient(
+    private val context: Context,
+    private val prefs: PreferencesManager,
+    private val connectionManager: ConnectionManager? = null
+) {
+    init {
+        defaultInstance = this
+    }
+
+    companion object {
+        @Volatile
+        var defaultInstance: ApiClient? = null
+
+        @Volatile
+        var currentCascadeId: String? = null
+
+        suspend fun fetchFileContent(uri: String, cascadeId: String? = null): Result<FileContentResponse> {
+            val inst = defaultInstance ?: return Result.failure(IllegalStateException("ApiClient not initialized"))
+            return inst.fetchFileContent(uri, cascadeId)
+        }
+
+        val currentBaseUrl: String?
+            get() = defaultInstance?.currentBaseUrl
+
+        /**
+         * Strictly verifies that [url]'s `(scheme, host, port)` matches one of the explicitly paired
+         * gateway endpoints stored in [prefs], preventing Bearer/device-token leakage to third-party origins.
+         */
+        fun isConfiguredGatewayOrigin(url: HttpUrl, prefs: PreferencesManager?): Boolean {
+            if (prefs == null) return false
+            val endpoints = listOfNotNull(
+                prefs.gatewayBaseUrl,
+                prefs.primaryCloudUrl,
+                prefs.lanServerUrl,
+                prefs.customServerUrl,
+                prefs.relayServerUrl
+            )
+            for (raw in endpoints) {
+                val clean = raw.trim().trimEnd('/')
+                if (clean.isEmpty()) continue
+                val candidate = clean.toHttpUrlOrNull() ?: continue
+                if (candidate.scheme.equals(url.scheme, ignoreCase = true) &&
+                    candidate.host.equals(url.host, ignoreCase = true) &&
+                    candidate.port == url.port
+                ) {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    val currentBaseUrl: String?
+        get() {
+            val avoidLan = (connectionManager?.isCellular ?: false) || !(connectionManager?.isWifi ?: true)
+            return prefs.getEffectiveGatewayUrl(avoidLan, connectionManager) ?: prefs.gatewayBaseUrl
+        }
+
+    val json = JsonConfig.instance
+
+    val okHttpClient: OkHttpClient
+        get() = client
+
+    fun openWebSocket(request: Request, listener: okhttp3.WebSocketListener): okhttp3.WebSocket =
+        E2eeWebSocketHelper.openWebSocket(client, request, prefs, listener)
+
+    private val connectionPool = ConnectionPool()
+
+    private val client = OkHttpClient.Builder()
+        .connectionPool(connectionPool)
+        .dns(CloudflareOptimizedDns)
+        .cache(Cache(File(context.cacheDir, "http_cache"), 10L * 1024L * 1024L))
+        .addInterceptor(RouteFailoverInterceptor(prefs, connectionManager))
+        .addInterceptor(E2eeTransportInterceptor(prefs, connectionManager))
+        .addInterceptor(CloudflareEdgeFallbackInterceptor(connectionPool))
+        .addInterceptor(LanCleartextSecurityInterceptor())
+        .retryOnConnectionFailure(true)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val messagesEtagCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, StreamUpdatePayload>>()
+
+    /**
+     * Attempts pairing with candidates from PairingInfo.
+     * Supports encrypted zero-knowledge pairing (`POST /api/v1/e2ee/pair`) when QR carries `&pk=...`
+     * over public relay hosts, as well as inline E2EE key negotiation during LAN/CF pairing.
+     */
+    suspend fun pair(info: PairingInfo): Result<PairResponse> = withContext(Dispatchers.IO) {
+        val candidates = info.candidateBaseUrls()
+        if (candidates.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("无可用候选网关地址".loc))
+        }
+
+        val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
+        val (ephemKp, ephemPubB64) = E2eeCrypto.generateEphemeralKeyPair()
+        val pairReq = PairRequest(
+            pairingCode = info.code,
+            deviceName = deviceName,
+            platform = "android",
+            e2eePub = ephemPubB64
+        )
+        val bodyStr = json.encodeToString(pairReq)
+
+        var lastException: Exception? = null
+        for (candidate in candidates) {
+            val candHost = ConnectionManager.extractHost(candidate)
+            val gwPub = info.e2eePubKey?.takeIf { it.isNotBlank() }
+            val useEncryptedPair = gwPub != null && !ConnectionManager.isLanHost(candHost) && !ConnectionManager.isTailscaleHost(candHost)
+            val endpoint = if (useEncryptedPair) "$candidate/api/v1/e2ee/pair" else "$candidate/api/v1/auth/pair"
+            try {
+                var activePriv = ephemKp.private
+                var activeClientPub = ephemPubB64
+                val postBody = if (useEncryptedPair) {
+                    val (encKp, encPub, envJson) = E2eeCrypto.encryptPairEnvelope(bodyStr.toByteArray(Charsets.UTF_8), gwPub!!)
+                    activePriv = encKp.private
+                    activeClientPub = encPub
+                    envJson
+                } else {
+                    bodyStr
+                }
+
+                val request = Request.Builder()
+                    .url(endpoint)
+                    .post(postBody.toRequestBody(jsonMediaType))
+                    .build()
+
+                client.newCall(request).await().use { response ->
+                    val rawRespStr = response.body?.string() ?: ""
+                    val (effectiveCode, respStr) = if (useEncryptedPair && response.isSuccessful) {
+                        E2eeCrypto.decryptPairEnvelope(rawRespStr, activePriv, activeClientPub, gwPub!!)
+                    } else {
+                        response.code to rawRespStr
+                    }
+                    if (effectiveCode !in 200..299) {
+                        val errMsg = respStr.ifBlank { "HTTP $effectiveCode" }
+                        lastException = RuntimeException("配对响应失败: $errMsg".loc)
+                        return@use
+                    }
+                    val pairResp = json.decodeFromString<PairResponse>(respStr)
+
+                    // Persist device credentials & derive E2EE session key before updating endpoints
+                    prefs.deviceToken = pairResp.deviceToken
+                    prefs.deviceId = pairResp.deviceId
+                    if (!pairResp.e2eeGatewayPub.isNullOrBlank() && !pairResp.e2eeSalt.isNullOrBlank()) {
+                        E2eeCrypto.deriveAndSaveDeviceKey(
+                            privateKey = activePriv,
+                            gatewayPubB64 = pairResp.e2eeGatewayPub,
+                            saltB64 = pairResp.e2eeSalt,
+                            deviceId = pairResp.deviceId,
+                            prefs = prefs
+                        )
+                    }
+
+                    var lanUrl: String? = info.lanBaseUrl
+                    var relayUrl: String? = info.relayBaseUrl
+                    var cloudUrl: String? = null
+
+                    if (info.ssl || !ConnectionManager.isLanHost(ConnectionManager.extractHost(info.host))) {
+                        cloudUrl = info.serverBaseUrl
+                    }
+
+                    if (pairResp.endpoints != null) {
+                        for (ep in pairResp.endpoints) {
+                            val epUrl = ep.url.trim().trimEnd('/')
+                            val trusted = ConnectionManager.isTrustedEndpoint(epUrl, info, candidate) ||
+                                (useEncryptedPair && ConnectionManager.isValidAdvertisedCloudUrl(epUrl, prefs, trustedByE2ee = true))
+                            if (!trusted) {
+                                continue
+                            }
+                            when (ep.type.lowercase()) {
+                                "lan" -> lanUrl = epUrl
+                                "relay" -> {
+                                    relayUrl = epUrl
+                                    cloudUrl = epUrl
+                                    val rHost = ConnectionManager.extractHost(epUrl)
+                                    if (rHost.isNotEmpty()) E2eeCrypto.markHostRequiresE2ee(rHost)
+                                }
+                                "cloudflare" -> {
+                                    if (cloudUrl.isNullOrBlank() || relayUrl.isNullOrBlank()) {
+                                        cloudUrl = epUrl
+                                    }
+                                }
+                                "primary" -> {
+                                    val h = ConnectionManager.extractHost(epUrl)
+                                    when {
+                                        ConnectionManager.isLanHost(h) && lanUrl.isNullOrBlank() -> lanUrl = epUrl
+                                        ConnectionManager.isRelayHost(h) && relayUrl.isNullOrBlank() -> relayUrl = epUrl
+                                        else -> if (cloudUrl.isNullOrBlank()) cloudUrl = epUrl
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    val dualRelay = pairResp.relayCloudUrl?.trim()?.trimEnd('/')
+                    if (!dualRelay.isNullOrBlank() &&
+                        E2eeCrypto.isReady(prefs) &&
+                        ConnectionManager.isValidAdvertisedCloudUrl(dualRelay, prefs, trustedByE2ee = true)
+                    ) {
+                        relayUrl = dualRelay
+                        cloudUrl = dualRelay
+                        val rHost = ConnectionManager.extractHost(dualRelay)
+                        if (rHost.isNotEmpty()) E2eeCrypto.markHostRequiresE2ee(rHost)
+                    }
+
+                    // Fallback classify the successful candidate into its slot if still unassigned
+                    val candClean = candidate.trim().trimEnd('/')
+                    when {
+                        ConnectionManager.isLanHost(candHost) -> {
+                            if (lanUrl.isNullOrBlank()) lanUrl = candClean
+                        }
+                        ConnectionManager.isRelayHost(candHost) -> {
+                            if (relayUrl.isNullOrBlank()) relayUrl = candClean
+                            if (cloudUrl.isNullOrBlank()) cloudUrl = candClean
+                        }
+                        else -> {
+                            // Public allocated domain (e.g. Cloudflare tunnel) strictly serves as background fallback, NEVER custom!
+                            if (cloudUrl.isNullOrBlank()) cloudUrl = candClean
+                        }
+                    }
+
+                    prefs.updateEndpoints(
+                        lan = lanUrl,
+                        relay = relayUrl,
+                        custom = null, // Strictly null: custom is left for manual user configuration only
+                        active = candidate,
+                        primaryCloud = cloudUrl
+                    )
+                    val plat = pairResp.platform ?: pairResp.os ?: info.platform ?: info.os
+                    if (!plat.isNullOrBlank()) {
+                        prefs.gatewayPlatform = plat
+                    }
+
+                    return@withContext Result.success(pairResp)
+                }
+            } catch (e: Exception) {
+                Log.w("ApiClient", "Failed candidate $candidate: ${e.message}")
+                lastException = e
+            }
+        }
+
+        Result.failure(lastException ?: RuntimeException("所有候选地址配对均超时或失败".loc))
+    }
+
+    /**
+     * Fetch all conversations via ConnectRPC GetAllCascadeTrajectories
+     */
+    suspend fun fetchConversations(): Result<List<ConversationItem>> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories"
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post("{}".toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("获取会话列表失败 (${response.code})".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val resp = json.decodeFromString<GetAllCascadeTrajectoriesResponse>(bodyStr)
+                val summaries = resp.trajectorySummaries ?: emptyMap()
+                val localPinnedIds = prefs.getPinnedConversationIds()
+
+                val list = summaries.mapNotNull { (id, summary) ->
+                    if (summary.isSubagent) return@mapNotNull null
+                    val localViewTime = prefs.getLastViewTime(id)
+                    val serverPinned = summary.annotations?.pinned
+                    val isPinned = if (serverPinned != null) {
+                        if (serverPinned != localPinnedIds.contains(id)) {
+                            prefs.setPinned(id, serverPinned)
+                        }
+                        serverPinned
+                    } else {
+                        localPinnedIds.contains(id)
+                    }
+                    val item = ConversationItem.fromSummary(
+                        id = id,
+                        summary = summary,
+                        localViewTime = localViewTime,
+                        isPinned = isPinned
+                    )
+                    if (item.isSubagent) return@mapNotNull null
+                    item
+                }.sortedWith(
+                    compareByDescending<ConversationItem> { it.lastModifiedEpochMs }
+                        .thenByDescending { it.id }
+                )
+
+                Result.success(list)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetch Cockpit Quota status
+     */
+    suspend fun fetchCockpitQuotas(): Result<CockpitQuotaResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/v1/cockpit/quotas"
+
+        try {
+            val req = buildAuthorizedRequest(url).get().build()
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("获取配额失败 (${response.code})".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val quotaResp = json.decodeFromString<CockpitQuotaResponse>(bodyStr)
+                Result.success(quotaResp)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetch Cockpit Token History & 52-week Heatmap
+     */
+    suspend fun fetchTokenHistory(force: Boolean = false): Result<TokenHistoryResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/v1/cockpit/tokens/history" + if (force) "?force=true" else ""
+
+        try {
+            val req = buildAuthorizedRequest(url).get().build()
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("获取 Token 历史失败 (${response.code})".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val historyResp = json.decodeFromString<TokenHistoryResponse>(bodyStr)
+                Result.success(historyResp)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Refresh Cockpit Quota
+     */
+    suspend fun refreshCockpitQuotas(): Result<CockpitQuotaResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/v1/cockpit/refresh"
+
+        try {
+            val req = buildAuthorizedRequest(url).post("{}".toRequestBody(jsonMediaType)).build()
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("刷新配额失败 (${response.code})".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val quotaResp = json.decodeFromString<CockpitQuotaResponse>(bodyStr)
+                Result.success(quotaResp)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Switch active Cockpit Account
+     */
+    suspend fun switchCockpitAccount(accountId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/v1/cockpit/switch"
+
+        val body = buildJsonObject {
+            put("account_id", accountId)
+        }.toString().toRequestBody(jsonMediaType)
+
+        try {
+            val req = buildAuthorizedRequest(url).post(body).build()
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("切换账号失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetch workspace projects from gateway
+     */
+    suspend fun fetchProjects(): Result<List<ProjectItem>> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/gateway/projects"
+
+        try {
+            val req = buildAuthorizedRequest(url).get().build()
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    val errMsg = response.body?.string()?.take(200) ?: ""
+                    Log.e("ApiClient", "fetchProjects failed (${response.code}): $errMsg")
+                    return@withContext Result.failure(RuntimeException("获取工作区列表失败 (${response.code})".loc))
+                }
+                val bodyStr = response.body?.string() ?: "[]"
+                val list = json.decodeFromString<List<ProjectItem>>(bodyStr)
+                Log.d("ApiClient", "fetchProjects successfully retrieved ${list.size} projects")
+                if (prefs.gatewayPlatform == null) {
+                    for (item in list) {
+                        val p = item.path.ifBlank { item.uri }
+                        if (p.contains(":\\\\") || p.contains(":/") || p.contains(":\\") || (p.length >= 2 && p[1] == ':')) {
+                            prefs.gatewayPlatform = "windows"
+                            break
+                        } else if (p.startsWith("/Users/")) {
+                            prefs.gatewayPlatform = "darwin"
+                            break
+                        } else if (p.startsWith("/home/")) {
+                            prefs.gatewayPlatform = "linux"
+                            break
+                        }
+                    }
+                }
+                Result.success(list)
+            }
+        } catch (e: Exception) {
+            Log.e("ApiClient", "fetchProjects error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Update or clear custom alias for a workspace/project path
+     */
+    suspend fun updateProjectAlias(path: String, alias: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/gateway/projects/alias"
+
+        val payload = buildJsonObject {
+            put("path", path.trim())
+            put("alias", alias.trim())
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("修改工作区备注失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Create a new cascade session
+     */
+    suspend fun createCascade(
+        workspaceUri: String,
+        prompt: String,
+        model: String? = null,
+        projectId: String? = null
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/gateway/cascade/new"
+
+        val payload = buildJsonObject {
+            put("workspaceUri", workspaceUri)
+            put("prompt", prompt)
+            model?.let { put("model", it) }
+            projectId?.let { put("projectId", it) }
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("创建会话失败: HTTP ${response.code}".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val resObj = json.parseToJsonElement(bodyStr).jsonObject
+                val cascadeId = resObj["cascadeId"]?.jsonPrimitive?.contentOrNull
+                if (!cascadeId.isNullOrBlank()) {
+                    Result.success(cascadeId)
+                } else {
+                    val err = resObj["error"]?.jsonPrimitive?.contentOrNull ?: "未能生成会话 ID".loc
+                    Result.failure(RuntimeException(err))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Delete a conversation
+     */
+    suspend fun deleteConversation(cascadeId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory"
+
+        val payload = buildJsonObject {
+            put("cascadeId", cascadeId)
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("删除会话失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Rename conversation
+     */
+    suspend fun renameConversation(cascadeId: String, newTitle: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
+
+        val payload = buildJsonObject {
+            put("cascadeIds", buildJsonArray { add(JsonPrimitive(cascadeId)) })
+            put("annotations", buildJsonObject {
+                put("title", newTitle.trim())
+            })
+            put("mergeAnnotations", true)
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("重命名会话失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Update pinned state of a conversation in upstream language_server
+     */
+    suspend fun setConversationPinned(cascadeId: String, pinned: Boolean): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
+
+        val payload = buildJsonObject {
+            put("cascadeIds", buildJsonArray { add(JsonPrimitive(cascadeId)) })
+            put("annotations", buildJsonObject {
+                put("pinned", pinned)
+            })
+            put("mergeAnnotations", true)
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("设置置顶状态失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetch paginated messages for a cascade session
+     */
+    suspend fun fetchMessages(
+        cascadeId: String,
+        limit: Int = 15,
+        offset: Int? = null,
+        fromOffset: Int? = null
+    ): Result<StreamUpdatePayload> = withContext(Dispatchers.IO) {
+        if (!CacheManager.isValidCascadeId(cascadeId)) {
+            return@withContext Result.failure(IllegalArgumentException("无效的会话 ID".loc))
+        }
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val encodedCid = URLEncoder.encode(cascadeId, "UTF-8")
+        val urlBuilder = StringBuilder("$baseUrl/gateway/cascade/messages?cascadeId=$encodedCid&limit=$limit")
+        offset?.let { urlBuilder.append("&offset=$it") }
+        fromOffset?.let { urlBuilder.append("&fromOffset=$it") }
+
+        try {
+            val urlStr = urlBuilder.toString()
+            val cached = messagesEtagCache[urlStr]
+            val reqBuilder = buildAuthorizedRequest(urlStr).get()
+            if (cached != null && cached.first.isNotBlank()) {
+                reqBuilder.header("If-None-Match", cached.first)
+            }
+
+            client.newCall(reqBuilder.build()).await().use { response ->
+                if (response.code == 304 && cached != null) {
+                    return@withContext Result.success(cached.second)
+                }
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("获取消息失败: HTTP ${response.code}".loc))
+                }
+                if (response.networkResponse?.code == 304 && cached != null) {
+                    return@withContext Result.success(cached.second)
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val payload = json.decodeFromString<StreamUpdatePayload>(bodyStr)
+                val etag = response.header("ETag")?.trim()
+                if (!etag.isNullOrEmpty()) {
+                    if (messagesEtagCache.size >= 32 && !messagesEtagCache.containsKey(urlStr)) {
+                        messagesEtagCache.clear()
+                    }
+                    messagesEtagCache[urlStr] = etag to payload
+                }
+                Result.success(payload)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Send user message to a cascade session
+     */
+    suspend fun sendMessage(
+        cascadeId: String,
+        text: String,
+        model: String? = null,
+        images: List<Pair<ByteArray, String>> = emptyList(),
+        deliveryStrategy: Int? = null,
+        clientMessageId: String? = null,
+        attachmentIds: List<String> = emptyList(),
+        /** 斜杠命令名（如 "plan"）。网关会补全权威定义；命令条目排在文本条目之前。 */
+        slashCommand: String? = null,
+        contextItems: List<ContextMentionItem> = emptyList()
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage"
+
+        val payload = buildJsonObject {
+            put("cascadeId", cascadeId)
+            putJsonArray("items") {
+                if (!slashCommand.isNullOrBlank()) {
+                    addJsonObject {
+                        putJsonObject("item") {
+                            putJsonObject("slashCommand") {
+                                putJsonObject("info") { put("name", slashCommand) }
+                            }
+                        }
+                    }
+                }
+                // 带命令时文本前补一个空格，让服务端生成的显示文本是 "/plan 内容"；只有命令没有文本时不带文本条目
+                if (slashCommand.isNullOrBlank() || text.isNotEmpty()) {
+                    addJsonObject {
+                        put("text", if (slashCommand.isNullOrBlank()) text else " $text")
+                    }
+                }
+            }
+            put("text", text)
+            if (images.isNotEmpty()) {
+                // Only media[] is stored by language_server (and read by the model); sending the
+                // legacy images[] copy as well would double the upload.
+                putJsonArray("media") {
+                    images.forEach { (bytes, mime) ->
+                        addJsonObject {
+                            put("inlineData", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                            put("mimeType", mime)
+                        }
+                    }
+                }
+            } else {
+                put("media", JsonArray(emptyList()))
+            }
+            if (attachmentIds.isNotEmpty()) {
+                putJsonArray("attachments") {
+                    attachmentIds.forEach { id -> addJsonObject { put("id", id) } }
+                }
+            }
+            if (contextItems.isNotEmpty()) {
+                put("contextItems", json.encodeToJsonElement(contextItems))
+            }
+            deliveryStrategy?.let { put("deliveryStrategy", it) }
+            model?.let { put("model", it) }
+        }
+
+        try {
+            val reqBuilder = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+
+            if (!clientMessageId.isNullOrBlank()) {
+                reqBuilder.header("X-Client-Message-Id", clientMessageId)
+            }
+            if (!model.isNullOrBlank()) {
+                reqBuilder.header("X-Antigravity-Model", model)
+            }
+
+            val req = reqBuilder.build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("发送失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 删除队列中的消息 (DeleteAgentMessage)
+     */
+    suspend fun deleteAgentMessage(
+        cascadeId: String,
+        messageId: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/DeleteAgentMessage"
+
+        val payload = buildJsonObject {
+            put("messageId", messageId)
+            put("recipient", cascadeId)
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("删除队列消息失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Cancel ongoing invocation
+     */
+    suspend fun cancelInvocation(cascadeId: String, killBackgroundTasks: Boolean? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation"
+
+        val payload = buildJsonObject {
+            put("cascadeId", cascadeId)
+            if (killBackgroundTasks != null) {
+                put("killBackgroundTasks", killBackgroundTasks)
+            }
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("取消失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 关停一个子代理（网关只接受子代理会话，不会误停主会话）。
+     */
+    suspend fun stopSubagent(conversationId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val payload = buildJsonObject { put("conversationId", conversationId) }
+        try {
+            val req = buildAuthorizedRequest("$baseUrl/gateway/subagent/stop")
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) Result.success(Unit)
+                else Result.failure(RuntimeException("关停子代理失败: HTTP ${response.code}".loc))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Stop background running command task
+     */
+    suspend fun stopTask(cascadeId: String, taskId: String, stepIndex: Int = 0): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/gateway/cascade/task/stop"
+
+        val payload = buildJsonObject {
+            put("cascadeId", cascadeId)
+            put("taskId", taskId)
+            put("stepIndex", stepIndex)
+            put("cascade_id", cascadeId)
+            put("task_id", taskId)
+            put("step_index", stepIndex)
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("停止任务失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Submit user interaction response (e.g. command approval, permission, ask_question)
+     */
+    suspend fun submitInteraction(
+        cascadeId: String,
+        trajectoryId: String = "",
+        stepIndex: Int = 0,
+        type: String = "",
+        optionId: String? = null,
+        scope: Int = 1,
+        allow: Boolean = true,
+        writeInResponse: String = "",
+        skipped: Boolean = false,
+        target: String? = null,
+        questionResponses: List<QuestionResponse>? = null
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/gateway/cascade/interaction"
+
+        val reqObj = InteractionSubmitRequest(
+            cascadeId = cascadeId,
+            trajectoryId = trajectoryId,
+            stepIndex = stepIndex,
+            type = type,
+            optionId = optionId,
+            scope = scope,
+            allow = allow,
+            writeInResponse = writeInResponse,
+            skipped = skipped,
+            target = target,
+            questionResponses = questionResponses
+        )
+        val bodyStr = json.encodeToString(reqObj)
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(bodyStr.toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("交互提交失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Proceed with artifact plan execution (aligned 1:1 with iOS SendUserCascadeMessage protocol)
+     */
+    suspend fun proceedArtifact(
+        cascadeId: String,
+        artifactUri: String,
+        model: String? = null
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage"
+
+        val comment = buildJsonObject {
+            put("artifactUri", artifactUri)
+            put("scope", buildJsonObject {
+                put("case", "fullFile")
+                put("value", buildJsonObject {})
+            })
+            put("approvalStatus", 1)
+            put("comment", "")
+        }
+
+        val payload = buildJsonObject {
+            put("cascadeId", cascadeId)
+            put("items", JsonArray(emptyList()))
+            put("artifactComments", buildJsonArray { add(comment) })
+            if (!model.isNullOrBlank()) {
+                put("model", model)
+            }
+        }
+
+        try {
+            val reqBuilder = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+            if (!model.isNullOrBlank()) {
+                reqBuilder.addHeader("X-Antigravity-Model", model)
+            }
+            val req = reqBuilder.build()
+
+            client.newCall(req).await().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(RuntimeException("执行方案推进失败: HTTP ${response.code}".loc))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetch document or artifact content with companion metadata
+     */
+    suspend fun fetchFileContent(uri: String, cascadeId: String? = null): Result<FileContentResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val unescapedUri = try { URLDecoder.decode(uri, "UTF-8") } catch (_: Exception) { uri }
+        val encodedUri = URLEncoder.encode(unescapedUri, "UTF-8")
+        val cidParam = cascadeId?.let { "&cascade_id=${URLEncoder.encode(it, "UTF-8")}" } ?: ""
+        val url = "$baseUrl/api/v1/files/content?uri=$encodedUri$cidParam"
+
+        try {
+            val req = buildAuthorizedRequest(url).get().build()
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("获取文件失败: HTTP ${response.code}".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val fileResp = json.decodeFromString<FileContentResponse>(bodyStr)
+                Result.success(fileResp)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun fetchWeChatChatArchive(uri: String, cascadeId: String? = null): Result<WeChatChatArchive> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl?.trimEnd('/') ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val cleanUri = normalizeUriForGateway(uri)
+        val encodedUri = URLEncoder.encode(cleanUri, "UTF-8")
+        val cidParam = cascadeId?.takeIf { it.isNotBlank() }?.let { "&cascade_id=${URLEncoder.encode(it, "UTF-8")}" } ?: ""
+        val url = "$baseUrl/api/v1/files/wechat-chat?uri=$encodedUri$cidParam"
+        try {
+            val req = buildAuthorizedRequest(url).get().build()
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("解析聊天记录失败: HTTP ${response.code}".loc))
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val parsed = json.decodeFromString<WeChatChatArchive>(bodyStr)
+                Result.success(parsed)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun buildZipEntryUrl(uri: String, entry: String, cascadeId: String? = null, thumb: Boolean = false): String {
+        val baseUrl = currentBaseUrl?.trimEnd('/') ?: return ""
+        val cleanUri = normalizeUriForGateway(uri)
+        val encodedUri = URLEncoder.encode(cleanUri, "UTF-8")
+        val encodedEntry = URLEncoder.encode(entry, "UTF-8")
+        val cidParam = cascadeId?.takeIf { it.isNotBlank() }?.let { "&cascade_id=${URLEncoder.encode(it, "UTF-8")}" } ?: ""
+        val thumbParam = if (thumb) "&thumb=1" else ""
+        return "$baseUrl/api/v1/files/zip-entry?uri=$encodedUri&entry=$encodedEntry$cidParam$thumbParam"
+    }
+
+    private fun normalizeUriForGateway(raw: String): String {
+        var clean = raw.trim()
+        if (clean.startsWith("MEDIA:", ignoreCase = true)) {
+            clean = clean.substring(6).trim()
+        }
+        if (clean.startsWith("file://")) {
+            clean = clean.removePrefix("file://")
+        }
+        clean = clean.trim('`', '"', '\'', '(', ')', '[', ']', '<', '>')
+        return try { URLDecoder.decode(clean, "UTF-8") } catch (_: Exception) { clean }
+    }
+
+    /**
+     * Report session focus to gateway immediately on tap (0ms latency, fire-and-forget).
+     * Synchronizes Mac desktop / hardware cascading cursor state.
+     */
+    fun notifySessionFocus(cascadeId: String) {
+        if (cascadeId.isBlank()) return
+        val baseUrl = currentBaseUrl ?: return
+        val url = "$baseUrl/gateway/cascade/focus"
+        val payload = buildJsonObject {
+            put("cascadeId", cascadeId)
+            put("source", "android")
+        }
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).enqueue(object : okhttp3.Callback {
+                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+                override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                    response.close()
+                }
+            })
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Mark conversation as read locally and report upstream
+     */
+    suspend fun markConversationAsRead(cascadeId: String, customViewTime: Long? = null) = withContext(Dispatchers.IO) {
+        val now = customViewTime ?: System.currentTimeMillis()
+        prefs.setLastViewTime(cascadeId, now)
+
+        // 1. Notify focus
+        notifySessionFocus(cascadeId)
+
+        // 2. Report upstream to LanguageServerService/UpdateConversationAnnotations
+        val baseUrl = currentBaseUrl ?: return@withContext
+        val url = "$baseUrl/api/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
+        val nowIso = Instant.ofEpochMilli(now).toString()
+
+        val payload = buildJsonObject {
+            put("cascadeIds", buildJsonArray { add(JsonPrimitive(cascadeId)) })
+            put("annotations", buildJsonObject {
+                put("markedAsUnread", false)
+                put("lastUserViewTime", nowIso)
+            })
+            put("mergeAnnotations", true)
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).await().close()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Resolves a raw media/image URI into an authenticated, loadable HTTP URL for Coil / Image loaders.
+     * Note: Image authentication is handled via Authorization Header (configured in Coil ImageLoader)
+     * avoiding deprecated query tokens.
+     */
+    fun resolveMediaURL(raw: String): String {
+        var clean = raw.trim()
+        if (clean.startsWith("MEDIA:", ignoreCase = true)) {
+            clean = clean.substring(6).trim()
+        }
+        clean = clean.trim('`', '"', '\'', '(', ')', '[', ']', '<', '>')
+
+        val baseUrl = currentBaseUrl?.trimEnd('/') ?: ""
+
+        if (clean.startsWith("http://") || clean.startsWith("https://")) {
+            return clean
+        }
+
+        if (clean.startsWith("/static/")) {
+            return "$baseUrl$clean"
+        }
+
+        if (clean.startsWith("file://")) {
+            clean = clean.removePrefix("file://")
+        }
+
+        if (baseUrl.isBlank()) return clean
+
+        val unescaped = try {
+            URLDecoder.decode(clean, "UTF-8")
+        } catch (_: Exception) {
+            clean
+        }
+
+        val encodedUri = try {
+            URLEncoder.encode(unescaped, "UTF-8")
+        } catch (_: Exception) {
+            unescaped
+        }
+        return "$baseUrl/api/v1/files/raw?uri=$encodedUri"
+    }
+
+    suspend fun downloadFile(
+        uri: String,
+        targetFile: java.io.File,
+        cascadeId: String? = null,
+        onProgress: ((progress: Float, written: Long, total: Long) -> Unit)? = null
+    ): Result<java.io.File> = withContext(Dispatchers.IO) {
+        try {
+            val resolvedUrl = resolveMediaURL(uri)
+            val parsedTarget = resolvedUrl.toHttpUrlOrNull()
+                ?: return@withContext Result.failure(IllegalArgumentException("无效的文件链接".loc))
+            val isGatewayOrigin = isConfiguredGatewayOrigin(parsedTarget, prefs)
+            val request = Request.Builder()
+                .url(parsedTarget)
+                .apply {
+                    if (isGatewayOrigin) {
+                        prefs.deviceToken?.takeIf { it.isNotBlank() }?.let { token ->
+                            header("Authorization", "Bearer $token")
+                        }
+                    }
+                }
+                .build()
+
+            val call = client.newCall(request)
+            val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+                if (cause != null) {
+                    try {
+                        call.cancel()
+                    } catch (_: Throwable) {}
+                }
+            }
+            var tempFile: java.io.File? = null
+            try {
+                call.await().use { response ->
+                    if (!response.isSuccessful) {
+                        return@withContext Result.failure(RuntimeException("下载文件失败: HTTP ${response.code}".loc))
+                    }
+                    val body = response.body ?: return@withContext Result.failure(RuntimeException("空响应体".loc))
+                    val totalLength = body.contentLength()
+
+                    targetFile.parentFile?.mkdirs()
+                    val candidateTemp = java.io.File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
+                    tempFile = candidateTemp
+                    candidateTemp.outputStream().use { output ->
+                        body.byteStream().use { input ->
+                            val buffer = ByteArray(8192)
+                            var bytesWritten = 0L
+                            var lastEmittedProgress = 0f
+                            var lastEmitMs = 0L
+                            var read: Int
+                            while (input.read(buffer).also { read = it } != -1) {
+                                coroutineContext.ensureActive()
+                                output.write(buffer, 0, read)
+                                bytesWritten += read
+                                if (totalLength > 0 && onProgress != null) {
+                                    val rawProgress = (bytesWritten.toFloat() / totalLength.toFloat()).coerceIn(0f, 1f)
+                                    val monotonicProgress = maxOf(lastEmittedProgress, rawProgress)
+                                    val now = android.os.SystemClock.elapsedRealtime()
+                                    val shouldEmit = monotonicProgress >= 1f ||
+                                        lastEmittedProgress == 0f ||
+                                        (now - lastEmitMs >= 50L && monotonicProgress - lastEmittedProgress >= 0.005f) ||
+                                        (monotonicProgress - lastEmittedProgress >= 0.05f)
+                                    if (shouldEmit) {
+                                        lastEmittedProgress = monotonicProgress
+                                        lastEmitMs = now
+                                        onProgress(monotonicProgress, bytesWritten, totalLength)
+                                    }
+                                }
+                            }
+                            output.flush()
+                        }
+                    }
+                    coroutineContext.ensureActive()
+                    if (targetFile.exists()) targetFile.delete()
+                    if (!candidateTemp.renameTo(targetFile)) {
+                        candidateTemp.copyTo(targetFile, overwrite = true)
+                        candidateTemp.delete()
+                    }
+                    tempFile = null
+                    Result.success(targetFile)
+                }
+            } catch (e: CancellationException) {
+                tempFile?.delete()
+                throw e
+            } finally {
+                cancelHandle?.dispose()
+                tempFile?.delete()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Unpairs this device from the gateway and cleans up server-side state.
+     */
+    suspend fun unpair(): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl?.trim()?.trimEnd('/')
+        val token = prefs.deviceToken
+        if (baseUrl.isNullOrBlank() || token.isNullOrBlank()) {
+            return@withContext Result.success(Unit)
+        }
+
+        try {
+            val endpoint = "$baseUrl/api/v1/auth/unpair"
+            val body = "{}".toRequestBody(jsonMediaType)
+            val request = buildAuthorizedRequest(endpoint)
+                .post(body)
+                .build()
+
+            client.newCall(request).await().use { response ->
+                Log.d("ApiClient", "Unpair response code: ${response.code}")
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.w("ApiClient", "Unpair call failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetches revert preview for a cascade step.
+     */
+    suspend fun getRevertPreview(cascadeId: String, stepIndex: Int): Result<RevertPreviewResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl?.trim()?.trimEnd('/')
+            ?: return@withContext Result.failure(IllegalStateException("网关地址未配置".loc))
+
+        try {
+            val endpoint = "$baseUrl/gateway/cascade/revert/preview"
+            val reqPayload = json.encodeToString(RevertPreviewRequest(cascadeId = cascadeId, stepIndex = stepIndex))
+            val request = buildAuthorizedRequest(endpoint)
+                .post(reqPayload.toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(request).await().use { response ->
+                if (!response.isSuccessful) {
+                    val errMsg = response.body?.string() ?: "HTTP ${response.code}"
+                    return@withContext Result.failure(RuntimeException("获取撤回预览失败: $errMsg".loc))
+                }
+                val respStr = response.body?.string() ?: ""
+                val preview = json.decodeFromString<RevertPreviewResponse>(respStr)
+                Result.success(preview)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Executes revert for a cascade step.
+     */
+    suspend fun executeRevert(cascadeId: String, stepIndex: Int, conversationOnly: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl?.trim()?.trimEnd('/')
+            ?: return@withContext Result.failure(IllegalStateException("网关地址未配置".loc))
+
+        try {
+            val endpoint = "$baseUrl/gateway/cascade/revert/execute"
+            val reqPayload = json.encodeToString(RevertExecuteRequest(cascadeId = cascadeId, stepIndex = stepIndex, conversationOnly = conversationOnly))
+            val request = buildAuthorizedRequest(endpoint)
+                .post(reqPayload.toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(request).await().use { response ->
+                if (!response.isSuccessful) {
+                    val errMsg = response.body?.string() ?: "HTTP ${response.code}"
+                    return@withContext Result.failure(RuntimeException("执行撤回失败: $errMsg".loc))
+                }
+                Result.success(Unit)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // region 改动 diff / Git / 搜索 / 导出
+
+    /** POST 一个 JSON 到网关并返回响应文本；失败时优先取网关 {"error": "..."} 里的说明。 */
+    private suspend fun postGatewayJson(path: String, payload: String, failurePrefix: String): Result<String> =
+        withContext(Dispatchers.IO) {
+            val baseUrl = currentBaseUrl?.trim()?.trimEnd('/')
+                ?: return@withContext Result.failure(IllegalStateException("网关地址未配置".loc))
+            try {
+                val request = buildAuthorizedRequest("$baseUrl$path")
+                    .post(payload.toRequestBody(jsonMediaType))
+                    .build()
+                client.newCall(request).await().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        val msg = runCatching {
+                            json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.contentOrNull
+                                ?: json.parseToJsonElement(body).jsonObject["message"]?.jsonPrimitive?.contentOrNull
+                        }.getOrNull() ?: body.ifBlank { "HTTP ${response.code}" }
+                        return@withContext Result.failure(RuntimeException("$failurePrefix: $msg"))
+                    }
+                    Result.success(body)
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    @Volatile
+    private var lastCompatRefreshAt = 0L
+
+    /**
+     * 刷新网关的升级自检结果（GET /gateway/status 的 compat 字段）。失败时保持上一次的结果不变。
+     */
+    suspend fun refreshGatewayCompat(force: Boolean = false): Result<GatewayCompat> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl?.trim()?.trimEnd('/')
+            ?: return@withContext Result.failure(IllegalStateException("网关地址未配置".loc))
+        // 列表会被频繁轮询；自检结果只在 Antigravity 重启/升级时才会变，30 秒内不重复请求
+        val now = System.currentTimeMillis()
+        if (!force && now - lastCompatRefreshAt < 30_000L) return@withContext Result.success(GatewayCompatStore.state.value)
+        lastCompatRefreshAt = now
+        try {
+            val request = buildAuthorizedRequest("$baseUrl/gateway/status").get().build()
+            client.newCall(request).await().use { response ->
+                if (!response.isSuccessful) return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                val compat = GatewayCompat.fromStatusJson(response.body?.string().orEmpty())
+                GatewayCompatStore.update(compat)
+                Result.success(compat)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** 手机端 "/" 菜单（系统命令 + 技能）。 */
+    suspend fun getSlashCommands(refresh: Boolean = false): Result<List<SlashCommandOption>> =
+        postGatewayJson(
+            if (refresh) "/gateway/slash-commands?refresh=1" else "/gateway/slash-commands",
+            "{}",
+            "获取斜杠命令失败".loc
+        ).mapCatching { json.decodeFromString<SlashCommandsResponse>(it).commands }
+
+    /** 可选模型目录（网关从 language_server 实时取，失败时返回内置兜底）。 */
+    suspend fun getModels(refresh: Boolean = false): Result<ModelsResponse> =
+        postGatewayJson(
+            if (refresh) "/gateway/models?refresh=1" else "/gateway/models",
+            "{}",
+            "获取模型列表失败".loc
+        ).mapCatching { json.decodeFromString<ModelsResponse>(it) }
+
+    /** 本会话累计改动（正向 diff）。fromStepIndex 非空时只取该步骤起的改动。 */
+    suspend fun getCascadeChanges(cascadeId: String, fromStepIndex: Int? = null): Result<CascadeChangesResponse> =
+        postGatewayJson(
+            "/gateway/cascade/changes",
+            json.encodeToString(CascadeChangesRequest(cascadeId = cascadeId, fromStepIndex = fromStepIndex)),
+            "获取本会话改动失败".loc
+        ).mapCatching { json.decodeFromString<CascadeChangesResponse>(it) }
+
+    /** 会话章节语义标题（Antigravity 2.30.0 GetChapterTitles，经网关 /gateway/cascade/chapters 聚合并轮询收敛）。 */
+    suspend fun getChapterTitles(
+        cascadeId: String,
+        ranges: List<CascadeStepRange>
+    ): Result<List<CascadeChapterTitleItem>> =
+        postGatewayJson(
+            "/gateway/cascade/chapters",
+            json.encodeToString(CascadeChaptersRequest(cascadeId = cascadeId, ranges = ranges)),
+            "获取章节标题失败".loc
+        ).mapCatching { json.decodeFromString<CascadeChaptersResponse>(it).chapters }
+
+    suspend fun getGitStatus(cascadeId: String): Result<GitStatusResponse> =
+        postGatewayJson(
+            "/gateway/git/status",
+            json.encodeToString(GitCascadeRequest(cascadeId = cascadeId)),
+            "获取 Git 状态失败".loc
+        ).mapCatching { json.decodeFromString<GitStatusResponse>(it) }
+
+    suspend fun gitCommit(
+        cascadeId: String,
+        message: String,
+        paths: List<String>,
+        push: Boolean
+    ): Result<GitCommitResponse> =
+        postGatewayJson(
+            "/gateway/git/commit",
+            json.encodeToString(GitCommitRequest(cascadeId = cascadeId, message = message, paths = paths, push = push)),
+            "提交失败".loc
+        ).mapCatching { json.decodeFromString<GitCommitResponse>(it) }
+
+    suspend fun gitPush(cascadeId: String): Result<GitCommitResponse> =
+        postGatewayJson(
+            "/gateway/git/push",
+            json.encodeToString(GitCascadeRequest(cascadeId = cascadeId)),
+            "推送失败".loc
+        ).mapCatching { json.decodeFromString<GitCommitResponse>(it) }
+
+    /** 会话内容全文搜索（language_server SearchConversations，经网关透传）。 */
+    suspend fun searchConversations(query: String): Result<List<ConversationSearchResult>> =
+        postGatewayJson(
+            "/api/exa.language_server_pb.LanguageServerService/SearchConversations",
+            buildJsonObject { put("query", query) }.toString(),
+            "搜索失败".loc
+        ).mapCatching { json.decodeFromString<ConversationSearchResponse>(it).results }
+
+    /** 导出会话为 Markdown（language_server ConvertTrajectoryToMarkdown，经网关透传）。 */
+    suspend fun exportConversationMarkdown(cascadeId: String): Result<String> =
+        postGatewayJson(
+            "/api/exa.language_server_pb.LanguageServerService/ConvertTrajectoryToMarkdown",
+            buildJsonObject { put("conversationId", cascadeId) }.toString(),
+            "导出失败".loc
+        ).mapCatching { json.decodeFromString<MarkdownExportResponse>(it).markdown }
+
+    /** 获取当前挂载的所有 MCP 服务状态及工具清单（language_server GetMcpServerStates，经网关透传）。 */
+    suspend fun fetchMcpServerStates(): Result<List<McpServerState>> =
+        postGatewayJson(
+            "/api/exa.language_server_pb.LanguageServerService/GetMcpServerStates",
+            "{}",
+            "获取 MCP 服务状态失败".loc
+        ).mapCatching { json.decodeFromString<GetMcpServerStatesResponse>(it).states ?: emptyList() }
+
+    /** 获取当前挂载的所有技能清单（language_server GetAllSkills，经网关透传）。 */
+    suspend fun fetchAllSkills(): Result<List<SkillInfo>> =
+        postGatewayJson(
+            "/api/exa.language_server_pb.LanguageServerService/GetAllSkills",
+            "{}",
+            "获取技能清单失败".loc
+        ).mapCatching { json.decodeFromString<GetAllSkillsResponse>(it).skills ?: emptyList() }
+
+    // endregion
+
+    /**
+     * Registers the device push token (FCM / remote push) with the gateway.
+     */
+    suspend fun registerPushToken(token: String, platform: String = "android"): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/v1/device/push-token"
+        val payload = buildJsonObject {
+            put("platform", platform)
+            put("token", token)
+            put("fcm_token", token)
+            prefs.deviceId?.let { put("device_id", it) }
+        }
+
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("注册推送 Token 失败 (${response.code})".loc))
+                }
+                Result.success(Unit)
+            }
+        } catch (e: Exception) {
+            Log.w("ApiClient", "registerPushToken error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Exchanges the device token for a short-lived one-time ticket via POST /api/v1/auth/ws-ticket.
+     */
+    suspend fun getWsTicket(): Result<String> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        val url = "$baseUrl/api/v1/auth/ws-ticket"
+        try {
+            val req = buildAuthorizedRequest(url)
+                .post("{}".toRequestBody("application/json".toMediaType()))
+                .build()
+
+            client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("获取 ws-ticket 失败 (${response.code})".loc))
+                }
+                val body = response.body?.string() ?: return@withContext Result.failure(RuntimeException("Empty body"))
+                val ticketResp = JsonConfig.instance.decodeFromString<WsTicketResponse>(body)
+                Result.success(ticketResp.ticket)
+            }
+        } catch (e: Exception) {
+            Log.w("ApiClient", "getWsTicket error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Uploads a local file to the gateway (POST /api/v1/attachments) as a raw streamed body.
+     * [onProgress] receives 0f..1f as bytes are written.
+     */
+    suspend fun uploadAttachment(
+        file: File,
+        displayName: String,
+        onProgress: (Float) -> Unit = {}
+    ): Result<UploadedAttachment> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl?.trim()?.trimEnd('/')
+            ?: return@withContext Result.failure(IllegalStateException("未配置网关地址".loc))
+        try {
+            val total = file.length()
+            val body = object : okhttp3.RequestBody() {
+                override fun contentType() = "application/octet-stream".toMediaType()
+                override fun contentLength() = total
+                override fun writeTo(sink: okio.BufferedSink) {
+                    file.source().use { source ->
+                        var written = 0L
+                        val buf = okio.Buffer()
+                        while (true) {
+                            val n = source.read(buf, 64 * 1024L)
+                            if (n == -1L) break
+                            sink.write(buf, n)
+                            written += n
+                            if (total > 0) onProgress((written.toFloat() / total).coerceIn(0f, 1f))
+                        }
+                    }
+                }
+            }
+            val request = buildAuthorizedRequest("$baseUrl/api/v1/attachments")
+                .header("X-File-Name", android.net.Uri.encode(displayName))
+                .post(body)
+                .build()
+            val uploadClient = client.newBuilder()
+                .writeTimeout(120, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .build()
+            uploadClient.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    val msg = runCatching {
+                        json.parseToJsonElement(respStr).jsonObject["message"]?.jsonPrimitive?.content
+                    }.getOrNull() ?: "HTTP ${response.code}"
+                    return@withContext Result.failure(RuntimeException(msg))
+                }
+                Result.success(json.decodeFromString<UploadedAttachment>(respStr))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 获取全局所有正在运行的后台任务（language_server ListBackgroundTasks，经网关补全会话与工作区信息）
+     */
+    suspend fun fetchGlobalBackgroundTasks(): Result<List<GlobalBackgroundTaskItem>> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val request = buildAuthorizedRequest("$baseUrl/gateway/tasks/background")
+                .get()
+                .build()
+            client.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                val parsed = json.decodeFromString<GlobalBackgroundTasksResponse>(respStr)
+                Result.success(parsed.tasks)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 读取后台任务日志文件的最新尾部内容（/gateway/tasks/background/log）
+     */
+    suspend fun fetchBackgroundTaskLog(
+        conversationId: String,
+        taskId: String,
+        logUri: String?
+    ): Result<BackgroundTaskLogResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val payload = buildJsonObject {
+                put("conversationId", conversationId)
+                put("taskId", taskId)
+                if (!logUri.isNullOrBlank()) {
+                    put("logUri", logUri)
+                }
+            }
+            val request = buildAuthorizedRequest("$baseUrl/gateway/tasks/background/log")
+                .post(payload.toString().toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                Result.success(json.decodeFromString<BackgroundTaskLogResponse>(respStr))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // MARK: - Swarm 蜂群协同接口
+
+    suspend fun fetchSwarmSnapshot(cascadeId: String): Result<SwarmSnapshot> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val url = "$baseUrl/gateway/swarm?cascadeId=${URLEncoder.encode(cascadeId, "UTF-8")}"
+            val request = buildAuthorizedRequest(url).get().build()
+            client.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                Result.success(json.decodeFromString<SwarmSnapshot>(respStr))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun sendSwarmFeedback(cascadeId: String, content: String, coordinatorId: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val payload = json.encodeToString(
+                SwarmFeedbackRequest(
+                    cascadeId = cascadeId,
+                    coordinatorId = coordinatorId?.takeIf { it.isNotBlank() },
+                    feedback = content
+                )
+            )
+            val request = buildAuthorizedRequest("$baseUrl/gateway/swarm/feedback")
+                .post(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(request).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                Result.success(Unit)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun nudgeSwarmMember(cascadeId: String, member: String, coordinatorId: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val payload = json.encodeToString(
+                SwarmNudgeRequest(
+                    cascadeId = cascadeId,
+                    coordinatorId = coordinatorId?.takeIf { it.isNotBlank() },
+                    workerName = member
+                )
+            )
+            val request = buildAuthorizedRequest("$baseUrl/gateway/swarm/nudge")
+                .post(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(request).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                Result.success(Unit)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // MARK: - Plugins 插件市场接口
+
+    suspend fun fetchPluginsCatalog(): Result<CascadePluginsResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val request = buildAuthorizedRequest("$baseUrl/gateway/plugins").get().build()
+            client.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                val parsed = json.decodeFromString<CascadePluginsResponse>(respStr)
+                Result.success(parsed)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun fetchPlugins(): Result<List<CascadePluginItem>> =
+        fetchPluginsCatalog().map { it.plugins }
+
+    suspend fun installPlugin(id: String, conversationId: String? = null, autoResume: Boolean = true): Result<PluginInstallResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val payload = json.encodeToString(
+                PluginInstallRequest(
+                    pluginId = id,
+                    cascadeId = conversationId?.takeIf { it.isNotBlank() },
+                    autoResume = autoResume
+                )
+            )
+            val request = buildAuthorizedRequest("$baseUrl/gateway/plugins/install")
+                .post(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                Result.success(json.decodeFromString<PluginInstallResponse>(respStr))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // MARK: - Automations 定时与守护任务接口
+
+    suspend fun fetchAutomationsData(): Result<AutomationsResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val request = buildAuthorizedRequest("$baseUrl/gateway/automations").get().build()
+            client.newCall(request).await().use { response ->
+                val respStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                val parsed = json.decodeFromString<AutomationsResponse>(respStr)
+                Result.success(parsed)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun fetchAutomations(): Result<List<AutomationSidecarItem>> =
+        fetchAutomationsData().map { it.automations }
+
+    suspend fun manageAutomation(action: String, sidecarId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val payload = json.encodeToString(AutomationManageRequest(sidecarId = sidecarId, action = action))
+            val request = buildAuthorizedRequest("$baseUrl/gateway/automations/manage")
+                .post(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(request).await().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}"))
+                }
+                Result.success(Unit)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // region Workflow 模板同步接口
+
+    suspend fun fetchWorkflowTemplates(): Result<WorkflowTemplatesResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val request = buildAuthorizedRequest("$baseUrl/gateway/workflow-templates")
+                .get()
+                .build()
+            client.newCall(request).await().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}: $body"))
+                }
+                Result.success(json.decodeFromString<WorkflowTemplatesResponse>(body))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun saveWorkflowTemplates(templates: List<WorkflowTemplateRecord>): Result<WorkflowTemplatesResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val payload = json.encodeToString(WorkflowTemplatesUpdateRequest(templates = templates))
+            val request = buildAuthorizedRequest("$baseUrl/gateway/workflow-templates")
+                .put(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(request).await().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}: $body"))
+                }
+                Result.success(json.decodeFromString<WorkflowTemplatesResponse>(body))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun resetWorkflowTemplates(): Result<WorkflowTemplatesResponse> = withContext(Dispatchers.IO) {
+        val baseUrl = currentBaseUrl ?: return@withContext Result.failure(RuntimeException("未配置网关地址".loc))
+        try {
+            val request = buildAuthorizedRequest("$baseUrl/gateway/workflow-templates")
+                .delete()
+                .build()
+            client.newCall(request).await().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(RuntimeException("HTTP ${response.code}: $body"))
+                }
+                Result.success(json.decodeFromString<WorkflowTemplatesResponse>(body))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // endregion
+
+    internal val prefsRef: PreferencesManager
+        get() = prefs
+
+    internal fun buildAuthorizedRequest(url: String): Request.Builder {
+        val builder = Request.Builder()
+            .url(url)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+
+        prefs.deviceToken?.takeIf { it.isNotBlank() }?.let { token ->
+            builder.header("Authorization", "Bearer $token")
+        }
+        return builder
+    }
+}
+
+/**
+ * OkHttp Interceptor that automatically fails over from an unreachable LAN gateway
+ * to the primary cloud domain (Cloudflare/E2EE HTTPS tunnel), and transparently migrates
+ * across multi-VPS relay nodes when a stale relay returns HTTP 502/503 (`gateway_offline`)
+ * or fails with a network error.
+ */
+class RouteFailoverInterceptor(
+    private val prefs: PreferencesManager,
+    private val connectionManager: ConnectionManager?
+) : okhttp3.Interceptor {
+    private fun canSafelyFailover(request: Request, error: IOException): Boolean {
+        if (request.body?.isOneShot() == true) {
+            return false
+        }
+        val method = request.method.uppercase()
+        if (method == "GET" || method == "HEAD") {
+            return true
+        }
+        // For state-mutating requests (POST/PUT/PATCH/DELETE), only failover on pre-transmission
+        // connection establishment errors — never on read SocketTimeoutException after payload dispatch.
+        return error is java.net.ConnectException ||
+            error is java.net.UnknownHostException ||
+            error is java.net.NoRouteToHostException ||
+            (error is java.net.SocketTimeoutException && error.message?.contains("connect", ignoreCase = true) == true)
+    }
+
+    private fun isSafeReadRequest(request: Request): Boolean {
+        if (request.body?.isOneShot() == true) return false
+        val method = request.method.uppercase()
+        if (method == "GET" || method == "HEAD") return true
+        val path = request.url.encodedPath
+        return path.endsWith("/GetAllCascadeTrajectories") ||
+            path.endsWith("/GetCascadeTrajectory") ||
+            path.endsWith("/GetCascadeTrajectorySteps") ||
+            path.endsWith("/GetAuthStatus") ||
+            path.endsWith("/GetCascadeNuxes") ||
+            path.endsWith("/SearchConversations")
+    }
+
+    private fun isRelayGatewayOfflineResponse(response: okhttp3.Response): Boolean {
+        if (response.code != 503) return false
+        val snippet = try {
+            response.peekBody(256).string().lowercase()
+        } catch (_: Exception) {
+            ""
+        }
+        return snippet.contains("gateway_offline") || snippet.contains("relay_capacity_full")
+    }
+
+    private fun originOf(url: HttpUrl): String {
+        val defaultPort = if (url.isHttps) 443 else 80
+        return if (url.port == defaultPort) {
+            "${url.scheme}://${url.host}"
+        } else {
+            "${url.scheme}://${url.host}:${url.port}"
+        }
+    }
+
+    private fun retryOnTargetBase(
+        chain: okhttp3.Interceptor.Chain,
+        request: Request,
+        targetBaseUrl: String
+    ): okhttp3.Response? {
+        val clean = targetBaseUrl.trim().trimEnd('/')
+        if (clean.isEmpty()) return null
+        val targetUri = java.net.URI(if (!clean.contains("://")) "https://$clean" else clean)
+        val newScheme = targetUri.scheme ?: "https"
+        val newHost = targetUri.host ?: ConnectionManager.extractHost(clean)
+        if (newHost.isBlank()) return null
+        if (!newScheme.equals("https", ignoreCase = true) && !ConnectionManager.isLanHost(newHost)) {
+            return null
+        }
+        val newPort = if (targetUri.port != -1) {
+            targetUri.port
+        } else if (newScheme.equals("https", ignoreCase = true)) {
+            443
+        } else {
+            80
+        }
+
+        val fallbackUrl = request.url.newBuilder()
+            .scheme(newScheme)
+            .host(newHost)
+            .port(newPort)
+            .build()
+
+        val fallbackRequest = request.newBuilder()
+            .url(fallbackUrl)
+            .build()
+
+        val fallbackResponse = chain.withConnectTimeout(10, TimeUnit.SECONDS).proceed(fallbackRequest)
+        if (fallbackResponse.isSuccessful || fallbackResponse.code < 500) {
+            ConnectionManager.applyAdvertisedCloudUrl(
+                rawHeader = fallbackResponse.header("X-Antigravity-Cloud-URL"),
+                prefs = prefs,
+                connectionManager = connectionManager
+            )
+            if (!prefs.gatewayBaseUrl.equals(clean, ignoreCase = true)) {
+                Log.i("ApiClient", "Failover to $clean succeeded! Updating active gateway to $clean")
+                prefs.gatewayBaseUrl = clean
+                connectionManager?.notifyRouteChanged(clean)
+            }
+        }
+        return fallbackResponse
+    }
+
+    override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
+        val request = chain.request()
+        val originalUrl = request.url
+        val originalHost = originalUrl.host
+        if (!ApiClient.isConfiguredGatewayOrigin(originalUrl, prefs)) {
+            return chain.proceed(request)
+        }
+
+        // If communicating with LAN host, shorten connect timeout to 1800ms so off-network failover is snappy
+        val isLan = ConnectionManager.isLanHost(originalHost)
+        val initialChain = if (isLan) {
+            chain.withConnectTimeout(1800, TimeUnit.MILLISECONDS)
+        } else {
+            chain
+        }
+
+        var initialError: IOException? = null
+        val response = try {
+            initialChain.proceed(request)
+        } catch (e: IOException) {
+            initialError = e
+            null
+        }
+
+        if (response != null) {
+            if (response.code < 500) {
+                ConnectionManager.applyAdvertisedCloudUrl(
+                    rawHeader = response.header("X-Antigravity-Cloud-URL"),
+                    prefs = prefs,
+                    connectionManager = connectionManager
+                )
+                return response
+            }
+
+            // Multi-VPS relay migration: when an old relay node returns HTTP 503 gateway_offline
+            // (or 502/503 on a safe read request), discover the active node via /api/relay/pool
+            // and transparently retry once so quota/list loads recover on the first attempt.
+            if (!isLan &&
+                connectionManager != null &&
+                request.body?.isOneShot() != true &&
+                (response.code == 502 || response.code == 503) &&
+                (isRelayGatewayOfflineResponse(response) || isSafeReadRequest(request))
+            ) {
+                val failedOrigin = originOf(originalUrl)
+                val migratedUrl = connectionManager.migrateUnreachableCloudBlocking(prefs, failedOrigin)
+                if (!migratedUrl.isNullOrBlank()) {
+                    val migratedHost = ConnectionManager.extractHost(migratedUrl)
+                    if (migratedHost.isNotBlank() && !migratedHost.equals(originalHost, ignoreCase = true)) {
+                        response.close()
+                        try {
+                            retryOnTargetBase(chain, request, migratedUrl)?.let { return it }
+                        } catch (retryEx: Exception) {
+                            Log.w("ApiClient", "Retry on migrated relay $migratedUrl failed: ${retryEx.message}")
+                            throw retryEx
+                        }
+                    }
+                }
+            }
+            return response
+        }
+
+        val e = initialError!!
+        if (!canSafelyFailover(request, e)) {
+            throw e
+        }
+        val cloud = prefs.primaryCloudUrl?.trim()?.trimEnd('/')
+        var failedCloudOrigin: String? = null
+        var migrationAttempted = false
+        if (!cloud.isNullOrBlank()) {
+            val cloudHost = ConnectionManager.extractHost(cloud)
+            if (!originalHost.equals(cloudHost, ignoreCase = true)) {
+                Log.w("ApiClient", "Request to $originalHost failed (${e.message}). Failing over to cloud domain: $cloud")
+                val fallbackResponse = try {
+                    retryOnTargetBase(chain, request, cloud)
+                } catch (fallbackEx: Exception) {
+                    Log.w("ApiClient", "Failover to $cloud also failed: ${fallbackEx.message}")
+                    failedCloudOrigin = cloud
+                    null
+                }
+                if (fallbackResponse != null) {
+                    if ((fallbackResponse.code == 502 || fallbackResponse.code == 503) &&
+                        connectionManager != null &&
+                        (isRelayGatewayOfflineResponse(fallbackResponse) || isSafeReadRequest(request))
+                    ) {
+                        migrationAttempted = true
+                        val migratedUrl = connectionManager.migrateUnreachableCloudBlocking(prefs, cloud)
+                        if (!migratedUrl.isNullOrBlank() &&
+                            !ConnectionManager.extractHost(migratedUrl).equals(cloudHost, ignoreCase = true)
+                        ) {
+                            fallbackResponse.close()
+                            try {
+                                retryOnTargetBase(chain, request, migratedUrl)?.let { return it }
+                            } catch (migEx: Exception) {
+                                Log.w("ApiClient", "Failover to migrated relay $migratedUrl failed: ${migEx.message}")
+                                throw migEx
+                            }
+                        }
+                    }
+                    return fallbackResponse
+                }
+            } else {
+                failedCloudOrigin = originOf(originalUrl)
+            }
+        } else if (!isLan) {
+            failedCloudOrigin = originOf(originalUrl)
+        }
+
+        if (!migrationAttempted && !failedCloudOrigin.isNullOrBlank() && connectionManager != null) {
+            val migratedUrl = connectionManager.migrateUnreachableCloudBlocking(prefs, failedCloudOrigin)
+            if (!migratedUrl.isNullOrBlank() &&
+                !ConnectionManager.extractHost(migratedUrl).equals(originalHost, ignoreCase = true)
+            ) {
+                try {
+                    retryOnTargetBase(chain, request, migratedUrl)?.let { return it }
+                } catch (migEx: Exception) {
+                    Log.w("ApiClient", "Failover to migrated relay $migratedUrl also failed: ${migEx.message}")
+                }
+            }
+        }
+        throw e
+    }
+}

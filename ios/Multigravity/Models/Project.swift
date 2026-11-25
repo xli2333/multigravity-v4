@@ -1,0 +1,80 @@
+import Foundation
+
+public struct ProjectItem: Identifiable, Hashable, Codable, Sendable {
+    public var id: String {
+        if let rawId, !rawId.isEmpty { return rawId }
+        return uri
+    }
+    public let rawId: String?
+    public let name: String
+    public var alias: String?
+    public let uri: String
+    public let path: String
+    public let isWorkspace: Bool
+    public let sessionCount: Int
+    public let lastActive: Date?
+    
+    enum CodingKeys: String, CodingKey {
+        case rawId = "id"
+        case name, alias, uri, path, isWorkspace, sessionCount, lastActive
+    }
+    
+    public init(
+        rawId: String? = nil,
+        name: String,
+        alias: String? = nil,
+        uri: String,
+        path: String,
+        isWorkspace: Bool,
+        sessionCount: Int = 0,
+        lastActive: Date? = nil
+    ) {
+        self.rawId = rawId
+        self.name = name
+        self.alias = alias
+        self.uri = uri
+        self.path = path
+        self.isWorkspace = isWorkspace
+        self.sessionCount = sessionCount
+        self.lastActive = lastActive
+    }
+    
+    public var displayName: String {
+        if let alias, !alias.trimmingCharacters(in: .whitespaces).isEmpty { return alias }
+        return name
+    }
+    
+    public var hasCustomAlias: Bool {
+        guard let alias, !alias.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        return alias != name
+    }
+    
+    public var relativeTimeString: String {
+        guard let date = lastActive else { return "" }
+        let diff = Date().timeIntervalSince(date)
+        if diff < 60 { return String(localized: "刚刚") }
+        if diff < 3600 { return String(localized: "\(Int(diff / 60))分钟前") }
+        if diff < 86400 { return String(localized: "\(Int(diff / 3600))小时前") }
+        return String(localized: "\(Int(diff / 86400))天前")
+    }
+    
+    public static var pureChat: ProjectItem {
+        ProjectItem(
+            rawId: "outside-of-project",
+            name: "Chat",
+            uri: "",
+            path: String(localized: "新对话 · 不关联任何工作区"),
+            isWorkspace: false
+        )
+    }
+    
+    public var isPureChat: Bool {
+        rawId == "outside-of-project" || name == "Chat" || (uri.isEmpty && (path.contains("不关联任何工作区") || path == String(localized: "新对话 · 不关联任何工作区")))
+    }
+}
+
+public struct CreateCascadeResponsePayload: Codable, Sendable {
+    public let cascadeId: String?
+    public let status: String?
+    public let error: String?
+}

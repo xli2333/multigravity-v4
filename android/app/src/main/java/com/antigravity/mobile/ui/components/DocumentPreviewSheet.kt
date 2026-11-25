@@ -1,0 +1,1985 @@
+package com.antigravity.mobile.ui.components
+
+import com.antigravity.mobile.ui.util.loc
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.pdf.PdfRenderer
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
+import android.util.Base64
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.net.URLDecoder
+import java.util.zip.ZipFile
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.FileProvider
+import coil.compose.SubcomposeAsyncImage
+import coil.decode.SvgDecoder
+import coil.request.ImageRequest
+import com.antigravity.mobile.ui.theme.AppColors
+import com.antigravity.mobile.ui.theme.AntigravityTheme
+import com.antigravity.mobile.ui.util.rememberHaptic
+import android.graphics.SurfaceTexture
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.view.Surface
+import android.view.TextureView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.ui.graphics.Brush
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+
+/**
+ * Android Document & Code Native Preview Sheet (1:1 aligned with iOS QuickLookPreviewSheet).
+ * Features:
+ * - Top-centered iOS-style drag handle indicator (36x5dp capsule).
+ * - Top navigation bar: Top-left Apple native Save button, Center Document Title, Top-right Apple native Share button.
+ * - Sheet container with 16dp rounded top corners.
+ * - Supports SVG vector graphics (via Coil SVG), PPTX (multi-slide XML structure parser + theme),
+ *   PDF (PdfRenderer), HTML/Marp (WebView), code & text, and Office docs (DOCX, XLSX).
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DocumentPreviewSheet(
+    file: File,
+    title: String,
+    onDismiss: VoidHandler,
+    colors: AppColors = AntigravityTheme.colors,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val haptic = rememberHaptic()
+    val ext = file.extension.lowercase()
+    val decodedTitle = remember(title, file) {
+        val raw = title.ifEmpty { file.name }
+        try {
+            URLDecoder.decode(raw, "UTF-8")
+        } catch (_: Exception) {
+            raw
+        }
+    }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val textToolbar = LocalTextToolbar.current
+    DisposableEffect(Unit) {
+        onDispose {
+            textToolbar.hide()
+        }
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = { onDismiss() },
+        sheetState = sheetState,
+        sheetMaxWidth = Dp.Unspecified,
+        containerColor = Color.Transparent,
+        shape = RectangleShape,
+        tonalElevation = 0.dp,
+        dragHandle = null,
+        contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
+        modifier = modifier
+            .fillMaxWidth()
+            .fillMaxHeight()
+    ) {
+        TallSheetBody(containerColor = colors.background, onDismiss = onDismiss) {
+            SheetGrabHandle(colors.textMuted.copy(alpha = 0.35f))
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+        ) {
+            // Top Navigation Bar (Apple Native Component Layout)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Top-left: Apple native Save button
+                ApplePreviewCircleButton(
+                    icon = Icons.Default.FileDownload,
+                    contentDescription = "保存文件".loc,
+                    colors = colors,
+                    onClick = {
+                        haptic.light()
+                        coroutineScope.launch {
+                            saveFileToDownloads(context, file, decodedTitle)
+                        }
+                    }
+                )
+
+                // Center: Title
+                Text(
+                    text = decodedTitle,
+                    color = colors.textPrimary,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 12.dp),
+                    textAlign = TextAlign.Center
+                )
+
+                // Top-right: Apple native Share button
+                ApplePreviewCircleButton(
+                    icon = Icons.Default.Share,
+                    contentDescription = "分享文件".loc,
+                    colors = colors,
+                    onClick = {
+                        haptic.medium()
+                        shareDocument(context, file, decodedTitle)
+                    }
+                )
+            }
+
+            HorizontalDivider(color = colors.border.copy(alpha = 0.4f), thickness = 0.8.dp)
+
+            // Body content based on file extension
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                when (ext) {
+                    "svg" -> {
+                        SvgDocumentViewer(file = file, colors = colors)
+                    }
+                    "png", "jpg", "jpeg", "webp", "gif" -> {
+                        ImageDocumentViewer(file = file, colors = colors)
+                    }
+                    "mp4", "mov", "m4v", "webm", "3gp", "mkv", "avi", "m4a", "mp3", "wav", "aac", "caf", "flac", "ogg", "oga", "opus", "amr", "wma" -> {
+                        VideoDocumentViewer(file = file, colors = colors)
+                    }
+                    "html", "htm" -> {
+                        HtmlDocumentViewer(file = file, colors = colors)
+                    }
+                    "pptx", "ppt" -> {
+                        PptxDocumentViewer(file = file, colors = colors)
+                    }
+                    "pdf" -> {
+                        PdfDocumentViewer(file = file, colors = colors)
+                    }
+                    "txt", "json", "csv", "log", "xml", "yaml", "yml", "sh", "py", "js", "ts", "kt", "swift", "md", "r", "rmd", "rmarkdown" -> {
+                        TextDocumentViewer(file = file, colors = colors)
+                    }
+                    else -> {
+                        OfficeDocumentFallback(file = file, colors = colors)
+                    }
+                }
+            }
+        }
+            }
+    }
+}
+
+typealias VoidHandler = () -> Unit
+
+/**
+ * Apple Native Component Style Circular Button (translucent frosted circle with subtle hairline border).
+ */
+@Composable
+fun ApplePreviewCircleButton(
+    icon: ImageVector,
+    contentDescription: String,
+    colors: AppColors,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = CircleShape,
+        color = colors.surfaceVariant.copy(alpha = 0.65f),
+        border = androidx.compose.foundation.BorderStroke(0.5.dp, colors.border.copy(alpha = 0.35f)),
+        modifier = modifier.size(36.dp)
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = colors.textPrimary,
+                modifier = Modifier.size(19.dp)
+            )
+        }
+    }
+}
+
+/**
+ * SVG Document Viewer using Coil with SvgDecoder.
+ */
+@Composable
+private fun SvgDocumentViewer(file: File, colors: AppColors) {
+    val context = LocalContext.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        SubcomposeAsyncImage(
+            model = ImageRequest.Builder(context)
+                .data(file)
+                .decoderFactory(SvgDecoder.Factory())
+                .crossfade(true)
+                .build(),
+            contentDescription = "SVG Preview",
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Fit,
+            loading = {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = colors.accentIndigo, modifier = Modifier.size(32.dp))
+                }
+            },
+            error = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.BrokenImage,
+                        contentDescription = null,
+                        tint = colors.textMuted,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("SVG 矢量图加载失败".loc, color = colors.textSecondary, fontSize = 14.sp)
+                }
+            }
+        )
+    }
+}
+
+/**
+ * Image Viewer for standard image formats.
+ */
+@Composable
+private fun ImageDocumentViewer(file: File, colors: AppColors) {
+    val context = LocalContext.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        SubcomposeAsyncImage(
+            model = ImageRequest.Builder(context)
+                .data(file)
+                .crossfade(true)
+                .build(),
+            contentDescription = "Image Preview",
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Fit,
+            loading = {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = colors.accentIndigo, modifier = Modifier.size(32.dp))
+                }
+            },
+            error = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.BrokenImage,
+                        contentDescription = null,
+                        tint = colors.textMuted,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("图片加载失败".loc, color = colors.textSecondary, fontSize = 14.sp)
+                }
+            }
+        )
+    }
+}
+
+/**
+ * Android Native Video Document Viewer using MediaPlayer and TextureView.
+ * Supports variable speed playback (0.5×, 0.75×, 1.0×, 1.25×, 1.5×, 2.0×),
+ * draggable progress scrubber Slider with timestamps, 10s rewind/forward,
+ * and auto-hiding controls overlay.
+ */
+@Composable
+private fun VideoDocumentViewer(file: File, colors: AppColors) {
+    var isPlaying by remember { mutableStateOf(false) }
+    var currentPosition by remember { mutableLongStateOf(0L) }
+    var duration by remember { mutableLongStateOf(0L) }
+    var currentSpeed by remember { mutableFloatStateOf(1.0f) }
+    var controlsVisible by remember { mutableStateOf(true) }
+    var isDragging by remember { mutableStateOf(false) }
+    var dragPosition by remember { mutableFloatStateOf(0f) }
+    var isCompleted by remember { mutableStateOf(false) }
+    var showSpeedMenu by remember { mutableStateOf(false) }
+    var videoWidth by remember { mutableIntStateOf(0) }
+    var videoHeight by remember { mutableIntStateOf(0) }
+    var mediaPlayerRef by remember { mutableStateOf<MediaPlayer?>(null) }
+    var currentSurface by remember { mutableStateOf<Surface?>(null) }
+
+    DisposableEffect(file) {
+        val player = MediaPlayer().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+            )
+            try {
+                setDataSource(file.absolutePath)
+                setOnPreparedListener { mp ->
+                    duration = mp.duration.toLong().coerceAtLeast(0L)
+                    videoWidth = mp.videoWidth
+                    videoHeight = mp.videoHeight
+                    currentSurface?.let { s ->
+                        if (s.isValid) {
+                            mp.setSurface(s)
+                        }
+                    }
+                    mp.start()
+                    isPlaying = true
+                }
+                setOnCompletionListener {
+                    isPlaying = false
+                    isCompleted = true
+                    controlsVisible = true
+                }
+                setOnVideoSizeChangedListener { _, w, h ->
+                    if (w > 0 && h > 0) {
+                        videoWidth = w
+                        videoHeight = h
+                    }
+                }
+                setOnErrorListener { _, _, _ ->
+                    true
+                }
+                prepareAsync()
+            } catch (_: Exception) {}
+        }
+        mediaPlayerRef = player
+
+        onDispose {
+            try {
+                player.stop()
+            } catch (_: Exception) {}
+            try {
+                player.release()
+            } catch (_: Exception) {}
+            mediaPlayerRef = null
+            currentSurface?.release()
+            currentSurface = null
+        }
+    }
+
+    // Periodic progress updater
+    LaunchedEffect(isPlaying, isDragging) {
+        while (isActive && isPlaying && !isDragging) {
+            mediaPlayerRef?.let { mp ->
+                try {
+                    if (mp.isPlaying) {
+                        currentPosition = mp.currentPosition.toLong()
+                    }
+                } catch (_: Exception) {}
+            }
+            delay(250)
+        }
+    }
+
+    // Auto-hide controls after 3.5s of playback
+    LaunchedEffect(controlsVisible, isPlaying) {
+        if (controlsVisible && isPlaying) {
+            delay(3500)
+            controlsVisible = false
+        }
+    }
+
+    val changeSpeed: (Float) -> Unit = { newSpeed ->
+        currentSpeed = newSpeed
+        mediaPlayerRef?.let { mp ->
+            try {
+                val wasPlaying = mp.isPlaying
+                val params = mp.playbackParams
+                params.speed = newSpeed
+                mp.playbackParams = params
+                if (!wasPlaying) {
+                    mp.pause()
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    val aspectRatio = if (videoWidth > 0 && videoHeight > 0) {
+        videoWidth.toFloat() / videoHeight.toFloat()
+    } else {
+        16f / 9f
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null
+            ) {
+                controlsVisible = !controlsVisible
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        // Media Surface or Audio Artwork
+        if (videoWidth > 0 && videoHeight > 0) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(aspectRatio)
+                    .clip(RectangleShape)
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        TextureView(ctx).apply {
+                            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                                    val s = Surface(surface)
+                                    currentSurface = s
+                                    mediaPlayerRef?.setSurface(s)
+                                }
+                                override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
+                                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                                    currentSurface?.release()
+                                    currentSurface = null
+                                    mediaPlayerRef?.setSurface(null)
+                                    return true
+                                }
+                                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+                            }
+                        }
+                    },
+                    update = { textureView ->
+                        if (textureView.isAvailable && textureView.surfaceTexture != null) {
+                            val s = currentSurface ?: Surface(textureView.surfaceTexture).also { currentSurface = it }
+                            mediaPlayerRef?.setSurface(s)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+        } else {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+                modifier = Modifier.padding(32.dp)
+            ) {
+                FileTypeBadge(fileName = file.name, size = 64.dp)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = file.name,
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        // Overlay Controls
+        AnimatedVisibility(
+            visible = controlsVisible,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.35f))
+            ) {
+                // Center Play/Pause/Rewind/Forward Controls
+                Row(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalArrangement = Arrangement.spacedBy(28.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Rewind 10s
+                    IconButton(
+                        onClick = {
+                            val target = (currentPosition - 10000L).coerceAtLeast(0L)
+                            mediaPlayerRef?.seekTo(target.toInt())
+                            currentPosition = target
+                            if (isCompleted) isCompleted = false
+                        },
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.5f))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Replay10,
+                            contentDescription = "快退10秒".loc,
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+
+                    // Main Play/Pause Button
+                    IconButton(
+                        onClick = {
+                            mediaPlayerRef?.let { mp ->
+                                if (isCompleted) {
+                                    mp.seekTo(0)
+                                    mp.start()
+                                    isPlaying = true
+                                    isCompleted = false
+                                } else if (mp.isPlaying) {
+                                    mp.pause()
+                                    isPlaying = false
+                                } else {
+                                    mp.start()
+                                    isPlaying = true
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .size(64.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.65f))
+                            .border(1.2.dp, Color.White.copy(alpha = 0.45f), CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = when {
+                                isCompleted -> Icons.Default.Replay
+                                isPlaying -> Icons.Default.Pause
+                                else -> Icons.Default.PlayArrow
+                            },
+                            contentDescription = if (isPlaying) "暂停".loc else "播放".loc,
+                            tint = Color.White,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .offset(x = if (!isPlaying && !isCompleted) 2.dp else 0.dp)
+                        )
+                    }
+
+                    // Forward 10s
+                    IconButton(
+                        onClick = {
+                            val target = (currentPosition + 10000L).coerceAtMost(duration)
+                            mediaPlayerRef?.seekTo(target.toInt())
+                            currentPosition = target
+                        },
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.5f))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Forward10,
+                            contentDescription = "快进10秒".loc,
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                }
+
+                // Bottom Scrubber Bar & Speed Selector
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomCenter)
+                        .background(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))
+                            )
+                        )
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = formatVideoTime(if (isDragging) dragPosition.toLong() else currentPosition),
+                        color = Color.White.copy(alpha = 0.95f),
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+
+                    Slider(
+                        value = if (isDragging) dragPosition else currentPosition.toFloat().coerceIn(0f, maxOf(1f, duration.toFloat())),
+                        onValueChange = { newVal ->
+                            isDragging = true
+                            dragPosition = newVal
+                        },
+                        onValueChangeFinished = {
+                            val targetMs = dragPosition.toInt()
+                            mediaPlayerRef?.seekTo(targetMs)
+                            currentPosition = targetMs.toLong()
+                            if (isCompleted && targetMs < duration) isCompleted = false
+                            isDragging = false
+                        },
+                        valueRange = 0f..maxOf(1f, duration.toFloat()),
+                        colors = SliderDefaults.colors(
+                            thumbColor = colors.accentIndigo,
+                            activeTrackColor = colors.accentIndigo,
+                            inactiveTrackColor = Color.White.copy(alpha = 0.35f)
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 8.dp)
+                    )
+
+                    Text(
+                        text = formatVideoTime(duration),
+                        color = Color.White.copy(alpha = 0.95f),
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+
+                    Spacer(modifier = Modifier.width(10.dp))
+
+                    // Speed Pill & Dropdown Menu
+                    Box {
+                        Surface(
+                            onClick = { showSpeedMenu = !showSpeedMenu },
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color.White.copy(alpha = 0.2f),
+                            border = androidx.compose.foundation.BorderStroke(0.6.dp, Color.White.copy(alpha = 0.4f))
+                        ) {
+                            Text(
+                                text = "${if (currentSpeed == currentSpeed.toInt().toFloat()) "${currentSpeed.toInt()}" else "$currentSpeed"}×",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+
+                        DropdownMenu(
+                            expanded = showSpeedMenu,
+                            onDismissRequest = { showSpeedMenu = false },
+                            modifier = Modifier.background(colors.surface)
+                        ) {
+                            listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { spd ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "${spd}×",
+                                            color = if (currentSpeed == spd) colors.accentIndigo else colors.textPrimary,
+                                            fontWeight = if (currentSpeed == spd) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    },
+                                    onClick = {
+                                        changeSpeed(spd)
+                                        showSpeedMenu = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatVideoTime(ms: Long): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
+}
+
+@Composable
+private fun HtmlDocumentViewer(file: File, colors: AppColors = AntigravityTheme.colors) {
+    val context = LocalContext.current
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var showFindBar by remember { mutableStateOf(false) }
+    var findQuery by remember { mutableStateOf("") }
+    var matchCount by remember { mutableStateOf(0) }
+    var activeMatchIdx by remember { mutableStateOf(0) }
+    val preparedHtml by produceState<Pair<String, Boolean>?>(initialValue = null, key1 = file) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                var htmlContent = file.readText(Charsets.UTF_8).trim()
+                if (!htmlContent.startsWith("<") && (htmlContent.startsWith("PCFE") || htmlContent.startsWith("PD!"))) {
+                    try {
+                        val decoded = String(Base64.decode(htmlContent, Base64.DEFAULT), Charsets.UTF_8)
+                        if (decoded.contains("<html", ignoreCase = true) || decoded.contains("<!DOCTYPE", ignoreCase = true)) {
+                            htmlContent = decoded
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                val isMarp = htmlContent.contains("data-marpit-svg", ignoreCase = true) ||
+                    htmlContent.contains("bespoke-marp", ignoreCase = true) ||
+                    htmlContent.contains("marpit", ignoreCase = true)
+
+                if (isMarp) {
+                    val mobileSlideStyle = """
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes">
+                        <style id="agy-mobile-slide-adapt">
+                        @media screen {
+                            html, body {
+                                overflow-y: auto !important;
+                                overflow-x: hidden !important;
+                                height: auto !important;
+                                min-height: 100% !important;
+                                background-color: #f4f5f7 !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                -webkit-overflow-scrolling: touch !important;
+                            }
+                            div#\:\${'$'}p, .bespoke-marp-parent {
+                                display: flex !important;
+                                flex-direction: column !important;
+                                align-items: center !important;
+                                padding: 16px 12px !important;
+                                gap: 16px !important;
+                                position: static !important;
+                                inset: auto !important;
+                                height: auto !important;
+                                overflow: visible !important;
+                            }
+                            svg[data-marpit-svg], svg.bespoke-marp-slide {
+                                display: block !important;
+                                width: 100% !important;
+                                max-width: 680px !important;
+                                height: auto !important;
+                                opacity: 1 !important;
+                                visibility: visible !important;
+                                content-visibility: visible !important;
+                                position: static !important;
+                                box-shadow: 0 4px 14px rgba(0,0,0,0.08) !important;
+                                border-radius: 10px !important;
+                                background: #ffffff !important;
+                                margin: 0 auto !important;
+                                transform: none !important;
+                                filter: none !important;
+                            }
+                            svg.bespoke-marp-slide * {
+                                visibility: visible !important;
+                            }
+                            [data-bespoke-marp-fragment] {
+                                visibility: visible !important;
+                                opacity: 1 !important;
+                            }
+                            .bespoke-marp-osc, .bespoke-progress-parent, .bespoke-marp-overview-header {
+                                display: none !important;
+                            }
+                        }
+                        </style>
+                        <script id="agy-mobile-guard">
+                        try {
+                            const noop = () => {};
+                            window.history.replaceState = noop;
+                            window.history.pushState = noop;
+                        } catch (_) {}
+                        const activateAll = () => {
+                            try {
+                                document.querySelectorAll("svg[data-marpit-svg], svg.bespoke-marp-slide").forEach(s => {
+                                    s.classList.add("bespoke-marp-active");
+                                    s.removeAttribute("aria-hidden");
+                                });
+                                document.querySelectorAll("[data-bespoke-marp-fragment]").forEach(f => {
+                                    f.setAttribute("data-bespoke-marp-fragment", "active");
+                                });
+                            } catch (_) {}
+                        };
+                        activateAll();
+                        window.addEventListener("DOMContentLoaded", activateAll);
+                        window.addEventListener("load", () => {
+                            activateAll();
+                            setTimeout(activateAll, 100);
+                            setTimeout(activateAll, 500);
+                        });
+                        </script>
+                    """.trimIndent()
+
+                    htmlContent = if (htmlContent.contains("</head>", ignoreCase = true)) {
+                        htmlContent.replaceFirst("</head>", "$mobileSlideStyle</head>", ignoreCase = true)
+                    } else {
+                        "$mobileSlideStyle$htmlContent"
+                    }
+                } else if (!htmlContent.contains("viewport", ignoreCase = true)) {
+                    val viewportMeta = """<meta name="viewport" content="width=device-width, initial-scale=1.0">"""
+                    htmlContent = if (htmlContent.contains("<head>", ignoreCase = true)) {
+                        htmlContent.replaceFirst("<head>", "<head>$viewportMeta", ignoreCase = true)
+                    } else {
+                        "$viewportMeta$htmlContent"
+                    }
+                }
+                htmlContent to isMarp
+            } catch (e: Exception) {
+                "<html><body><pre>无法加载 HTML 预览</pre></body></html>" to false
+            }
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(colors.surfaceVariant)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (showFindBar) {
+                OutlinedTextField(
+                    value = findQuery,
+                    onValueChange = { q ->
+                        findQuery = q
+                        if (q.isBlank()) {
+                            webViewRef?.clearMatches()
+                            matchCount = 0
+                            activeMatchIdx = 0
+                        } else {
+                            webViewRef?.findAllAsync(q)
+                        }
+                    },
+                    placeholder = { Text("页内查找...".loc, fontSize = 12.5.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                if (findQuery.isNotEmpty()) {
+                    Text(
+                        text = if (matchCount > 0) "${activeMatchIdx + 1}/$matchCount" else "0/0",
+                        color = colors.textSecondary,
+                        fontSize = 11.5.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    IconButton(onClick = { webViewRef?.findNext(false) }, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = "上一个".loc, tint = colors.textPrimary)
+                    }
+                    IconButton(onClick = { webViewRef?.findNext(true) }, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "下一个".loc, tint = colors.textPrimary)
+                    }
+                }
+                IconButton(
+                    onClick = {
+                        showFindBar = false
+                        findQuery = ""
+                        webViewRef?.clearMatches()
+                    },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = "关闭查找".loc, tint = colors.textSecondary)
+                }
+            } else {
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { showFindBar = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)) {
+                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("页内查找".loc, fontSize = 12.5.sp)
+                }
+            }
+        }
+
+        val currentPrepared = preparedHtml
+        if (currentPrepared == null) {
+            Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = colors.accentIndigo)
+            }
+        } else {
+            AndroidView(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        webViewRef = this
+                        setBackgroundColor(
+                            if (currentPrepared.second) android.graphics.Color.parseColor("#F4F5F7")
+                            else android.graphics.Color.WHITE
+                        )
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                val reqUrl = request?.url ?: return true
+                                val scheme = reqUrl.scheme?.lowercase().orEmpty()
+                                if (reqUrl.toString() == "about:blank" || scheme == "about") {
+                                    return false
+                                }
+                                if (scheme == "file" || scheme == "content" || scheme == "intent" || scheme == "javascript") {
+                                    return true
+                                }
+                                if (request.isForMainFrame && request.hasGesture() && (scheme == "http" || scheme == "https")) {
+                                    com.antigravity.mobile.ui.util.InAppBrowserUtils.openUrl(context, reqUrl.toString())
+                                }
+                                return true
+                            }
+
+                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                val scheme = request?.url?.scheme?.lowercase().orEmpty()
+                                if (scheme == "file" || scheme == "content" || scheme == "intent") {
+                                    return WebResourceResponse(
+                                        "text/plain",
+                                        "UTF-8",
+                                        403,
+                                        "Forbidden",
+                                        emptyMap(),
+                                        ByteArrayInputStream(ByteArray(0))
+                                    )
+                                }
+                                return super.shouldInterceptRequest(view, request)
+                            }
+                        }
+                        webChromeClient = WebChromeClient()
+                        setFindListener { activeOrdinal, numberOfMatches, _ ->
+                            activeMatchIdx = activeOrdinal
+                            matchCount = numberOfMatches
+                        }
+                        settings.apply {
+                            @Suppress("SetJavaScriptEnabled")
+                            javaScriptEnabled = true
+                            domStorageEnabled = false
+                            databaseEnabled = false
+                            allowFileAccess = false
+                            allowContentAccess = false
+                            @Suppress("DEPRECATION")
+                            allowFileAccessFromFileURLs = false
+                            @Suppress("DEPRECATION")
+                            allowUniversalAccessFromFileURLs = false
+                            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            builtInZoomControls = true
+                            displayZoomControls = false
+                            useWideViewPort = true
+                            loadWithOverviewMode = true
+                        }
+                        tag = currentPrepared.first
+                        loadDataWithBaseURL("about:blank", currentPrepared.first, "text/html", "utf-8", null)
+                    }
+                },
+                update = { wv ->
+                    if (wv.tag != currentPrepared.first) {
+                        wv.setBackgroundColor(
+                            if (currentPrepared.second) android.graphics.Color.parseColor("#F4F5F7")
+                            else android.graphics.Color.WHITE
+                        )
+                        wv.tag = currentPrepared.first
+                        wv.loadDataWithBaseURL("about:blank", currentPrepared.first, "text/html", "utf-8", null)
+                    }
+                }
+            )
+        }
+    }
+}
+
+private data class PptxSlide(
+    val slideNumber: Int,
+    val bitmap: Bitmap? = null,
+    val categoryBadge: String? = null,
+    val title: String? = null,
+    val subtitle: String? = null,
+    val items: List<String> = emptyList(),
+    val isDarkTheme: Boolean = true
+)
+
+/**
+ * PPTX Document Viewer.
+ * Solves the previous preview bug where a blank white template dummy thumbnail in docProps/thumbnail.jpeg
+ * caused all slide XML parsing to be skipped.
+ * Now parses all ppt/slides/slide{N}.xml numerically, extracts structured shapes, categories, titles,
+ * subtitles, bullet items, and slide theme, and renders each as a 16:9 presentation slide card.
+ */
+@Composable
+private fun PptxDocumentViewer(file: File, colors: AppColors) {
+    val context = LocalContext.current
+    val haptic = rememberHaptic()
+    var slides by remember { mutableStateOf<List<PptxSlide>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(file) {
+        withContext(Dispatchers.IO) {
+            try {
+                val parsedSlides = mutableListOf<PptxSlide>()
+                val zip = ZipFile(file)
+                val entries = zip.entries().asSequence().toList()
+
+                // Check for slide-rendered image exports (e.g. ppt/media/slide_1.png, Slide-1-image-1.png, page-1.png, etc.)
+                val slideImageRegex = Regex("""ppt/media/(?:slide|page)[-_]?(\d+)(?:[-_].*?)?\.(?:png|jpe?g|webp)""", RegexOption.IGNORE_CASE)
+                val slideImageEntries = mutableMapOf<Int, java.util.zip.ZipEntry>()
+                for (entry in entries) {
+                    val match = slideImageRegex.find(entry.name)
+                    if (match != null) {
+                        val num = match.groupValues[1].toIntOrNull() ?: 1
+                        if (!slideImageEntries.containsKey(num)) {
+                            slideImageEntries[num] = entry
+                        }
+                    }
+                }
+
+                // If slide images not identified by filename, check slide .rels for background/embedded images
+                val slideXmlRegex = Regex("""ppt/slides/slide(\d+)\.xml""", RegexOption.IGNORE_CASE)
+                val xmlEntries = entries.filter { slideXmlRegex.matches(it.name) }
+                    .sortedBy { slideXmlRegex.find(it.name)?.groupValues?.get(1)?.toIntOrNull() ?: 999 }
+
+                if (slideImageEntries.isEmpty() && xmlEntries.isNotEmpty()) {
+                    val relTargetRegex = Regex("""<Relationship[^>]+Id="([^"]+)"[^>]+Target="([^"]+)"""", RegexOption.IGNORE_CASE)
+                    val relEmbedRegex = Regex("""r:embed="([^"]+)"""")
+                    for (xmlEntry in xmlEntries) {
+                        val slideNum = slideXmlRegex.find(xmlEntry.name)?.groupValues?.get(1)?.toIntOrNull() ?: continue
+                        val relEntryName = "ppt/slides/_rels/slide$slideNum.xml.rels"
+                        val relEntry = zip.getEntry(relEntryName)
+                        if (relEntry != null) {
+                            val relXml = zip.getInputStream(relEntry).use { it.bufferedReader(Charsets.UTF_8).readText() }
+                            val relTargets = relTargetRegex.findAll(relXml).associate {
+                                it.groupValues[1] to it.groupValues[2]
+                            }
+                            val slideXml = zip.getInputStream(xmlEntry).use { it.bufferedReader(Charsets.UTF_8).readText() }
+                            val embeds = relEmbedRegex.findAll(slideXml).map { it.groupValues[1] }.toList()
+                            for (embedId in embeds) {
+                                val rawTarget = relTargets[embedId] ?: continue
+                                val normalizedTarget = if (rawTarget.startsWith("../")) {
+                                    "ppt/" + rawTarget.removePrefix("../")
+                                } else {
+                                    "ppt/slides/" + rawTarget
+                                }
+                                val imgEntry = zip.getEntry(normalizedTarget)
+                                if (imgEntry != null && (normalizedTarget.endsWith(".png", true) || normalizedTarget.endsWith(".jpg", true) || normalizedTarget.endsWith(".jpeg", true) || normalizedTarget.endsWith(".webp", true))) {
+                                    slideImageEntries[slideNum] = imgEntry
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (slideImageEntries.isNotEmpty()) {
+                    // Render pure image slides if present with memory-safe downsampling
+                    val sortedKeys = slideImageEntries.keys.sorted()
+                    for (num in sortedKeys) {
+                        val entry = slideImageEntries[num]!!
+                        val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                        
+                        val boundsOptions = BitmapFactory.Options().apply {
+                            inJustDecodeBounds = true
+                        }
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+
+                        var sampleSize = 1
+                        val targetWidth = 1440
+                        while (boundsOptions.outWidth / (sampleSize * 2) >= targetWidth) {
+                            sampleSize *= 2
+                        }
+
+                        val decodeOptions = BitmapFactory.Options().apply {
+                            inSampleSize = sampleSize
+                            inPreferredConfig = Bitmap.Config.RGB_565
+                        }
+                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)
+                        if (bmp != null) {
+                            parsedSlides.add(PptxSlide(slideNumber = num, bitmap = bmp))
+                        }
+                    }
+                } else {
+                    // Parse structured XML slides from ppt/slides/slide{N}.xml (numerical order)
+                    // Matches DrawingML paragraphs <a:p> globally to cover shapes, tables, group shapes, and text frames
+                    val pRegex = Regex("""<a:p\b.*?</a:p>""", RegexOption.DOT_MATCHES_ALL)
+                    val tRegex = Regex("""<a:t\b[^>]*>(.*?)</a:t>""", RegexOption.DOT_MATCHES_ALL)
+                    val darkHexRegex = Regex("""srgbClr val="(0B0F19|111827|1E293B|0A0F1D|000000|0F172A)""", RegexOption.IGNORE_CASE)
+
+                    for (xmlEntry in xmlEntries) {
+                        val slideNum = slideXmlRegex.find(xmlEntry.name)?.groupValues?.get(1)?.toIntOrNull()
+                            ?: (parsedSlides.size + 1)
+                        val xmlContent = zip.getInputStream(xmlEntry).use { it.bufferedReader(Charsets.UTF_8).readText() }
+
+                        val isDark = darkHexRegex.containsMatchIn(xmlContent) || xmlContent.contains("0B0F19", ignoreCase = true)
+                        val paragraphs = pRegex.findAll(xmlContent).map { it.value }.toList()
+                        val texts = mutableListOf<String>()
+
+                        for (p in paragraphs) {
+                            val runs = tRegex.findAll(p).map { m ->
+                                unescapeXml(m.groupValues[1])
+                            }.filter { it.isNotEmpty() }.toList()
+
+                            if (runs.isNotEmpty()) {
+                                val line = runs.joinToString("").trim()
+                                if (line.isNotBlank()) {
+                                    texts.add(line)
+                                }
+                            }
+                        }
+
+                        var categoryBadge: String? = null
+                        var slideTitle: String? = null
+                        var subtitle: String? = null
+                        var rem = texts.toList()
+
+                        if (rem.isNotEmpty()) {
+                            val first = rem.first()
+                            // Determine if first shape is category/theme badge
+                            if (first.length <= 32 && (first.all { it.isUpperCase() || it.isDigit() || it.isWhitespace() || it == '-' || it == '_' || it == '/' || it == ':' }
+                                    || listOf("DEMO", "SYSTEM", "EVOLUTION", "CHALLENGES", "ARCHITECTURE", "OVERVIEW", "KEYNOTE").any { first.contains(it, ignoreCase = true) })) {
+                                categoryBadge = first
+                                rem = rem.drop(1)
+                            }
+                        }
+
+                        if (rem.isNotEmpty()) {
+                            slideTitle = rem.first()
+                            rem = rem.drop(1)
+                        }
+
+                        if (rem.isNotEmpty()) {
+                            val candidateSub = rem.first()
+                            if (candidateSub.length <= 120 && !candidateSub.startsWith("01") && !candidateSub.startsWith("第一代".loc) && !candidateSub.startsWith("•")) {
+                                subtitle = candidateSub
+                                rem = rem.drop(1)
+                            }
+                        }
+
+                        // Filter out bottom footer boilerplate
+                        val items = rem.filter { t ->
+                            !listOf("PPT Master", "Tech Presentation", "Release: v", "Page 0", "• Page").any { t.contains(it, ignoreCase = true) }
+                        }
+
+                        parsedSlides.add(
+                            PptxSlide(
+                                slideNumber = slideNum,
+                                categoryBadge = categoryBadge,
+                                title = slideTitle ?: "幻灯片 $slideNum".loc,
+                                subtitle = subtitle,
+                                items = items,
+                                isDarkTheme = isDark
+                            )
+                        )
+                    }
+                }
+
+                zip.close()
+
+                withContext(Dispatchers.Main) {
+                    slides = parsedSlides
+                    isLoading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = e.localizedMessage ?: "无法解析幻灯片".loc
+                    isLoading = false
+                }
+            }
+        }
+    }
+
+    if (isLoading) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(color = colors.accentIndigo, modifier = Modifier.size(32.dp))
+        }
+    } else if (errorMessage != null || slides.isEmpty()) {
+        OfficeDocumentFallback(file = file, colors = colors, customMessage = errorMessage)
+    } else {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = 16.dp, top = 16.dp, end = 16.dp,
+                bottom = 16.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+            ),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            itemsIndexed(slides) { _, slide ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (slide.bitmap != null) {
+                        Image(
+                            bitmap = slide.bitmap.asImageBitmap(),
+                            contentDescription = "幻灯片 ${slide.slideNumber}".loc,
+                            contentScale = ContentScale.FillWidth,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(0.5.dp, colors.border, RoundedCornerShape(12.dp))
+                        )
+                    } else {
+                        // Presentation Slide Widescreen Card
+                        val cardBg = if (slide.isDarkTheme) Color(0xFF0F172A) else colors.surfaceVariant.copy(alpha = 0.5f)
+                        val cardBorder = if (slide.isDarkTheme) Color(0xFF334155) else colors.border
+                        val titleColor = if (slide.isDarkTheme) Color(0xFFF8FAFC) else colors.textPrimary
+                        val subColor = if (slide.isDarkTheme) Color(0xFF94A3B8) else colors.textSecondary
+                        val textColor = if (slide.isDarkTheme) Color(0xFFE2E8F0) else colors.textPrimary
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(cardBg)
+                                .border(0.8.dp, cardBorder, RoundedCornerShape(14.dp))
+                                .padding(16.dp)
+                        ) {
+                            // Slide Top Bar
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (!slide.categoryBadge.isNullOrBlank()) {
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = colors.accentIndigo.copy(alpha = 0.2f)
+                                    ) {
+                                        Text(
+                                            text = slide.categoryBadge,
+                                            color = colors.accentIndigo,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                } else {
+                                    Spacer(modifier = Modifier.width(1.dp))
+                                }
+
+                                Text(
+                                    text = String.format("%02d / %02d", slide.slideNumber, slides.size),
+                                    color = colors.textMuted,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // Slide Title
+                            Text(
+                                text = slide.title ?: "幻灯片 ${slide.slideNumber}".loc,
+                                color = titleColor,
+                                fontSize = 16.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                lineHeight = 22.sp
+                            )
+
+                            // Slide Subtitle
+                            if (!slide.subtitle.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = slide.subtitle,
+                                    color = subColor,
+                                    fontSize = 12.5.sp,
+                                    lineHeight = 17.sp
+                                )
+                            }
+
+                            // Slide Items
+                            if (slide.items.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                HorizontalDivider(color = cardBorder.copy(alpha = 0.6f), thickness = 0.5.dp)
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    slide.items.take(10).forEach { item ->
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.Top
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .padding(top = 6.dp, end = 8.dp)
+                                                    .size(5.dp)
+                                                    .clip(CircleShape)
+                                                    .background(colors.accentIndigo)
+                                            )
+                                            Text(
+                                                text = item,
+                                                color = textColor,
+                                                fontSize = 12.sp,
+                                                lineHeight = 16.5.sp
+                                            )
+                                        }
+                                    }
+                                    if (slide.items.size > 10) {
+                                        Text(
+                                            text = "• 还有 ${slide.items.size - 10} 项演示内容...".loc,
+                                            color = colors.textMuted,
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        )
+                                    }
+                                }
+                            } else if (slide.subtitle.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "（本页主要包含图表、表格或版式内容，可点击下方在第三方应用中完整查看）".loc,
+                                    color = subColor,
+                                    fontSize = 11.5.sp,
+                                    lineHeight = 16.sp
+                                )
+                            }
+                        }
+                    }
+
+                    Text(
+                        text = "第 ${slide.slideNumber} / ${slides.size} 页".loc,
+                        color = colors.textMuted,
+                        fontSize = 11.5.sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
+            }
+
+            // Bottom Action: Open in External App
+            item {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        haptic.medium()
+                        openInExternalApp(context, file)
+                    },
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = colors.surfaceVariant,
+                        contentColor = colors.textPrimary
+                    ),
+                    border = androidx.compose.foundation.BorderStroke(0.5.dp, colors.border),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.OpenInNew,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "在第三方应用中打开 (WPS / Office 完整放映)".loc,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+        }
+    }
+}
+
+private fun unescapeXml(text: String): String {
+    return text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+}
+
+private class LazyPdfHolder(
+    private val fileDescriptor: ParcelFileDescriptor,
+    private val renderer: PdfRenderer
+) {
+    val pageCount: Int = renderer.pageCount
+    private val mutex = Mutex()
+    private val pageCache = object : android.util.LruCache<Int, Bitmap>(12) {}
+
+    suspend fun getOrRenderPage(index: Int, highRes: Boolean): Bitmap? = withContext(Dispatchers.IO) {
+        val cacheKey = if (highRes) index + 100_000 else index
+        pageCache.get(cacheKey)?.let { if (!it.isRecycled) return@withContext it }
+        mutex.withLock {
+            pageCache.get(cacheKey)?.let { if (!it.isRecycled) return@withLock it }
+            if (index < 0 || index >= pageCount) return@withLock null
+            val page = renderer.openPage(index)
+            try {
+                val scale = if (highRes) 2f else 1.35f
+                val targetWidth = (page.width * scale).toInt().coerceIn(320, 1800)
+                val targetHeight = (page.height * (targetWidth.toFloat() / page.width.coerceAtLeast(1))).toInt().coerceAtLeast(320)
+                val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(android.graphics.Color.WHITE)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                pageCache.put(cacheKey, bitmap)
+                bitmap
+            } finally {
+                page.close()
+            }
+        }
+    }
+
+    fun close() {
+        runCatching { renderer.close() }
+        runCatching { fileDescriptor.close() }
+        pageCache.evictAll()
+    }
+}
+
+@Composable
+private fun PdfDocumentViewer(file: File, colors: AppColors) {
+    var holder by remember { mutableStateOf<LazyPdfHolder?>(null) }
+    var isLoading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var highResMode by remember { mutableStateOf(false) }
+
+    DisposableEffect(file) {
+        onDispose {
+            holder?.close()
+            holder = null
+        }
+    }
+
+    LaunchedEffect(file) {
+        holder?.close()
+        holder = null
+        isLoading = true
+        errorMessage = null
+        withContext(Dispatchers.IO) {
+            try {
+                val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                val renderer = PdfRenderer(fd)
+                val h = LazyPdfHolder(fd, renderer)
+                withContext(Dispatchers.Main) {
+                    holder = h
+                    isLoading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = e.localizedMessage ?: "无法解析 PDF".loc
+                    isLoading = false
+                }
+            }
+        }
+    }
+
+    if (isLoading) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(color = colors.accentIndigo, modifier = Modifier.size(32.dp))
+        }
+    } else if (errorMessage != null) {
+        OfficeDocumentFallback(file = file, colors = colors, customMessage = errorMessage)
+    } else if (holder != null) {
+        val activeHolder = holder!!
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(colors.surfaceVariant)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "共 ${activeHolder.pageCount} 页 · 按需懒加载".loc,
+                    color = colors.textSecondary,
+                    fontSize = 12.sp
+                )
+                FilterChip(
+                    selected = highResMode,
+                    onClick = { highResMode = !highResMode },
+                    label = { Text(if (highResMode) "超清渲染中".loc else "标准流畅".loc, fontSize = 11.5.sp) }
+                )
+            }
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentPadding = PaddingValues(
+                    start = 16.dp, top = 12.dp, end = 16.dp,
+                    bottom = 16.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+                ),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                items(activeHolder.pageCount) { index ->
+                    val bitmap by produceState<Bitmap?>(initialValue = null, index, highResMode, activeHolder) {
+                        value = activeHolder.getOrRenderPage(index, highResMode)
+                    }
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        if (bitmap != null && !bitmap!!.isRecycled) {
+                            Image(
+                                bitmap = bitmap!!.asImageBitmap(),
+                                contentDescription = "Page ${index + 1}",
+                                contentScale = ContentScale.FillWidth,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .border(0.5.dp, colors.border, RoundedCornerShape(8.dp))
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(360.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(colors.surfaceVariant)
+                                    .border(0.5.dp, colors.border, RoundedCornerShape(8.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp, color = colors.accentIndigo)
+                            }
+                        }
+                        Text(
+                            text = "第 ${index + 1} / ${activeHolder.pageCount} 页".loc,
+                            color = colors.textMuted,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TextDocumentViewer(file: File, colors: AppColors) {
+    val linesState by produceState<List<String>?>(initialValue = null, key1 = file) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                val maxPreviewBytes = 8L * 1024L * 1024L
+                val result = ArrayList<String>(512)
+                var totalBytes = 0L
+                file.bufferedReader(Charsets.UTF_8).useLines { seq ->
+                    for (line in seq) {
+                        totalBytes += line.length * 2L
+                        if (totalBytes > maxPreviewBytes) {
+                            result.add("... [文件过大，已截断后续内容预览] ...")
+                            break
+                        }
+                        result.add(line)
+                    }
+                }
+                if (result.isEmpty()) listOf("") else result
+            } catch (e: Exception) {
+                listOf("无法读取文件内容: ${e.message}".loc)
+            }
+        }
+    }
+    var showFindBar by remember { mutableStateOf(false) }
+    var findQuery by remember { mutableStateOf("") }
+    val trimmedQuery = remember(findQuery) { findQuery.trim() }
+
+    val matchCount by produceState(initialValue = 0, key1 = linesState, key2 = trimmedQuery) {
+        val loadedLines = linesState
+        if (loadedLines == null || trimmedQuery.isEmpty()) {
+            value = 0
+        } else {
+            delay(120)
+            value = withContext(Dispatchers.Default) {
+                var total = 0
+                for (line in loadedLines) {
+                    var start = 0
+                    while (start < line.length) {
+                        val found = line.indexOf(trimmedQuery, startIndex = start, ignoreCase = true)
+                        if (found < 0) break
+                        total++
+                        start = found + trimmedQuery.length.coerceAtLeast(1)
+                    }
+                }
+                total
+            }
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(colors.surfaceVariant)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (showFindBar) {
+                OutlinedTextField(
+                    value = findQuery,
+                    onValueChange = { findQuery = it },
+                    placeholder = { Text("在文本中查找...".loc, fontSize = 12.5.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                    trailingIcon = {
+                        if (findQuery.isNotEmpty()) {
+                            Text("$matchCount 处".loc, color = colors.textSecondary, fontSize = 11.5.sp, modifier = Modifier.padding(end = 6.dp))
+                        }
+                    }
+                )
+                IconButton(
+                    onClick = {
+                        showFindBar = false
+                        findQuery = ""
+                    },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = "关闭查找".loc, tint = colors.textSecondary)
+                }
+            } else {
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { showFindBar = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)) {
+                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("页内查找".loc, fontSize = 12.5.sp)
+                }
+            }
+        }
+
+        val currentLines = linesState
+        if (currentLines == null) {
+            Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = colors.accentIndigo)
+            }
+        } else {
+            val horizScroll = rememberScrollState()
+            SelectionContainer {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .horizontalScroll(horizScroll),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+                ) {
+                    itemsIndexed(currentLines, key = { index, _ -> index }) { _, rawLine ->
+                        val renderedLine = remember(rawLine, trimmedQuery, colors.textPrimary) {
+                            if (trimmedQuery.isEmpty() || !rawLine.contains(trimmedQuery, ignoreCase = true)) {
+                                AnnotatedString(rawLine)
+                            } else {
+                                buildAnnotatedString {
+                                    append(rawLine)
+                                    var start = 0
+                                    while (start < rawLine.length) {
+                                        val found = rawLine.indexOf(trimmedQuery, startIndex = start, ignoreCase = true)
+                                        if (found < 0) break
+                                        addStyle(
+                                            SpanStyle(background = Color(0x66FFEB3B), color = colors.textPrimary),
+                                            found,
+                                            found + trimmedQuery.length
+                                        )
+                                        start = found + trimmedQuery.length.coerceAtLeast(1)
+                                    }
+                                }
+                            }
+                        }
+                        Text(
+                            text = renderedLine,
+                            color = colors.textPrimary,
+                            fontSize = 12.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 18.sp,
+                            softWrap = false
+                        )
+                    }
+                    item(key = "bottom_nav_spacer") {
+                        Spacer(modifier = Modifier.navigationBarsPadding().height(8.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OfficeDocumentFallback(
+    file: File,
+    colors: AppColors,
+    customMessage: String? = null
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val haptic = rememberHaptic()
+    val sizeStr = remember(file) {
+        val bytes = file.length()
+        if (bytes < 1024) "$bytes B"
+        else if (bytes < 1024 * 1024) "${bytes / 1024} KB"
+        else "%.1f MB".format(bytes.toFloat() / (1024 * 1024))
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(72.dp)
+                .clip(CircleShape)
+                .background(colors.accentIndigo.copy(alpha = 0.12f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.Description,
+                contentDescription = null,
+                tint = colors.accentIndigo,
+                modifier = Modifier.size(36.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+            text = file.name,
+            color = colors.textPrimary,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center
+        )
+
+        Text(
+            text = "文件大小: $sizeStr".loc,
+            color = colors.textMuted,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+
+        if (customMessage != null) {
+            Text(
+                text = customMessage,
+                color = Color(0xFFFF9800),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Button(
+            onClick = {
+                haptic.medium()
+                openInExternalApp(context, file)
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = colors.accentIndigo),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth(0.75f)
+        ) {
+            Icon(
+                imageVector = Icons.Default.OpenInNew,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(text = "在第三方应用中打开".loc, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        OutlinedButton(
+            onClick = {
+                haptic.light()
+                coroutineScope.launch {
+                    saveFileToDownloads(context, file, file.name)
+                }
+            },
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth(0.75f)
+        ) {
+            Icon(
+                imageVector = Icons.Default.FileDownload,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(text = "保存到下载目录".loc, fontSize = 14.sp)
+        }
+    }
+}
+
+private fun openInExternalApp(context: Context, file: File) {
+    try {
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        val mimeType = getMimeType(file)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(Intent.createChooser(intent, "打开文件".loc))
+    } catch (e: Exception) {
+        Toast.makeText(context, "未找到可打开此文件的应用: ${e.message}".loc, Toast.LENGTH_SHORT).show()
+    }
+}
+
+internal fun shareDocument(context: Context, file: File, title: String) {
+    try {
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        val mimeType = getMimeType(file)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, title)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        com.antigravity.mobile.ui.util.ShareImageUtils.startShare(context, shareIntent, "分享文件".loc)
+    } catch (e: Exception) {
+        Toast.makeText(context, "分享失败: ${e.message}".loc, Toast.LENGTH_SHORT).show()
+    }
+}
+
+suspend fun saveFileToDownloads(context: Context, file: File, displayName: String) {
+    withContext(Dispatchers.IO) {
+        try {
+            val mimeType = getMimeType(file)
+            val isImage = mimeType.startsWith("image/")
+            val isVideo = mimeType.startsWith("video/")
+            val resolver = context.contentResolver
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val relativePath = when {
+                        isImage -> Environment.DIRECTORY_PICTURES + "/Antigravity"
+                        isVideo -> Environment.DIRECTORY_MOVIES + "/Antigravity"
+                        else -> Environment.DIRECTORY_DOWNLOADS + "/Antigravity"
+                    }
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+
+            val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                when {
+                    isImage -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                    isVideo -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                    else -> MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                }
+            } else {
+                when {
+                    isImage -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                    isVideo -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                    else -> MediaStore.Files.getContentUri("external")
+                }
+            }
+
+            val itemUri = resolver.insert(collectionUri, contentValues)
+            if (itemUri != null) {
+                resolver.openOutputStream(itemUri)?.use { out ->
+                    file.inputStream().use { input ->
+                        input.copyTo(out)
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    contentValues.clear()
+                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(itemUri, contentValues, null, null)
+                }
+                withContext(Dispatchers.Main) {
+                    val destDesc = when {
+                        isImage -> "相册".loc
+                        isVideo -> "视频相册".loc
+                        else -> "下载目录".loc
+                    }
+                    Toast.makeText(context, "已保存到$destDesc".loc, Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                val targetDir = Environment.getExternalStoragePublicDirectory(
+                    when {
+                        isImage -> Environment.DIRECTORY_PICTURES
+                        isVideo -> Environment.DIRECTORY_MOVIES
+                        else -> Environment.DIRECTORY_DOWNLOADS
+                    }
+                )
+                val destFile = File(targetDir, displayName)
+                file.copyTo(destFile, overwrite = true)
+                withContext(Dispatchers.Main) {
+                    val destDesc = when {
+                        isImage -> "相册".loc
+                        isVideo -> "视频相册".loc
+                        else -> "下载目录".loc
+                    }
+                    Toast.makeText(context, "已保存到$destDesc".loc, Toast.LENGTH_SHORT).show()
+                }
+            }
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, "保存失败: ${e.localizedMessage ?: e.message}".loc, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
+private fun getMimeType(file: File): String {
+    return when (file.extension.lowercase()) {
+        "pdf" -> "application/pdf"
+        "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        "ppt" -> "application/vnd.ms-powerpoint"
+        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "doc" -> "application/msword"
+        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "xls" -> "application/vnd.ms-excel"
+        "html", "htm" -> "text/html"
+        "svg" -> "image/svg+xml"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "webp" -> "image/webp"
+        "gif" -> "image/gif"
+        "mp4" -> "video/mp4"
+        "mov" -> "video/quicktime"
+        "m4v" -> "video/x-m4v"
+        "webm" -> "video/webm"
+        "3gp" -> "video/3gpp"
+        "mkv" -> "video/x-matroska"
+        "avi" -> "video/x-msvideo"
+        "txt", "log", "csv" -> "text/plain"
+        "json" -> "application/json"
+        "md" -> "text/markdown"
+        "zip" -> "application/zip"
+        else -> "*/*"
+    }
+}
