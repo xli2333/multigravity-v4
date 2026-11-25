@@ -366,7 +366,7 @@ private struct UserAsyncImageBubbleView: View {
                 return
             }
             if let decoded = UIImage(data: data) {
-                MarkdownImageCache.shared.insert(decoded, for: url)
+                MarkdownImageCache.shared.insert(decoded, for: url, rawData: data)
                 uiImage = decoded
                 hasFailed = false
             } else {

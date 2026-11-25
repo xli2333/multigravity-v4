@@ -29,7 +29,7 @@ enum ImageActions {
         guard let (data, response) = try? await NetworkTransport.shared.fetchCachedData(for: request) else { return nil }
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 { return nil }
         guard let image = UIImage(data: data) else { return nil }
-        MarkdownImageCache.shared.insert(image, for: url)
+        MarkdownImageCache.shared.insert(image, for: url, rawData: data)
         return image
     }
 

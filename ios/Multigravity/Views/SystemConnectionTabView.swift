@@ -30,6 +30,7 @@ public struct SystemConnectionTabView: View {
     @State private var permissionErrorMessage: String? = nil
 
     @State private var showClearCacheAlert: Bool = false
+    @State private var cachedMediaSizeText: String = ""
     @State private var showUnpairAlert: Bool = false
     @State private var webSheetURL: IdentifiableURL? = nil
     @State private var showPrivacyPolicySheet: Bool = false
@@ -125,10 +126,11 @@ public struct SystemConnectionTabView: View {
             Button("清空", role: .destructive) {
                 CacheManager.shared.clearCache()
                 DocumentCacheManager.shared.clearCache()
+                cachedMediaSizeText = "0 KB"
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
         } message: {
-            Text("本地缓存的会话消息、方案及离线文档将被清理，下次访问时将从网关重新拉取。")
+            Text("本地永久缓存的图片、视频、离线文档与会话消息将被清理，下次访问时将重新从电脑端加载。")
         }
         .alert(settings.isDemoMode ? String(localized: "确定退出演示模式？") : String(localized: "确定解除设备配对？"), isPresented: $showUnpairAlert) {
             Button("取消", role: .cancel) {}
@@ -900,9 +902,10 @@ public struct SystemConnectionTabView: View {
                 } label: {
                     HStack(spacing: 5) {
                         AGLinearIcon(.trash, size: 12.5, color: AGPalette.textSecondary(colorScheme), lineWidth: 1.9)
-                        Text("清空本地缓存")
+                        Text(cachedMediaSizeText.isEmpty || cachedMediaSizeText == "0 KB" ? "清空本地缓存" : "清空缓存 (\(cachedMediaSizeText))")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(AGPalette.textSecondary(colorScheme))
+                            .lineLimit(1)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 9)
@@ -910,6 +913,12 @@ public struct SystemConnectionTabView: View {
                     .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(AGPalette.border(colorScheme), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
+                .task {
+                    let sizeStr = await Task.detached(priority: .utility) {
+                        DocumentCacheManager.shared.formattedCacheSize()
+                    }.value
+                    cachedMediaSizeText = sizeStr
+                }
 
                 Button {
                     showUnpairAlert = true

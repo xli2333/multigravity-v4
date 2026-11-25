@@ -23,45 +23,89 @@ public func isVideoURL(_ raw: String) -> Bool {
     return false
 }
 
-// MARK: - Video Thumbnail Memory Cache
+// MARK: - Video Thumbnail Permanent Disk + Memory Cache
 
 public final class VideoThumbnailCache: @unchecked Sendable {
     public static let shared = VideoThumbnailCache()
-    private let cache = NSCache<NSURL, UIImage>()
+    private let cache = NSCache<NSString, UIImage>()
     
     private init() {
-        cache.countLimit = 60
-        cache.totalCostLimit = 40 * 1024 * 1024 // 40MB
+        cache.countLimit = 80
+        cache.totalCostLimit = 40 * 1024 * 1024 // 40MB RAM
+    }
+    
+    private func cacheKey(for url: URL) -> NSString {
+        DocumentCacheManager.canonicalMediaKey(for: url.absoluteString) as NSString
     }
     
     public func image(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
+        let key = cacheKey(for: url)
+        if let mem = cache.object(forKey: key) {
+            return mem
+        }
+        if let diskData = DocumentCacheManager.shared.cachedMediaData(for: url, namespace: "video_poster"),
+           let decoded = UIImage(data: diskData) {
+            let cost = Int(decoded.size.width * decoded.size.height * 4)
+            cache.setObject(decoded, forKey: key, cost: min(cost, 5 * 1024 * 1024))
+            return decoded
+        }
+        return nil
     }
     
     public func insert(_ image: UIImage, for url: URL) {
+        let key = cacheKey(for: url)
         let cost = Int(image.size.width * image.size.height * 4)
-        cache.setObject(image, forKey: url as NSURL, cost: min(cost, 5 * 1024 * 1024))
+        cache.setObject(image, forKey: key, cost: min(cost, 5 * 1024 * 1024))
+        if let jpegData = image.jpegData(compressionQuality: 0.85) {
+            DocumentCacheManager.shared.saveMediaData(jpegData, for: url, namespace: "video_poster")
+        }
+    }
+    
+    public func clearMemory() {
+        cache.removeAllObjects()
     }
 }
 
-// MARK: - Markdown Image Memory Cache
+// MARK: - Markdown Image Permanent Disk + Memory Cache
 
 public final class MarkdownImageCache: @unchecked Sendable {
     public static let shared = MarkdownImageCache()
-    private let cache = NSCache<NSURL, UIImage>()
+    private let cache = NSCache<NSString, UIImage>()
 
     private init() {
-        cache.countLimit = 150
-        cache.totalCostLimit = 60 * 1024 * 1024 // 60MB
+        cache.countLimit = 180
+        cache.totalCostLimit = 80 * 1024 * 1024 // 80MB RAM
+    }
+
+    private func cacheKey(for url: URL) -> NSString {
+        DocumentCacheManager.canonicalMediaKey(for: url.absoluteString) as NSString
     }
 
     public func image(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
+        let key = cacheKey(for: url)
+        if let mem = cache.object(forKey: key) {
+            return mem
+        }
+        if let diskData = DocumentCacheManager.shared.cachedMediaData(for: url, namespace: "img"),
+           let decoded = UIImage(data: diskData) {
+            let cost = Int(decoded.size.width * decoded.size.height * 4)
+            cache.setObject(decoded, forKey: key, cost: min(cost, 10 * 1024 * 1024))
+            return decoded
+        }
+        return nil
     }
 
-    public func insert(_ image: UIImage, for url: URL) {
+    public func insert(_ image: UIImage, for url: URL, rawData: Data? = nil) {
+        let key = cacheKey(for: url)
         let cost = Int(image.size.width * image.size.height * 4)
-        cache.setObject(image, forKey: url as NSURL, cost: min(cost, 10 * 1024 * 1024))
+        cache.setObject(image, forKey: key, cost: min(cost, 10 * 1024 * 1024))
+        if let bytes = rawData ?? image.pngData() ?? image.jpegData(compressionQuality: 0.92) {
+            DocumentCacheManager.shared.saveMediaData(bytes, for: url, namespace: "img")
+        }
+    }
+
+    public func clearMemory() {
+        cache.removeAllObjects()
     }
 }
 
@@ -228,7 +272,7 @@ struct CachedMarkdownAsyncImageView: View {
                 return
             }
             if let decoded = UIImage(data: data) {
-                MarkdownImageCache.shared.insert(decoded, for: url)
+                MarkdownImageCache.shared.insert(decoded, for: url, rawData: data)
                 uiImage = decoded
             } else {
                 hasFailed = true
@@ -408,6 +452,10 @@ public struct MarkdownVideoPreviewCard: View {
         defer { isLoading = false }
         
         let asset: AVURLAsset = {
+            if let localCached = DocumentCacheManager.shared.getCachedFile(for: rawUri, fileName: displayTitle)
+                ?? DocumentCacheManager.shared.getCachedFile(for: url.absoluteString, fileName: displayTitle) {
+                return AVURLAsset(url: localCached)
+            }
             if NetworkTransport.isConfiguredGatewayOrigin(url),
                let token = KeychainHelper.shared.read(key: .deviceToken) ?? AppSettings.shared.deviceToken,
                !token.isEmpty {
