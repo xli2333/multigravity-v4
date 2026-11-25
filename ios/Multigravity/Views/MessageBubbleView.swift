@@ -19,6 +19,7 @@ public struct MessageBubbleView: View {
     let onFork: ((ChatMessage) -> Void)?
     let onNarrate: ((String) -> Void)?
     let onAskBtw: ((String) -> Void)?
+    let onPreviewGallery: ((ImageGalleryData) -> Void)?
     let makeShareContext: (() -> ShareCardContext)?
     @State var showShareCard: Bool = false
     @State var isThinkingExpanded: Bool = false
@@ -42,6 +43,7 @@ public struct MessageBubbleView: View {
         onFork: ((ChatMessage) -> Void)? = nil,
         onNarrate: ((String) -> Void)? = nil,
         onAskBtw: ((String) -> Void)? = nil,
+        onPreviewGallery: ((ImageGalleryData) -> Void)? = nil,
         makeShareContext: (() -> ShareCardContext)? = nil
     ) {
         self.message = message
@@ -59,7 +61,16 @@ public struct MessageBubbleView: View {
         self.onFork = onFork
         self.onNarrate = onNarrate
         self.onAskBtw = onAskBtw
+        self.onPreviewGallery = onPreviewGallery
         self.makeShareContext = makeShareContext
+    }
+
+    func presentGallery(_ gallery: ImageGalleryData) {
+        if let onPreviewGallery {
+            onPreviewGallery(gallery)
+        } else {
+            previewGallery = gallery
+        }
     }
     
     public var body: some View {

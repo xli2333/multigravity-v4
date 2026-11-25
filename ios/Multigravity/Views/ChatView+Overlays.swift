@@ -268,6 +268,24 @@ extension ChatView {
         let audioExtensions = [".m4a", ".mp3", ".wav", ".aac", ".caf", ".flac", ".ogg", ".oga", ".opus", ".amr", ".wma"]
         let allPreviewExtensions = documentExtensions + imageExtensions + videoExtensions + audioExtensions
         
+        let isImageFile = imageExtensions.contains { ext in
+            lower.hasSuffix(ext) || pathLower.hasSuffix(ext) || uriLower.hasSuffix(ext) || lower.contains(ext + "?") || lower.contains(ext + "#")
+        } && !lower.hasSuffix(".svg")
+
+        if isImageFile, let gwURL = viewModel.settings.serverURL {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            isInputFocused = false
+            let resolvedString = APIClient.shared.resolveMediaURL(
+                uriParam ?? unescaped,
+                cascadeId: viewModel.cascadeId,
+                baseURL: gwURL
+            )
+            if let imgURL = URL(string: resolvedString) {
+                previewDraftGallery = ImageGalleryData(url: imgURL)
+                return .handled
+            }
+        }
+
         let isPreviewableFile = allPreviewExtensions.contains { ext in
             lower.hasSuffix(ext) || pathLower.hasSuffix(ext) || uriLower.hasSuffix(ext) || lower.contains(ext + "?") || lower.contains(ext + "#")
         }

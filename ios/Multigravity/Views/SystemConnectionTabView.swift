@@ -350,13 +350,13 @@ public struct SystemConnectionTabView: View {
                 )
                 routeChannelPill(
                     title: "E2EE 中继",
-                    urlString: settings.relayServerURL,
-                    isPrimaryActive: isActiveURL(settings.relayServerURL)
+                    urlString: effectiveRelayURL,
+                    isPrimaryActive: isActiveURL(effectiveRelayURL)
                 )
                 routeChannelPill(
                     title: "Cloudflare",
-                    urlString: settings.primaryCloudURL,
-                    isPrimaryActive: isActiveURL(settings.primaryCloudURL)
+                    urlString: dedicatedCloudflareURL,
+                    isPrimaryActive: isActiveURL(dedicatedCloudflareURL)
                 )
             }
 
@@ -423,12 +423,13 @@ public struct SystemConnectionTabView: View {
                 .font(.system(size: 11.5, weight: .bold))
                 .foregroundColor(AGPalette.textPrimary(colorScheme))
                 .lineLimit(1)
+                .minimumScaleFactor(0.8)
             Text(subtitle)
                 .font(.system(size: 9.5))
                 .foregroundColor(AGPalette.textTertiary(colorScheme))
                 .lineLimit(1)
         }
-        .frame(width: 76)
+        .frame(width: 88)
     }
 
     private func routeChannelPill(title: String, urlString: String?, isPrimaryActive: Bool) -> some View {
@@ -689,12 +690,31 @@ public struct SystemConnectionTabView: View {
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundColor(AGPalette.textPrimary(colorScheme))
                 Spacer()
-                Picker("字号缩放", selection: $settings.fontSizeScale) {
+                Menu {
                     ForEach(AppSettings.FontSizeScale.allCases) { scale in
-                        Text(scale.displayName).tag(scale)
+                        Button {
+                            settings.fontSizeScale = scale
+                        } label: {
+                            HStack {
+                                Text(scale.displayName)
+                                if settings.fontSizeScale == scale {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
                     }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(settings.fontSizeScale.displayName)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(AGPalette.accentText(colorScheme))
+                            .lineLimit(1)
+                        AGLinearIcon(.chevronDown, size: 10, color: AGPalette.accentText(colorScheme).opacity(0.8), lineWidth: 2.1)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(AGPalette.accentSoft(colorScheme)))
                 }
-                .pickerStyle(.menu)
             }
 
             Toggle(isOn: $settings.weeklyPaceCursorEnabled) {
@@ -716,26 +736,46 @@ public struct SystemConnectionTabView: View {
     @ViewBuilder
     private func favoriteModelRow(title: String, selection: Binding<String>) -> some View {
         let all = modelCatalog.allOptions
+        let currentLabel = modelCatalog.compactDisplayName(forID: selection.wrappedValue)
         HStack(spacing: 8) {
             ModelProviderBrandIcon(modelId: selection.wrappedValue, size: 14)
             Text(title)
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundColor(AGPalette.textPrimary(colorScheme))
-            Spacer()
-            Picker(title, selection: selection) {
-                if !all.contains(where: { $0.id == selection.wrappedValue }) {
-                    Text(modelCatalog.resolvedDisplayName(forID: selection.wrappedValue)).tag(selection.wrappedValue)
-                }
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 8)
+            Menu {
                 ForEach(all) { opt in
-                    Text(ModelDefaultsLogic.formatPickerLabel(name: opt.name, tag: opt.tag)).tag(opt.id)
+                    Button {
+                        selection.wrappedValue = opt.id
+                    } label: {
+                        HStack {
+                            Text(ModelDefaultsLogic.formatPickerLabel(name: opt.name, tag: opt.tag))
+                            if selection.wrappedValue == opt.id {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
                 }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(currentLabel)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(AGPalette.accentText(colorScheme))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                    AGLinearIcon(.chevronDown, size: 10, color: AGPalette.accentText(colorScheme).opacity(0.8), lineWidth: 2.1)
+                }
+                .padding(.horizontal, 9.5)
+                .padding(.vertical, 5.5)
+                .background(Capsule().fill(AGPalette.cardBackground(colorScheme)))
+                .overlay(Capsule().stroke(AGPalette.border(colorScheme), lineWidth: 1))
             }
-            .pickerStyle(.menu)
             .disabled(all.isEmpty)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(AGPalette.recessedWell(colorScheme)))
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(AGPalette.recessedWell(colorScheme)))
     }
 
     // MARK: - 4. Notifications, Voice & Compact Mode
@@ -907,6 +947,33 @@ public struct SystemConnectionTabView: View {
     }
 
     // MARK: - Helpers
+
+    private static func isRelayEndpointURL(_ raw: String?) -> Bool {
+        guard let raw, !raw.isEmpty, let host = URL(string: raw)?.host?.lowercased() else { return false }
+        return host.hasPrefix("r-") && host.contains(".jiuge.space")
+    }
+
+    private var effectiveRelayURL: String? {
+        if let relay = settings.relayServerURL, !relay.isEmpty {
+            return relay
+        }
+        if Self.isRelayEndpointURL(settings.primaryCloudURL) {
+            return settings.primaryCloudURL
+        }
+        return nil
+    }
+
+    private var dedicatedCloudflareURL: String? {
+        guard let cloud = settings.primaryCloudURL, !cloud.isEmpty else { return nil }
+        if Self.isRelayEndpointURL(cloud) {
+            return nil
+        }
+        if let relay = settings.relayServerURL,
+           cloud.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == relay.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
+            return nil
+        }
+        return cloud
+    }
 
     private var bestLatencyText: String {
         if let cur = settings.serverURL?.absoluteString,

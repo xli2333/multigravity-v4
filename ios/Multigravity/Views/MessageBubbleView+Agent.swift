@@ -12,13 +12,13 @@ extension MessageBubbleView {
                 ForEach(Array(fallbackAgentGalleryItems.enumerated()), id: \.element.id) { index, item in
                     Button(action: {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        previewGallery = ImageGalleryData(items: fallbackAgentGalleryItems, initialIndex: index)
+                        presentGallery(ImageGalleryData(items: fallbackAgentGalleryItems, initialIndex: index))
                     }) {
                         thumbnailView(for: item)
                     }
                     .buttonStyle(.plain)
                     .imageContextMenu(item: item) {
-                        previewGallery = ImageGalleryData(items: fallbackAgentGalleryItems, initialIndex: index)
+                        presentGallery(ImageGalleryData(items: fallbackAgentGalleryItems, initialIndex: index))
                     }
                 }
             }
@@ -64,7 +64,7 @@ extension MessageBubbleView {
 
             if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 MarkdownContentView(content: message.content, onImageTap: { url in
-                    previewGallery = ImageGalleryData(url: url)
+                    presentGallery(ImageGalleryData(url: url))
                 })
                 InlineGitHubPRPillsSection(content: message.content)
             }
@@ -187,7 +187,7 @@ extension MessageBubbleView {
             onTap: { _ in
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 let effectiveItems = gallery.isEmpty ? [IdentifiableImage(url: url)] : gallery
-                previewGallery = ImageGalleryData(items: effectiveItems, initialIndex: index)
+                presentGallery(ImageGalleryData(items: effectiveItems, initialIndex: index))
             },
             onFailure: { _ in
                 AnyView(

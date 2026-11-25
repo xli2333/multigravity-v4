@@ -8,6 +8,8 @@ public struct CockpitDashboardView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.displayScale) private var displayScale
     @AppStorage("cockpit_email_masked") private var isMasked: Bool = false
+    @AppStorage("cockpit_gemini_focus_weekly") private var geminiFocusWeeklyPref: Bool = false
+    @AppStorage("cockpit_claude_focus_weekly") private var claudeFocusWeeklyPref: Bool = false
 
     @Binding public var quotaResponse: CockpitQuotaResponse?
     public let tokenHistory: TokenHistoryResponse?
@@ -292,6 +294,9 @@ public struct CockpitDashboardView: View {
         let claudePrimaryKind: QuotaBucketKind = account.claude5h != nil ? .claude5h : .claudeWeekly
         let claudeSecondary = account.claude5h != nil ? account.claudeWeekly : nil
 
+        let geminiFocusWeekly = geminiFocusWeeklyPref && account.geminiWeekly != nil
+        let claudeFocusWeekly = claudeFocusWeeklyPref && account.claudeWeekly != nil
+
         return HStack(spacing: 10) {
             DualArcQuotaGaugeCard(
                 provider: .gemini,
@@ -301,18 +306,27 @@ public struct CockpitDashboardView: View {
                 weeklyBucket: geminiSecondary,
                 subscriptionTier: account.subscriptionTier,
                 isSelectedPrimary: settings.selectedQuotaBucket == geminiPrimaryKind || settings.selectedQuotaBucket == .geminiWeekly,
-                activeBadgeWindow: settings.selectedQuotaBucket == .geminiWeekly ? "7d" : (settings.selectedQuotaBucket == geminiPrimaryKind ? geminiPrimaryWindow.lowercased() : nil),
+                isFocusingWeekly: geminiFocusWeekly,
                 showPaceCursor: settings.weeklyPaceCursorEnabled,
                 onSelectPrimaryBucket: {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    if settings.selectedQuotaBucket == .gemini5h, account.geminiWeekly != nil {
-                        settings.selectedQuotaBucket = .geminiWeekly
-                    } else {
-                        settings.selectedQuotaBucket = geminiPrimaryKind
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                        let isAlreadyGemini = (settings.selectedQuotaBucket == geminiPrimaryKind || settings.selectedQuotaBucket == .geminiWeekly)
+                        if isAlreadyGemini && account.geminiWeekly != nil {
+                            geminiFocusWeeklyPref.toggle()
+                        }
+                        settings.selectedQuotaBucket = (geminiFocusWeeklyPref && account.geminiWeekly != nil) ? .geminiWeekly : geminiPrimaryKind
                     }
                 },
-                onInspectPace: { paceInfo in
-                    paceDetailItem = WeeklyPaceDetailItem(title: "Gemini · \(geminiPrimaryWindow)", info: paceInfo)
+                onSelectSpecificWindow: { wantWeekly in
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                        geminiFocusWeeklyPref = wantWeekly && account.geminiWeekly != nil
+                        settings.selectedQuotaBucket = geminiFocusWeeklyPref ? .geminiWeekly : geminiPrimaryKind
+                    }
+                },
+                onInspectPace: { windowLabel, paceInfo in
+                    paceDetailItem = WeeklyPaceDetailItem(title: "Gemini · \(windowLabel)", info: paceInfo)
                 }
             )
 
@@ -324,18 +338,27 @@ public struct CockpitDashboardView: View {
                 weeklyBucket: claudeSecondary,
                 subscriptionTier: account.subscriptionTier,
                 isSelectedPrimary: settings.selectedQuotaBucket == claudePrimaryKind || settings.selectedQuotaBucket == .claudeWeekly,
-                activeBadgeWindow: settings.selectedQuotaBucket == .claudeWeekly ? "7d" : (settings.selectedQuotaBucket == claudePrimaryKind ? claudePrimaryWindow.lowercased() : nil),
+                isFocusingWeekly: claudeFocusWeekly,
                 showPaceCursor: settings.weeklyPaceCursorEnabled,
                 onSelectPrimaryBucket: {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    if settings.selectedQuotaBucket == .claude5h, account.claudeWeekly != nil {
-                        settings.selectedQuotaBucket = .claudeWeekly
-                    } else {
-                        settings.selectedQuotaBucket = claudePrimaryKind
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                        let isAlreadyClaude = (settings.selectedQuotaBucket == claudePrimaryKind || settings.selectedQuotaBucket == .claudeWeekly)
+                        if isAlreadyClaude && account.claudeWeekly != nil {
+                            claudeFocusWeeklyPref.toggle()
+                        }
+                        settings.selectedQuotaBucket = (claudeFocusWeeklyPref && account.claudeWeekly != nil) ? .claudeWeekly : claudePrimaryKind
                     }
                 },
-                onInspectPace: { paceInfo in
-                    paceDetailItem = WeeklyPaceDetailItem(title: "Claude · \(claudePrimaryWindow)", info: paceInfo)
+                onSelectSpecificWindow: { wantWeekly in
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                        claudeFocusWeeklyPref = wantWeekly && account.claudeWeekly != nil
+                        settings.selectedQuotaBucket = claudeFocusWeeklyPref ? .claudeWeekly : claudePrimaryKind
+                    }
+                },
+                onInspectPace: { windowLabel, paceInfo in
+                    paceDetailItem = WeeklyPaceDetailItem(title: "Claude · \(windowLabel)", info: paceInfo)
                 }
             )
         }
@@ -369,16 +392,17 @@ public struct CockpitDashboardView: View {
             if let monitor = linkMonitor {
                 TimelineView(.periodic(from: .now, by: 2)) { context in
                     let state = monitor.linkState(at: context.date)
+                    let isEffectivelyOnline = (state == .connected) || (settings.isPaired && monitor.desktopState != "down" && quotaResponse != nil)
                     HStack(spacing: 5) {
                         AGLinearIcon(
                             .bolt,
                             size: 12.5,
-                            color: state == .connected ? AGPalette.emeraldText(colorScheme) : AGPalette.amberText(colorScheme),
+                            color: isEffectivelyOnline ? AGPalette.emeraldText(colorScheme) : AGPalette.amberText(colorScheme),
                             lineWidth: 2.0
                         )
-                        Text(state == .connected ? "网关实时在线" : state.title)
+                        Text(isEffectivelyOnline ? "网关实时在线" : state.title)
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(state == .connected ? AGPalette.emeraldText(colorScheme) : AGPalette.textSecondary(colorScheme))
+                            .foregroundColor(isEffectivelyOnline ? AGPalette.emeraldText(colorScheme) : AGPalette.textSecondary(colorScheme))
                             .lineLimit(1)
                     }
                 }
@@ -950,10 +974,11 @@ struct DualArcQuotaGaugeCard: View {
     let weeklyBucket: CockpitQuotaBucket?
     let subscriptionTier: String?
     let isSelectedPrimary: Bool
-    var activeBadgeWindow: String? = nil
+    var isFocusingWeekly: Bool = false
     let showPaceCursor: Bool
     let onSelectPrimaryBucket: () -> Void
-    let onInspectPace: (WeeklyPaceInfo) -> Void
+    var onSelectSpecificWindow: ((Bool) -> Void)? = nil
+    let onInspectPace: (String, WeeklyPaceInfo) -> Void
 
     private var primaryPercent: Double {
         min(100.0, max(0.0, primaryBucket?.remainingPercent ?? 0.0))
@@ -964,10 +989,23 @@ struct DualArcQuotaGaugeCard: View {
         return min(100.0, max(0.0, weeklyBucket.remainingPercent))
     }
 
+    private var displayedBucket: CockpitQuotaBucket? {
+        (isFocusingWeekly && weeklyBucket != nil) ? weeklyBucket : primaryBucket
+    }
+
+    private var displayedPercent: Double {
+        if isFocusingWeekly, let wp = weeklyPercent { return wp }
+        return primaryPercent
+    }
+
+    private var displayedWindowLabel: String {
+        (isFocusingWeekly && weeklyBucket != nil) ? "7D" : primaryWindowLabel
+    }
+
     private var paceInfo: WeeklyPaceInfo? {
-        guard let primaryBucket else { return nil }
-        let windowHours = primaryWindowLabel == "5H" ? 5.0 : 168.0
-        return primaryBucket.calculateWeeklyPace(totalWindowHours: windowHours)
+        guard let bucket = displayedBucket else { return nil }
+        let windowHours = displayedWindowLabel == "5H" ? 5.0 : 168.0
+        return bucket.calculateWeeklyPace(totalWindowHours: windowHours)
     }
 
     private var primaryArcColor: Color {
@@ -980,32 +1018,34 @@ struct DualArcQuotaGaugeCard: View {
         if primaryPercent < 30 {
             return AGPalette.amberFill(colorScheme)
         }
-        switch provider {
-        case .gemini:
-            return AGPalette.geminiBrandFill(colorScheme)
-        case .claude:
-            return AGPalette.claudeBrandFill
-        }
+        let base: Color = {
+            switch provider {
+            case .gemini: return AGPalette.geminiBrandFill(colorScheme)
+            case .claude: return AGPalette.claudeBrandFill
+            }
+        }()
+        return (isFocusingWeekly && weeklyBucket != nil) ? base.opacity(0.45) : base
     }
 
     private var innerArcColor: Color {
-        switch provider {
-        case .gemini:
-            return AGPalette.emeraldFill(colorScheme)
-        case .claude:
-            return AGPalette.claudeBrandFill.opacity(0.75)
-        }
+        let base: Color = {
+            switch provider {
+            case .gemini: return AGPalette.emeraldFill(colorScheme)
+            case .claude: return AGPalette.claudeBrandFill
+            }
+        }()
+        return isFocusingWeekly ? base : base.opacity(0.68)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Brand header
-            HStack(spacing: 6) {
+            // Brand header + interactive 5h / 7d segmented pill
+            HStack(spacing: 5) {
                 switch provider {
                 case .gemini:
-                    GeminiBrandIcon(size: 15)
+                    GeminiBrandIcon(size: 14.5)
                 case .claude:
-                    ClaudeBrandIcon(size: 15)
+                    ClaudeBrandIcon(size: 14.5)
                 }
 
                 Text(title)
@@ -1015,16 +1055,19 @@ struct DualArcQuotaGaugeCard: View {
 
                 Spacer(minLength: 2)
 
-                if let activeWin = activeBadgeWindow {
-                    Text("\(activeWin) 主显")
-                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                        .foregroundColor(AGPalette.accentText(colorScheme))
-                        .padding(.horizontal, 5.5)
-                        .padding(.vertical, 1.5)
-                        .background(AGPalette.accentSoft(colorScheme))
-                        .clipShape(Capsule())
+                if weeklyBucket != nil {
+                    HStack(spacing: 1) {
+                        windowSwitchChip(label: "5h", isActive: !isFocusingWeekly) {
+                            onSelectSpecificWindow?(false)
+                        }
+                        windowSwitchChip(label: "7d", isActive: isFocusingWeekly) {
+                            onSelectSpecificWindow?(true)
+                        }
+                    }
+                    .padding(1.5)
+                    .background(Capsule().fill(AGPalette.recessedWell(colorScheme)))
                 } else {
-                    Text(weeklyBucket != nil ? "5h / 7d" : primaryWindowLabel.lowercased())
+                    Text(primaryWindowLabel.lowercased())
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .foregroundColor(AGPalette.textTertiary(colorScheme))
                 }
@@ -1038,8 +1081,8 @@ struct DualArcQuotaGaugeCard: View {
                 isOverPacing: paceInfo?.isOverPacing ?? false,
                 outerColor: primaryArcColor,
                 innerColor: innerArcColor,
-                centerValueText: primaryBucket != nil ? "\(Int(primaryPercent.rounded()))%" : "—",
-                centerSubText: "\(primaryWindowLabel) 剩余"
+                centerValueText: displayedBucket != nil ? "\(Int(displayedPercent.rounded()))%" : "—",
+                centerSubText: "\(displayedWindowLabel) 剩余"
             )
             .frame(maxWidth: .infinity)
             .frame(height: 112)
@@ -1052,9 +1095,15 @@ struct DualArcQuotaGaugeCard: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
                     if let wp = weeklyPercent {
-                        Text("7d 周池 \(Int(wp.rounded()))%")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundColor(AGPalette.textSecondary(colorScheme))
+                        if isFocusingWeekly {
+                            Text("5h 短池 \(Int(primaryPercent.rounded()))%")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundColor(AGPalette.textSecondary(colorScheme))
+                        } else {
+                            Text("7d 周池 \(Int(wp.rounded()))%")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundColor(AGPalette.textSecondary(colorScheme))
+                        }
                     } else {
                         Text(subscriptionTier?.uppercased() == "FREE" ? "周度免费池" : "单层配额池")
                             .font(.system(size: 10.5, weight: .medium))
@@ -1070,7 +1119,7 @@ struct DualArcQuotaGaugeCard: View {
                 if let info = paceInfo {
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        onInspectPace(info)
+                        onInspectPace(displayedWindowLabel, info)
                     } label: {
                         let deltaStr = (info.paceDeltaPercent >= 0 ? "+" : "") + String(format: "%.0f%%", info.paceDeltaPercent)
                         AGBadge(
@@ -1082,7 +1131,7 @@ struct DualArcQuotaGaugeCard: View {
                     }
                     .buttonStyle(.plain)
                 } else {
-                    AGBadge(primaryBucket != nil ? "配额监控中" : "暂无该池数据", tone: .neutral)
+                    AGBadge(displayedBucket != nil ? "配额监控中" : "暂无该池数据", tone: .neutral)
                 }
             }
         }
@@ -1103,8 +1152,24 @@ struct DualArcQuotaGaugeCard: View {
         )
     }
 
+    @ViewBuilder
+    private func windowSwitchChip(label: String, isActive: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 9.5, weight: isActive ? .bold : .semibold, design: .monospaced))
+                .foregroundColor(isActive ? AGPalette.accentText(colorScheme) : AGPalette.textTertiary(colorScheme))
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(isActive ? AGPalette.cardBackground(colorScheme) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
     private var shortResetLabel: String {
-        guard let friendly = primaryBucket?.resetFriendly, !friendly.isEmpty else {
+        guard let friendly = displayedBucket?.resetFriendly, !friendly.isEmpty else {
             return String(localized: "充足")
         }
         return friendly

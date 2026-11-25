@@ -94,13 +94,13 @@ extension MessageBubbleView {
                 ForEach(Array(userAttachmentItems.enumerated()), id: \.element.id) { index, item in
                     Button(action: {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        previewGallery = ImageGalleryData(items: userAttachmentItems, initialIndex: index)
+                        presentGallery(ImageGalleryData(items: userAttachmentItems, initialIndex: index))
                     }) {
                         thumbnailView(for: item)
                     }
                     .buttonStyle(.plain)
                     .imageContextMenu(item: item) {
-                        previewGallery = ImageGalleryData(items: userAttachmentItems, initialIndex: index)
+                        presentGallery(ImageGalleryData(items: userAttachmentItems, initialIndex: index))
                     }
                 }
             }
@@ -113,13 +113,13 @@ extension MessageBubbleView {
                     ForEach(Array(userAttachmentItems.enumerated()), id: \.element.id) { index, item in
                         Button(action: {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            previewGallery = ImageGalleryData(items: userAttachmentItems, initialIndex: index)
+                            presentGallery(ImageGalleryData(items: userAttachmentItems, initialIndex: index))
                         }) {
                             thumbnailView(for: item)
                         }
                         .buttonStyle(.plain)
                         .imageContextMenu(item: item) {
-                            previewGallery = ImageGalleryData(items: userAttachmentItems, initialIndex: index)
+                            presentGallery(ImageGalleryData(items: userAttachmentItems, initialIndex: index))
                         }
                     }
                 }
@@ -179,7 +179,7 @@ extension MessageBubbleView {
         return Button(action: {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             let effectiveItems = gallery.isEmpty ? [IdentifiableImage(image: uiImg)] : gallery
-            previewGallery = ImageGalleryData(items: effectiveItems, initialIndex: index)
+            presentGallery(ImageGalleryData(items: effectiveItems, initialIndex: index))
         }) {
             Image(uiImage: uiImg)
                 .resizable()
@@ -196,7 +196,7 @@ extension MessageBubbleView {
         .buttonStyle(.plain)
         .imageContextMenu(item: IdentifiableImage(image: uiImg)) {
             let effectiveItems = gallery.isEmpty ? [IdentifiableImage(image: uiImg)] : gallery
-            previewGallery = ImageGalleryData(items: effectiveItems, initialIndex: index)
+            presentGallery(ImageGalleryData(items: effectiveItems, initialIndex: index))
         }
     }
     
@@ -207,7 +207,7 @@ extension MessageBubbleView {
             gallery: gallery,
             index: index
         ) { effectiveItems, effectiveIndex in
-            previewGallery = ImageGalleryData(items: effectiveItems, initialIndex: effectiveIndex)
+            presentGallery(ImageGalleryData(items: effectiveItems, initialIndex: effectiveIndex))
         }
     }
 }

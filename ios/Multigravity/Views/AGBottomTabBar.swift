@@ -78,6 +78,7 @@ public struct AGBottomTabBar: View {
             AGPalette.tabBarBackground(colorScheme)
                 .ignoresSafeArea(edges: .bottom)
         )
+        .compositingGroup()
     }
 
     @ViewBuilder
@@ -175,12 +176,13 @@ public struct AGBottomTabBar: View {
             if let monitor = linkMonitor {
                 TimelineView(.periodic(from: .now, by: 2)) { context in
                     let state = monitor.linkState(at: context.date)
+                    let reachableViaHTTP = monitor.desktopState != "down" && ConnectionManager.shared.endpointStatuses.values.contains(where: \.isReachable)
                     let dotFill: Color = {
                         switch state {
                         case .connected: return AGPalette.emeraldFill(colorScheme)
                         case .attention: return AGPalette.amberFill(colorScheme)
-                        case .disconnected: return AGPalette.roseFill(colorScheme)
-                        case .unknown: return AGPalette.textTertiary(colorScheme)
+                        case .disconnected: return reachableViaHTTP ? AGPalette.emeraldFill(colorScheme) : AGPalette.roseFill(colorScheme)
+                        case .unknown: return reachableViaHTTP ? AGPalette.emeraldFill(colorScheme) : AGPalette.textTertiary(colorScheme)
                         }
                     }()
                     Circle()

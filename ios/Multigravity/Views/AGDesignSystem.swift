@@ -50,7 +50,7 @@ public struct AGPalette: Sendable {
     }
 
     public var navBarBg: Color {
-        isDark ? Self.hex(0x16161A, alpha: 0.95) : Self.hex(0xFFFFFF, alpha: 0.96)
+        isDark ? Self.hex(0x16161A) : Self.hex(0xFFFFFF)
     }
 
     public var card: Color {

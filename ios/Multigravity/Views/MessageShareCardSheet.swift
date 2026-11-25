@@ -146,12 +146,19 @@ struct ShareCardQuestion {
 }
 
 extension ChatMessage {
-    /// 用户消息里的图片附件（优先 imageUrls，缩略图来自 imageDataList）。
+    /// 用户消息里的图片附件（优先 imageUrls，缩略图来自 imageDataList；非 HTTP 服务端路径自动通过网关解析）。
     var attachmentImages: [IdentifiableImage] {
         let validImageUrls = imageUrls.filter { FileIconResolver.isImage(for: $0) }
         if !validImageUrls.isEmpty {
+            let gwBase = AppSettings.shared.serverURL
             return validImageUrls.enumerated().compactMap { idx, urlString in
-                guard let url = URL(string: urlString) else { return nil }
+                let resolvedStr: String
+                if let gwBase, !urlString.lowercased().hasPrefix("http://"), !urlString.lowercased().hasPrefix("https://") {
+                    resolvedStr = APIClient.shared.resolveMediaURL(urlString, baseURL: gwBase)
+                } else {
+                    resolvedStr = urlString
+                }
+                guard let url = URL(string: resolvedStr) else { return nil }
                 let thumb = idx < imageDataList.count ? UIImage(data: imageDataList[idx]) : nil
                 return IdentifiableImage(image: thumb, url: url)
             }

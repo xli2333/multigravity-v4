@@ -552,6 +552,11 @@ public struct ChatView: View {
                     .presentationDragIndicator(.visible)
                 }
             }
+            .fullScreenCover(item: $previewDraftGallery) { gallery in
+                ImageViewerSheet(gallery: gallery)
+                    .presentationBackground(.clear)
+                    .ignoresSafeArea()
+            }
             .fullScreenCover(item: $viewModel.weChatArchiveItem) { item in
                 WeChatChatArchiveSheet(
                     item: item,

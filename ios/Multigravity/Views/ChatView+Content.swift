@@ -657,6 +657,10 @@ extension ChatView {
                 btwInitialQuote = quote
                 showBtwSheet = true
             },
+            onPreviewGallery: { gallery in
+                isInputFocused = false
+                previewDraftGallery = gallery
+            },
             makeShareContext: { shareContext(for: message) }
         )
         .equatable()
@@ -1095,6 +1099,7 @@ private struct EquatableMessageRow: View, Equatable {
     let onFork: (ChatMessage) -> Void
     let onNarrate: (String) -> Void
     let onAskBtw: (String) -> Void
+    let onPreviewGallery: (ImageGalleryData) -> Void
     let makeShareContext: () -> ShareCardContext
 
     static func == (lhs: EquatableMessageRow, rhs: EquatableMessageRow) -> Bool {
@@ -1126,6 +1131,7 @@ private struct EquatableMessageRow: View, Equatable {
                 onFork: onFork,
                 onNarrate: onNarrate,
                 onAskBtw: onAskBtw,
+                onPreviewGallery: onPreviewGallery,
                 makeShareContext: makeShareContext
             )
         }

@@ -1,9 +1,37 @@
 import Foundation
 
 extension APIClient {
+    /// Normalizes a local/remote file URI before sending it to `/api/v1/files/raw` or `/api/v1/files/content`.
+    /// Strips `file://` and fixes Windows drive paths like `"/c:/Users/..."` -> `"c:/Users/..."` so Windows gateways do not reject them with HTTP 403.
+    public static func normalizeGatewayFileURI(_ raw: String) -> String {
+        var clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.hasPrefix("MEDIA:") {
+            clean = String(clean.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+        }
+        clean = clean.trimmingCharacters(in: CharacterSet(charactersIn: "`\"'()[]<>"))
+        if let decoded = clean.removingPercentEncoding {
+            clean = decoded
+        }
+        if clean.lowercased().hasPrefix("file://") {
+            clean = String(clean.dropFirst(7))
+            if let decoded = clean.removingPercentEncoding {
+                clean = decoded
+            }
+        }
+        // Strip leading slash before Windows drive letter: "/c:/..." or "\C:\..." -> "c:/..."
+        let chars = Array(clean.utf8)
+        if chars.count >= 3,
+           (chars[0] == UInt8(ascii: "/") || chars[0] == UInt8(ascii: "\\")),
+           ((chars[1] >= UInt8(ascii: "a") && chars[1] <= UInt8(ascii: "z")) || (chars[1] >= UInt8(ascii: "A") && chars[1] <= UInt8(ascii: "Z"))),
+           chars[2] == UInt8(ascii: ":") {
+            clean = String(clean.dropFirst())
+        }
+        return clean
+    }
+
     /// Resolves a raw media/image URI into a loadable HTTP URL for the mobile client.
     /// Authentication is injected via HTTP `Authorization: Bearer` header in `NetworkTransport` (never in query URLs).
-    public func resolveMediaURL(_ raw: String, baseURL: URL) -> String {
+    public func resolveMediaURL(_ raw: String, cascadeId: String? = nil, baseURL: URL) -> String {
         var clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.hasPrefix("MEDIA:") {
             clean = String(clean.dropFirst(6)).trimmingCharacters(in: .whitespaces)
@@ -30,13 +58,14 @@ extension APIClient {
             return "\(base)\(clean)"
         }
         
-        if clean.hasPrefix("file://") {
-            clean = String(clean.dropFirst(7))
-        }
-        
+        let normalizedURI = Self.normalizeGatewayFileURI(clean)
         var comps = URLComponents(url: baseURL.appendingPathComponent("api/v1/files/raw"), resolvingAgainstBaseURL: false)
-        comps?.queryItems = [URLQueryItem(name: "uri", value: clean)]
-        return comps?.url?.absoluteString ?? clean
+        var qItems = [URLQueryItem(name: "uri", value: normalizedURI)]
+        if let cascadeId, !cascadeId.isEmpty {
+            qItems.append(URLQueryItem(name: "cascade_id", value: cascadeId))
+        }
+        comps?.queryItems = qItems
+        return comps?.url?.absoluteString ?? normalizedURI
     }
 
     /// Extracts potential image URLs or media paths from text if not already populated.
@@ -72,8 +101,9 @@ extension APIClient {
 
     // Fetch file or artifact content from Gateway
     public func fetchFileContent(uri: String, cascadeId: String? = nil, baseURL: URL) async throws -> FileContentResponse {
+        let normalizedURI = uri.lowercased().hasPrefix("ui://") ? uri : Self.normalizeGatewayFileURI(uri)
         var components = URLComponents(url: baseURL.appendingPathComponent("api/v1/files/content"), resolvingAgainstBaseURL: false)
-        var queryItems: [URLQueryItem] = [URLQueryItem(name: "uri", value: uri)]
+        var queryItems: [URLQueryItem] = [URLQueryItem(name: "uri", value: normalizedURI)]
         if let cascadeId = cascadeId, !cascadeId.isEmpty {
             queryItems.append(URLQueryItem(name: "cascade_id", value: cascadeId))
         }
@@ -148,15 +178,7 @@ extension APIClient {
         if isDirectHttp, let directURL = URL(string: uri) {
             endpoint = directURL
         } else {
-            var cleanPath = uri.trimmingCharacters(in: .whitespacesAndNewlines)
-            if cleanPath.hasPrefix("MEDIA:") {
-                cleanPath = String(cleanPath.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-            }
-            if cleanPath.hasPrefix("file://") {
-                cleanPath = String(cleanPath.dropFirst(7))
-            }
-            cleanPath = cleanPath.trimmingCharacters(in: CharacterSet(charactersIn: "`\"'()[]<>"))
-            
+            let cleanPath = Self.normalizeGatewayFileURI(uri)
             var components = URLComponents(url: baseURL.appendingPathComponent("api/v1/files/raw"), resolvingAgainstBaseURL: false)
             var queryItems: [URLQueryItem] = [URLQueryItem(name: "uri", value: cleanPath)]
             if let cascadeId = cascadeId, !cascadeId.isEmpty {
