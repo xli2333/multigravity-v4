@@ -379,6 +379,12 @@ public struct CockpitDashboardView: View {
                     Text(String(format: "%.0f%%", argon.remainingPercent))
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundColor(AGPalette.amberText(colorScheme))
+                    if let argonReset = argon.recoveryCountdownText() {
+                        Text("· \(argonReset)")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(AGPalette.textTertiary(colorScheme))
+                            .lineLimit(1)
+                    }
                 } else {
                     Text("外环 5h 实时 · 内环 7d 周池")
                         .font(.system(size: 11, weight: .medium))
@@ -1093,7 +1099,7 @@ struct DualArcQuotaGaugeCard: View {
 
             // Bottom telemetry footer
             VStack(alignment: .leading, spacing: 5) {
-                HStack {
+                HStack(spacing: 4) {
                     if let wp = weeklyPercent {
                         if isFocusingWeekly {
                             Text("5h 短池 \(Int(primaryPercent.rounded()))%")
@@ -1110,10 +1116,19 @@ struct DualArcQuotaGaugeCard: View {
                             .foregroundColor(AGPalette.textSecondary(colorScheme))
                     }
                     Spacer(minLength: 2)
-                    Text(shortResetLabel)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(AGPalette.textTertiary(colorScheme))
-                        .lineLimit(1)
+                }
+
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(AGPalette.textTertiary(colorScheme))
+                        Text(recoveryLabel(at: context.date))
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(AGPalette.textSecondary(colorScheme))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                    }
                 }
 
                 if let info = paceInfo {
@@ -1168,11 +1183,14 @@ struct DualArcQuotaGaugeCard: View {
         .buttonStyle(.plain)
     }
 
-    private var shortResetLabel: String {
-        guard let friendly = displayedBucket?.resetFriendly, !friendly.isEmpty else {
-            return String(localized: "充足")
+    private func recoveryLabel(at now: Date) -> String {
+        if let text = displayedBucket?.recoveryCountdownText(now: now) {
+            return text
         }
-        return friendly
+        if let bucket = displayedBucket, bucket.remainingPercent >= 99.5 {
+            return String(localized: "已满额")
+        }
+        return String(localized: "配额充足")
     }
 }
 

@@ -116,6 +116,66 @@ public struct CockpitQuotaBucket: Codable, Sendable {
         case resetFriendly = "reset_friendly"
     }
 
+    /// Parses `resetTime` ISO-8601 string into a `Date`.
+    public var parsedResetDate: Date? {
+        guard let rt = resetTime?.trimmingCharacters(in: .whitespacesAndNewlines), !rt.isEmpty else { return nil }
+        let isoFull = ISO8601DateFormatter()
+        isoFull.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = isoFull.date(from: rt) { return d }
+        let isoStd = ISO8601DateFormatter()
+        isoStd.formatOptions = [.withInternetDateTime]
+        if let d = isoStd.date(from: rt) { return d }
+        let cleanRt = rt.components(separatedBy: ".").first ?? rt
+        let isoBare = ISO8601DateFormatter()
+        isoBare.formatOptions = [.withFullDate, .withTime, .withColonSeparatorInTime]
+        if let d = isoBare.date(from: cleanRt) ?? isoBare.date(from: cleanRt + "Z") { return d }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = TimeZone(secondsFromGMT: 0)
+        df.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return df.date(from: cleanRt)
+    }
+
+    /// Formats the remaining time until quota recovery in natural Chinese:
+    /// - >= 24h: e.g. "3天5小时后恢复" / "3天后恢复"
+    /// - >= 1h:  e.g. "4小时57分后恢复" / "4小时后恢复"
+    /// - < 1h:   e.g. "42分钟后恢复" / "即将恢复"
+    public func recoveryCountdownText(now: Date = Date()) -> String? {
+        if let target = parsedResetDate {
+            let remaining = target.timeIntervalSince(now)
+            if remaining <= 60 {
+                return "即将恢复"
+            }
+            let totalMinutes = Int(remaining / 60)
+            let days = totalMinutes / (24 * 60)
+            let hours = (totalMinutes % (24 * 60)) / 60
+            let mins = totalMinutes % 60
+            if days > 0 {
+                return hours > 0 ? "\(days)天\(hours)小时后恢复" : "\(days)天后恢复"
+            }
+            if hours > 0 {
+                return mins > 0 ? "\(hours)小时\(mins)分后恢复" : "\(hours)小时后恢复"
+            }
+            return "\(max(1, mins))分钟后恢复"
+        }
+
+        if let raw = resetFriendly?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            let lower = raw.lowercased()
+            if lower.contains("恢复") || lower.contains("满") {
+                return raw
+            }
+            var translated = raw
+            translated = translated.replacingOccurrences(of: "d ", with: "天")
+            translated = translated.replacingOccurrences(of: "d", with: "天")
+            translated = translated.replacingOccurrences(of: "h ", with: "小时")
+            translated = translated.replacingOccurrences(of: "h", with: "小时")
+            translated = translated.replacingOccurrences(of: "m", with: "分")
+            translated = translated.replacingOccurrences(of: " ", with: "")
+            return "\(translated)后恢复"
+        }
+        return nil
+    }
+
     public func calculateWeeklyPace(totalWindowHours: Double = 168.0) -> WeeklyPaceInfo? {
         guard let rt = resetTime?.trimmingCharacters(in: .whitespacesAndNewlines), !rt.isEmpty else { return nil }
         let cleanRt = rt.components(separatedBy: ".").first ?? rt
