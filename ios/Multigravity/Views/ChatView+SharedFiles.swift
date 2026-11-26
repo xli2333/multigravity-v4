@@ -5,8 +5,14 @@ extension ChatView {
     /// Drops delivered files into the input bar as attachments. Never sends anything by itself.
     @MainActor
     func consumeSharedFiles() {
-        let key = initialConversation?.id ?? viewModel.draftKey
-        let shared = ShareInbox.shared.takeDelivery(for: key)
+        var candidateKeys: [String] = []
+        for k in [viewModel.cascadeId, viewModel.draftKey, initialConversation?.id ?? ""] where !k.isEmpty && !candidateKeys.contains(k) {
+            candidateKeys.append(k)
+        }
+        var shared: [SharedFile] = []
+        for k in candidateKeys {
+            shared.append(contentsOf: ShareInbox.shared.takeDelivery(for: k))
+        }
         guard !shared.isEmpty else { return }
         
         let docs = shared.filter { !$0.isImage }

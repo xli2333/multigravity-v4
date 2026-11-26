@@ -1522,9 +1522,15 @@ public struct ConversationListView: View {
             pairingErrorMessage = String(localized: "请先完成配对，再分享文件到 Multigravity")
             return
         }
-        dismissAllModals()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            shareInbox.receive([url])
+        // Copy synchronously during `.onOpenURL` while any open-in security grant is still active.
+        let hadModal = dismissAllModals()
+        shareInbox.receive([url], presentSheetImmediately: !hadModal)
+        if hadModal && !shareInbox.files.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                if !shareInbox.files.isEmpty {
+                    shareInbox.showSheet = true
+                }
+            }
         }
     }
     

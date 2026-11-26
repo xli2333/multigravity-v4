@@ -1,5 +1,6 @@
 import UIKit
 import Photos
+import UniformTypeIdentifiers
 import ZLPhotoBrowser
 
 @MainActor
@@ -82,5 +83,81 @@ public final class ZLPhotoPickerBridge {
             top = presented
         }
         return top
+    }
+}
+
+/// Imperative UIKit bridge for `UIDocumentPickerViewController(forOpeningContentTypes:asCopy: true)`.
+///
+/// Why `asCopy: true` instead of SwiftUI `.fileImporter`:
+/// - SwiftUI `.fileImporter` hardcodes `asCopy: false` (security-scoped open-in-place), which fails silently
+///   under re-signed / sideloaded provisioning profiles (`全能签` / Feather / TrollStore) when FileProvider or
+///   iCloud container entitlements are stripped.
+/// - With `asCopy: true`, iOS's privileged system `DocumentManager` XPC service copies the picked files directly
+///   into our app's own `tmp/` directory before invoking the delegate, guaranteeing 100% readable local files.
+@MainActor
+public final class DocumentPickerBridge: NSObject, UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate {
+    public static let shared = DocumentPickerBridge()
+
+    private var activePicker: UIDocumentPickerViewController?
+    private var onFilesPickedHandler: (([URL]) -> Void)?
+
+    private override init() {
+        super.init()
+    }
+
+    public func present(onFilesPicked: @escaping ([URL]) -> Void) {
+        presentWhenReady(attempt: 0, onFilesPicked: onFilesPicked)
+    }
+
+    private func presentWhenReady(attempt: Int, onFilesPicked: @escaping ([URL]) -> Void) {
+        guard let window = activeKeyWindow(), let root = window.rootViewController else {
+            return
+        }
+
+        var top: UIViewController = root
+        while let presented = top.presentedViewController {
+            if presented.isBeingDismissed {
+                if attempt < 12 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+                        self?.presentWhenReady(attempt: attempt + 1, onFilesPicked: onFilesPicked)
+                    }
+                }
+                return
+            }
+            top = presented
+        }
+
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item, .data, .content], asCopy: true)
+        picker.allowsMultipleSelection = true
+        picker.delegate = self
+        picker.presentationController?.delegate = self
+
+        self.activePicker = picker
+        self.onFilesPickedHandler = onFilesPicked
+        top.present(picker, animated: true)
+    }
+
+    public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        let callback = onFilesPickedHandler
+        activePicker = nil
+        onFilesPickedHandler = nil
+        guard !urls.isEmpty else { return }
+        callback?(urls)
+    }
+
+    public func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        activePicker = nil
+        onFilesPickedHandler = nil
+    }
+
+    public func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        activePicker = nil
+        onFilesPickedHandler = nil
+    }
+
+    private func activeKeyWindow() -> UIWindow? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        return activeScene?.windows.first(where: { $0.isKeyWindow }) ?? activeScene?.windows.first
     }
 }

@@ -375,7 +375,6 @@ struct AttachmentPickerSheet: View {
     @State private var selected: [String] = []                // PHAsset.localIdentifier, in selection order
     @State private var selectedAssetMap: [String: PHAsset] = [:] // Preserves PHAsset references across album switches
     @State private var showAlbumDrawer = false
-    @State private var showFileImporter = false
     @State private var previewLaunchState: AlbumPreviewLaunchState? = nil
     private let imageManager = PHCachingImageManager()
 
@@ -397,16 +396,6 @@ struct AttachmentPickerSheet: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .onAppear { photos.start() }
-        .fileImporter(
-            isPresented: $showFileImporter,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: true
-        ) { result in
-            if case .success(let urls) = result, !urls.isEmpty {
-                onFilesPicked(urls)
-                dismiss()
-            }
-        }
         .fullScreenCover(item: $previewLaunchState) { state in
             AlbumAssetPreviewSheet(
                 assets: state.assets,
@@ -741,10 +730,13 @@ struct AttachmentPickerSheet: View {
         quickActionTile(icon: .paperclip, title: String(localized: "文件")) {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             if let onOpenFilePicker {
-                dismiss()
                 onOpenFilePicker()
+                dismiss()
             } else {
-                showFileImporter = true
+                DocumentPickerBridge.shared.present { urls in
+                    dismiss()
+                    onFilesPicked(urls)
+                }
             }
         }
     }

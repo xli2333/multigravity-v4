@@ -16,7 +16,7 @@ extension APIClient {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         let encodedName = displayName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? displayName
         request.setValue(encodedName, forHTTPHeaderField: "X-File-Name")
-        request.timeoutInterval = 120
+        request.timeoutInterval = 60
         if let token = KeychainHelper.shared.read(key: .deviceToken), !token.isEmpty {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -24,6 +24,14 @@ extension APIClient {
         let isDemoEndpoint = DemoGateway.isEnabled
             && endpoint.host == DemoGateway.host
             && endpoint.port == DemoGateway.port
+
+        let fileSize = ((try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        let canFallbackToE2EE = !isDemoEndpoint
+            && E2EECrypto.shared.isReady
+            && endpoint.scheme?.lowercased() == "https"
+            && !NetworkTransport.isLocalOrPrivateHost(endpoint.host ?? "")
+            && fileSize > 0
+            && fileSize <= 32 * 1024 * 1024
 
         let data: Data
         let response: URLResponse
@@ -51,42 +59,34 @@ extension APIClient {
             } catch {
                 throw APIError.networkError(error.localizedDescription)
             }
-        } else if !isDemoEndpoint,
-                  endpoint.scheme?.lowercased() == "https",
-                  CloudflareAnycastAccelerator.isCloudflareTunnelHost(endpoint.host ?? "") {
-            // Try accelerated Anycast edge first; fall back to native URLSession file upload on transport or edge error.
-            var acceleratedResult: (Data, URLResponse)? = nil
+        } else {
+            // Use system URLSession file upload directly (respects iOS VPN/proxy & HTTP/2 flow control),
+            // and automatically fall back to encrypted `/api/v1/e2ee/rpc` if Cloudflare WAF or tunnel drops raw binary streams.
             do {
-                let candidate = try await transport.uploadCloudflareAcceleratedHTTPS(
+                let primary = try await Self.uploadViaURLSession(
                     request: request,
                     fileURL: fileURL,
                     onProgress: onProgress
                 )
-                if let http = candidate.1 as? HTTPURLResponse,
-                   (200...299).contains(http.statusCode) || [401, 413, 415, 426].contains(http.statusCode) {
-                    acceleratedResult = candidate
+                if canFallbackToE2EE,
+                   let http = primary.1 as? HTTPURLResponse,
+                   !(200...299).contains(http.statusCode),
+                   ![401, 413, 415].contains(http.statusCode),
+                   let e2eeResult = try? await uploadOverExplicitE2EE(request: request, fileURL: fileURL, onProgress: onProgress) {
+                    (data, response) = e2eeResult
+                } else {
+                    (data, response) = primary
                 }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                acceleratedResult = nil
+                if canFallbackToE2EE,
+                   let e2eeResult = try? await uploadOverExplicitE2EE(request: request, fileURL: fileURL, onProgress: onProgress) {
+                    (data, response) = e2eeResult
+                } else {
+                    throw error
+                }
             }
-
-            if let acceleratedResult {
-                (data, response) = acceleratedResult
-            } else {
-                (data, response) = try await Self.uploadViaURLSession(
-                    request: request,
-                    fileURL: fileURL,
-                    onProgress: onProgress
-                )
-            }
-        } else {
-            (data, response) = try await Self.uploadViaURLSession(
-                request: request,
-                fileURL: fileURL,
-                onProgress: onProgress
-            )
         }
 
         var finalData = data
@@ -130,6 +130,34 @@ extension APIClient {
         }
     }
 
+    /// Wraps an attachment upload inside `/api/v1/e2ee/rpc` (same channel used by chat JSON RPCs)
+    /// when raw `application/octet-stream` uploads are blocked by Cloudflare WAF or proxy resets.
+    private func uploadOverExplicitE2EE(
+        request: URLRequest,
+        fileURL: URL,
+        onProgress: (@Sendable (Double) -> Void)?
+    ) async throws -> (Data, URLResponse) {
+        guard let originalURL = request.url else {
+            throw URLError(.badURL)
+        }
+        var innerReq = request
+        innerReq.httpBody = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        onProgress?(0.25)
+        let (outerReq, deviceID, key) = try E2EECrypto.shared.wrapHTTPRequest(innerReq)
+        let (outerData, outerResp) = try await transport.send(request: outerReq)
+        guard let outerHTTP = outerResp as? HTTPURLResponse, outerHTTP.statusCode == 200 else {
+            return (outerData, outerResp)
+        }
+        let (innerData, innerResp) = try E2EECrypto.shared.unwrapHTTPResponse(
+            encData: outerData,
+            originalURL: originalURL,
+            deviceID: deviceID,
+            key: key
+        )
+        onProgress?(0.95)
+        return (innerData, innerResp)
+    }
+
     /// Streams a file directly from disk via `URLSession.upload(for:fromFile:delegate:)`,
     /// preserving automatic stream rewinding across HTTP/2, Cloudflare edges, and system VPN/proxies.
     private static func uploadViaURLSession(
@@ -138,8 +166,8 @@ extension APIClient {
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> (Data, URLResponse) {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 600
+        config.timeoutIntervalForRequest = 45
+        config.timeoutIntervalForResource = 300
         config.httpShouldSetCookies = false
         config.protocolClasses = [DemoURLProtocol.self] + (config.protocolClasses ?? [])
         let reporter = UploadProgressReporter(onProgress: onProgress)

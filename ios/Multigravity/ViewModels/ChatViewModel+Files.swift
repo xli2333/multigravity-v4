@@ -23,16 +23,25 @@ extension ChatViewModel {
         var accepted: [DraftFile] = []
         var rejected: [String] = []
         
+        let tempRoot = NSTemporaryDirectory()
         for url in urls {
             let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                // Clean up `UIDocumentPickerViewController(..., asCopy: true)` staged copy in tmp/
+                if url.path.hasPrefix(tempRoot) {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
             
             var name = url.lastPathComponent
             if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 name = "attachment"
             }
             let existing = selectedFiles + accepted
-            let declared = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init) ?? -1
+            let declared = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value
+                ?? (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init)
+                ?? -1
             if let reason = AttachmentRules.validate(name: name, size: declared > 0 ? declared : 1, existing: existing) {
                 rejected.append(reason)
                 continue
@@ -41,31 +50,38 @@ extension ChatViewModel {
             let fileUUID = UUID().uuidString
             var localName = "\(fileUUID)-\(Self.safeLocalName(name))"
             var target = dir.appendingPathComponent(localName)
-            var coordinationError: NSError?
             var didCopy = false
-            // `.forUploading` downloads iCloud Drive placeholders AND automatically zips directory bundles (.pages/.numbers/.rtfd).
-            NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { readURL in
-                let readExt = readURL.pathExtension.lowercased()
-                let origExt = (name as NSString).pathExtension.lowercased()
-                if readExt == "zip" && origExt != "zip" {
-                    name = "\(name).zip"
-                    localName = "\(fileUUID)-\(Self.safeLocalName(name))"
-                    target = dir.appendingPathComponent(localName)
-                }
+
+            // 1. Fast direct copy (works immediately for `asCopy: true` and `Documents/Inbox` files with zero XPC/entitlement dependency)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
                 try? FileManager.default.removeItem(at: target)
-                didCopy = (try? FileManager.default.copyItem(at: readURL, to: target)) != nil
-            }
-            if !didCopy {
-                // Fallback for third-party FileProviders that reject coordinated reads.
-                var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
-                    try? FileManager.default.removeItem(at: target)
-                    didCopy = (try? FileManager.default.copyItem(at: url, to: target)) != nil
-                }
+                didCopy = (try? FileManager.default.copyItem(at: url, to: target)) != nil
                 if !didCopy, let rawData = try? Data(contentsOf: url) {
                     didCopy = (try? rawData.write(to: target, options: .atomic)) != nil
                 }
             }
+
+            // 2. Coordinated fallback for directory bundles (.pages/.numbers/.rtfd) or unmaterialized cloud items
+            if !didCopy {
+                var coordinationError: NSError?
+                NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { readURL in
+                    let readExt = readURL.pathExtension.lowercased()
+                    let origExt = (name as NSString).pathExtension.lowercased()
+                    if readExt == "zip" && origExt != "zip" {
+                        name = "\(name).zip"
+                        localName = "\(fileUUID)-\(Self.safeLocalName(name))"
+                        target = dir.appendingPathComponent(localName)
+                    }
+                    try? FileManager.default.removeItem(at: target)
+                    didCopy = (try? FileManager.default.copyItem(at: readURL, to: target)) != nil
+                }
+            }
+
+            if !didCopy, let rawData = try? Data(contentsOf: url) {
+                didCopy = (try? rawData.write(to: target, options: .atomic)) != nil
+            }
+
             guard didCopy else {
                 rejected.append(String(localized: "无法读取文件：\(name)"))
                 continue
@@ -87,7 +103,11 @@ extension ChatViewModel {
         }
         if !rejected.isEmpty {
             var seen = Set<String>()
-            attachmentNotice = rejected.filter { seen.insert($0).inserted }.joined(separator: "\n")
+            let noticeText = rejected.filter { seen.insert($0).inserted }.joined(separator: "\n")
+            // Defer alert presentation until UIDocumentPickerViewController finishes dismissing so UIKit never drops the alert.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                self?.attachmentNotice = noticeText
+            }
         }
     }
     

@@ -55,8 +55,8 @@ public final class ShareInbox {
         }
     }
     
-    /// Moves files delivered by "open in" into staging and opens the destination sheet.
-    public func receive(_ urls: [URL]) {
+    /// Moves files delivered by "open in" into staging, and optionally opens the destination sheet.
+    public func receive(_ urls: [URL], presentSheetImmediately: Bool = true) {
         let fm = FileManager.default
         var added: [SharedFile] = []
         for url in urls where url.isFileURL {
@@ -81,21 +81,27 @@ public final class ShareInbox {
             let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
             var target = dir.appendingPathComponent(name)
-            var coordinationError: NSError?
             var didCopy = false
-            NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { readURL in
-                let readExt = readURL.pathExtension.lowercased()
-                if readExt == "zip" && ext != "zip" {
-                    name = "\(name).zip"
-                    isImage = false
-                    target = dir.appendingPathComponent(name)
-                }
-                try? fm.removeItem(at: target)
-                didCopy = (try? fm.copyItem(at: readURL, to: target)) != nil
-            }
-            if !didCopy {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
                 try? fm.removeItem(at: target)
                 didCopy = (try? fm.copyItem(at: url, to: target)) != nil
+                if !didCopy, let rawData = try? Data(contentsOf: url) {
+                    didCopy = (try? rawData.write(to: target, options: .atomic)) != nil
+                }
+            }
+            if !didCopy {
+                var coordinationError: NSError?
+                NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { readURL in
+                    let readExt = readURL.pathExtension.lowercased()
+                    if readExt == "zip" && ext != "zip" {
+                        name = "\(name).zip"
+                        isImage = false
+                        target = dir.appendingPathComponent(name)
+                    }
+                    try? fm.removeItem(at: target)
+                    didCopy = (try? fm.copyItem(at: readURL, to: target)) != nil
+                }
             }
             if !didCopy, let rawData = try? Data(contentsOf: url) {
                 didCopy = (try? rawData.write(to: target, options: .atomic)) != nil
@@ -123,7 +129,9 @@ public final class ShareInbox {
         }
         guard !added.isEmpty else { return }
         files.append(contentsOf: added)
-        showSheet = true
+        if presentSheetImmediately {
+            showSheet = true
+        }
     }
     
     public func remove(_ id: String) {

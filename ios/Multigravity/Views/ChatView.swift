@@ -35,7 +35,7 @@ public struct ChatView: View {
     @State var lastVoiceTroubleshootBubbleAt: Date = .distantPast
     @State var previewDraftGallery: ImageGalleryData? = nil
     @State var showAttachmentSheet = false
-    @State var showFileImporter = false
+    @State var pendingOpenFilePicker = false
     @State var showNavigatorSheet = false
     @State var showMcpSkillsSheet = false
     @State var mcpSkillsInitialTabOverride: McpSkillsSheet.Tab? = nil
@@ -503,7 +503,14 @@ public struct ChatView: View {
     @ViewBuilder
     private func applyPrimarySheets<Content: View>(_ content: Content) -> some View {
         content
-            .sheet(isPresented: $showAttachmentSheet) {
+            .sheet(isPresented: $showAttachmentSheet, onDismiss: {
+                if pendingOpenFilePicker {
+                    pendingOpenFilePicker = false
+                    DocumentPickerBridge.shared.present { urls in
+                        viewModel.addFiles(from: urls)
+                    }
+                }
+            }) {
                 AttachmentPickerSheet(
                     remainingImageSlots: max(0, 5 - viewModel.selectedImageData.count),
                     onPhotosPicked: { assets in handlePickedAssets(assets) },
@@ -519,8 +526,7 @@ public struct ChatView: View {
                     },
                     onFilesPicked: { urls in viewModel.addFiles(from: urls) },
                     onOpenFilePicker: {
-                        // Dismiss the attachment sheet first so UIKit presents UIDocumentPickerViewController cleanly from the root chat host.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { showFileImporter = true }
+                        pendingOpenFilePicker = true
                     },
                     onOpenMentionPicker: {
                         viewModel.openMentionPicker()
@@ -530,15 +536,6 @@ public struct ChatView: View {
                         showWorkflowTemplateSheet = true
                     }
                 )
-            }
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: true
-            ) { result in
-                if case .success(let urls) = result, !urls.isEmpty {
-                    viewModel.addFiles(from: urls)
-                }
             }
             .alert("无法添加文件", isPresented: isAttachmentNoticePresented) {
                 Button("好", role: .cancel) {}
@@ -804,6 +801,7 @@ public struct ChatView: View {
     }
 
     private func dismissChatModals() {
+        pendingOpenFilePicker = false
         showAttachmentSheet = false
         showNavigatorSheet = false
         showMcpSkillsSheet = false
