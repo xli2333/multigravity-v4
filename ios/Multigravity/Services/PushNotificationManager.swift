@@ -13,6 +13,7 @@ public final class MultigravityAppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         PushNotificationManager.shared.configureDelegate()
         ActivityManager.shared.startRemoteTokenObservers()
+        WatchSyncManager.shared.activateIfSupported()
         return true
     }
 

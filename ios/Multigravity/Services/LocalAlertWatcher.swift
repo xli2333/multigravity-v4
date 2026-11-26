@@ -110,6 +110,7 @@ public final class LocalAlertWatcher {
             queuedScan = nil
             await performScan(conversations: next.conversations, baseURL: next.baseURL)
         }
+        WatchSyncManager.shared.updateConversations(scoped)
     }
 
     private func performScan(conversations: [ConversationItem], baseURL: URL) async {

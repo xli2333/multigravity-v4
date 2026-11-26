@@ -1,4 +1,4 @@
-name: Build iOS Unsigned IPA (v4.0)
+name: Build iOS + Apple Watch Unsigned IPA (v4.0)
 
 on:
   workflow_dispatch:
@@ -15,16 +15,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check Xcode version
-        run: xcodebuild -version
+      - name: Check Xcode & Ensure watchOS SDK
+        run: |
+          xcodebuild -version
+          if ! xcodebuild -showsdks | grep -q "watchos"; then
+            echo "Downloading watchOS platform SDK..."
+            xcodebuild -downloadPlatform watchOS
+          fi
+          xcodebuild -showsdks
 
-      - name: Build Release Multigravity.app (Unsigned for On-Device Signing)
+      - name: Verify Standalone watchOS Target Build
+        run: |
+          xcodebuild \
+            -project ios/Multigravity.xcodeproj \
+            -scheme MultigravityWatch \
+            -configuration Release \
+            -destination 'generic/platform=watchOS' \
+            -derivedDataPath ios/build_watch_check \
+            build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Build Release Multigravity.app (with Embedded MultigravityWatch.app)
         run: |
           xcodebuild \
             -project ios/Multigravity.xcodeproj \
             -scheme Multigravity \
             -configuration Release \
-            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath ios/build_ipa \
             clean build \
@@ -32,20 +50,30 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Package Payload into Multigravity-v4.0-unsigned.ipa
+      - name: Package Full IPA (iOS + Apple Watch) & iOS-Only Fallback IPA
         run: |
           cd ios/build_ipa/Build/Products/Release-iphoneos
+          ls -la Multigravity.app/Watch || true
+
+          # 1. Full IPA (iPhone + ActivityExtension + MultigravityWatch + WatchWidgets)
           rm -rf Payload
           mkdir -p Payload
           cp -R Multigravity.app Payload/
           ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/Multigravity-v4.0-unsigned.ipa"
-          ls -lh "$GITHUB_WORKSPACE/Multigravity-v4.0-unsigned.ipa"
 
-      - name: Upload IPA Artifact
+          # 2. Fallback iOS-only IPA (for signers without watchOS provisioning profile support)
+          rm -rf Payload/Multigravity.app/Watch
+          ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/Multigravity-v4.0-ios-only-unsigned.ipa"
+
+          ls -lh "$GITHUB_WORKSPACE"/*.ipa
+
+      - name: Upload IPA Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Multigravity-v4.0-unsigned-ipa
-          path: Multigravity-v4.0-unsigned.ipa
+          path: |
+            Multigravity-v4.0-unsigned.ipa
+            Multigravity-v4.0-ios-only-unsigned.ipa
           retention-days: 30
 
       - name: Publish Direct-Download IPA to GitHub Releases
@@ -53,8 +81,11 @@ jobs:
         with:
           tag_name: v4.0-ipa-latest
           target_commitish: ${{ github.sha }}
-          name: "Multigravity iOS v4.0 (Unsigned IPA for On-Device Signing)"
+          name: "Multigravity iOS + Watch v4.0 (Unsigned IPA for On-Device Signing)"
           body: |
-            手机端直接点击下方 `Multigravity-v4.0-unsigned.ipa` 下载，导入 **轻松签 (ESign) / 全能签 / Feather / GBox / 巨魔 TrollStore** 即可本机一键签名安装，无需连接电脑。
-          files: Multigravity-v4.0-unsigned.ipa
+            - **`Multigravity-v4.0-unsigned.ipa`（完整版：iPhone + Apple Watch 伴侣端 + 桌面/表盘小组件）**：导入 **全能签 / 轻松签 / Feather** 本机签名安装；若证书支持多描述文件，iPhone 上的 Watch 应用会自动将 Multigravity 同步到 Apple Watch（也可在 Mac 上用 Xcode 直接安装）。
+            - **`Multigravity-v4.0-ios-only-unsigned.ipa`（纯手机版兜底）**：若单 App 个人证书或巨魔 TrollStore 因缺少手表描述文件无法重签 `Watch/` 目录，可安装此包。
+          files: |
+            Multigravity-v4.0-unsigned.ipa
+            Multigravity-v4.0-ios-only-unsigned.ipa
           prerelease: false

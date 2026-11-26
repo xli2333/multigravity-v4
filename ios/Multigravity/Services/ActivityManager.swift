@@ -322,6 +322,7 @@ public final class ActivityManager {
             observePushToken(for: activity)
             observeStateUpdates(for: activity)
             deduplicateActivities(for: cascadeId)
+            WatchSyncManager.shared.scheduleContextSync()
         } catch {
             print("[LiveActivity] Failed to start for \(cascadeId): \(error)")
         }
@@ -386,6 +387,7 @@ public final class ActivityManager {
         
         Task {
             await activity.update(.init(state: updatedState, staleDate: nil))
+            WatchSyncManager.shared.scheduleContextSync()
         }
     }
     
@@ -428,6 +430,7 @@ public final class ActivityManager {
 
         guard !matching.isEmpty else { return }
         endActivitiesList(matching, finalStatus: finalStatus, dismissalPolicy: dismissalPolicy)
+        WatchSyncManager.shared.scheduleContextSync()
     }
 
     public func endAllActivities(

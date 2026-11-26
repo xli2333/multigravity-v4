@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		37BD0595305AC47600524822 /* ZLPhotoBrowser in Frameworks */ = {isa = PBXBuildFile; productRef = 3756FEAB2F42C01000EDA5E9 /* ZLPhotoBrowser */; };
 		A10000012F42C01000EDA5E9 /* ActivityExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A10000022F42C01000EDA5E9 /* ActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B10000012F42C01000EDA5E9 /* MultigravityWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = B10000022F42C01000EDA5E9 /* MultigravityWatch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B20000012F42C01000EDA5E9 /* MultigravityWatchWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B20000022F42C01000EDA5E9 /* MultigravityWatchWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -18,6 +20,20 @@
 			proxyType = 1;
 			remoteGlobalIDString = A10000042F42C01000EDA5E9;
 			remoteInfo = ActivityExtension;
+		};
+		B10000032F42C01000EDA5E9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 3756FE0C2F42C00F00EDA5E9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B10000042F42C01000EDA5E9;
+			remoteInfo = MultigravityWatch;
+		};
+		B20000032F42C01000EDA5E9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 3756FE0C2F42C00F00EDA5E9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B20000042F42C01000EDA5E9;
+			remoteInfo = MultigravityWatchWidgets;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -33,11 +49,35 @@
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B10000052F42C01000EDA5E9 /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				B10000012F42C01000EDA5E9 /* MultigravityWatch.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B20000052F42C01000EDA5E9 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				B20000012F42C01000EDA5E9 /* MultigravityWatchWidgets.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		3756FE142F42C01000EDA5E9 /* Multigravity.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Multigravity.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000022F42C01000EDA5E9 /* ActivityExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ActivityExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10000022F42C01000EDA5E9 /* MultigravityWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MultigravityWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B20000022F42C01000EDA5E9 /* MultigravityWatchWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MultigravityWatchWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -49,6 +89,16 @@
 		A10000062F42C01000EDA5E9 /* ActivityExtension */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = ActivityExtension;
+			sourceTree = "<group>";
+		};
+		B10000062F42C01000EDA5E9 /* MultigravityWatch */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = MultigravityWatch;
+			sourceTree = "<group>";
+		};
+		B20000062F42C01000EDA5E9 /* MultigravityWatchWidgets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = MultigravityWatchWidgets;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -69,6 +119,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B10000072F42C01000EDA5E9 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B20000072F42C01000EDA5E9 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -77,6 +141,8 @@
 			children = (
 				3756FE162F42C01000EDA5E9 /* Multigravity */,
 				A10000062F42C01000EDA5E9 /* ActivityExtension */,
+				B10000062F42C01000EDA5E9 /* MultigravityWatch */,
+				B20000062F42C01000EDA5E9 /* MultigravityWatchWidgets */,
 				3756FE152F42C01000EDA5E9 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -86,6 +152,8 @@
 			children = (
 				3756FE142F42C01000EDA5E9 /* Multigravity.app */,
 				A10000022F42C01000EDA5E9 /* ActivityExtension.appex */,
+				B10000022F42C01000EDA5E9 /* MultigravityWatch.app */,
+				B20000022F42C01000EDA5E9 /* MultigravityWatchWidgets.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -101,11 +169,13 @@
 				3756FE112F42C01000EDA5E9 /* Frameworks */,
 				3756FE122F42C01000EDA5E9 /* Resources */,
 				A10000052F42C01000EDA5E9 /* Embed Foundation Extensions */,
+				B10000052F42C01000EDA5E9 /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				A10000082F42C01000EDA5E9 /* PBXTargetDependency */,
+				B10000082F42C01000EDA5E9 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				3756FE162F42C01000EDA5E9 /* Multigravity */,
@@ -140,6 +210,52 @@
 			productReference = A10000022F42C01000EDA5E9 /* ActivityExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		B10000042F42C01000EDA5E9 /* MultigravityWatch */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B10000092F42C01000EDA5E9 /* Build configuration list for PBXNativeTarget "MultigravityWatch" */;
+			buildPhases = (
+				B100000A2F42C01000EDA5E9 /* Sources */,
+				B10000072F42C01000EDA5E9 /* Frameworks */,
+				B100000B2F42C01000EDA5E9 /* Resources */,
+				B20000052F42C01000EDA5E9 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B20000082F42C01000EDA5E9 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				B10000062F42C01000EDA5E9 /* MultigravityWatch */,
+			);
+			name = MultigravityWatch;
+			packageProductDependencies = (
+			);
+			productName = MultigravityWatch;
+			productReference = B10000022F42C01000EDA5E9 /* MultigravityWatch.app */;
+			productType = "com.apple.product-type.application";
+		};
+		B20000042F42C01000EDA5E9 /* MultigravityWatchWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B20000092F42C01000EDA5E9 /* Build configuration list for PBXNativeTarget "MultigravityWatchWidgets" */;
+			buildPhases = (
+				B200000A2F42C01000EDA5E9 /* Sources */,
+				B20000072F42C01000EDA5E9 /* Frameworks */,
+				B200000B2F42C01000EDA5E9 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B20000062F42C01000EDA5E9 /* MultigravityWatchWidgets */,
+			);
+			name = MultigravityWatchWidgets;
+			packageProductDependencies = (
+			);
+			productName = MultigravityWatchWidgets;
+			productReference = B20000022F42C01000EDA5E9 /* MultigravityWatchWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -154,6 +270,12 @@
 						CreatedOnToolsVersion = 26.2;
 					};
 					A10000042F42C01000EDA5E9 = {
+						CreatedOnToolsVersion = 26.2;
+					};
+					B10000042F42C01000EDA5E9 = {
+						CreatedOnToolsVersion = 26.2;
+					};
+					B20000042F42C01000EDA5E9 = {
 						CreatedOnToolsVersion = 26.2;
 					};
 				};
@@ -179,6 +301,8 @@
 			targets = (
 				3756FE132F42C01000EDA5E9 /* Multigravity */,
 				A10000042F42C01000EDA5E9 /* ActivityExtension */,
+				B10000042F42C01000EDA5E9 /* MultigravityWatch */,
+				B20000042F42C01000EDA5E9 /* MultigravityWatchWidgets */,
 			);
 		};
 /* End PBXProject section */
@@ -192,6 +316,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A100000B2F42C01000EDA5E9 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B100000B2F42C01000EDA5E9 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B200000B2F42C01000EDA5E9 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -215,6 +353,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B100000A2F42C01000EDA5E9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B200000A2F42C01000EDA5E9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -222,6 +374,16 @@
 			isa = PBXTargetDependency;
 			target = A10000042F42C01000EDA5E9 /* ActivityExtension */;
 			targetProxy = A10000032F42C01000EDA5E9 /* PBXContainerItemProxy */;
+		};
+		B10000082F42C01000EDA5E9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B10000042F42C01000EDA5E9 /* MultigravityWatch */;
+			targetProxy = B10000032F42C01000EDA5E9 /* PBXContainerItemProxy */;
+		};
+		B20000082F42C01000EDA5E9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B20000042F42C01000EDA5E9 /* MultigravityWatchWidgets */;
+			targetProxy = B20000032F42C01000EDA5E9 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -476,6 +638,143 @@
 			};
 			name = Release;
 		};
+		B100000C2F42C01000EDA5E9 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = MultigravityWatch/MultigravityWatch.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 37;
+				DEVELOPMENT_TEAM = 7ZW5X4CFNP;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "MultigravityWatch-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.2.6;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ghsaimo.antigravity.watchkitapp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Debug;
+		};
+		B100000D2F42C01000EDA5E9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = MultigravityWatch/MultigravityWatch.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 37;
+				DEVELOPMENT_TEAM = 7ZW5X4CFNP;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "MultigravityWatch-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.2.6;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ghsaimo.antigravity.watchkitapp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Release;
+		};
+		B200000C2F42C01000EDA5E9 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = MultigravityWatchWidgets/MultigravityWatchWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 37;
+				DEVELOPMENT_TEAM = 7ZW5X4CFNP;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "MultigravityWatchWidgets-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.2.6;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ghsaimo.antigravity.watchkitapp.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG WATCH_WIDGET_EXTENSION $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Debug;
+		};
+		B200000D2F42C01000EDA5E9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = MultigravityWatchWidgets/MultigravityWatchWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 37;
+				DEVELOPMENT_TEAM = 7ZW5X4CFNP;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "MultigravityWatchWidgets-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.2.6;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ghsaimo.antigravity.watchkitapp.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "WATCH_WIDGET_EXTENSION $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -502,6 +801,24 @@
 			buildConfigurations = (
 				A100000C2F42C01000EDA5E9 /* Debug */,
 				A100000D2F42C01000EDA5E9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B10000092F42C01000EDA5E9 /* Build configuration list for PBXNativeTarget "MultigravityWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B100000C2F42C01000EDA5E9 /* Debug */,
+				B100000D2F42C01000EDA5E9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B20000092F42C01000EDA5E9 /* Build configuration list for PBXNativeTarget "MultigravityWatchWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B200000C2F42C01000EDA5E9 /* Debug */,
+				B200000D2F42C01000EDA5E9 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

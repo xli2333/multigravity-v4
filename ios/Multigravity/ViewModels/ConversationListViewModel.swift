@@ -442,6 +442,7 @@ public final class ConversationListViewModel {
             cacheManager.prewarmSessions(for: all.prefix(15).map(\.id))
             ActivityManager.shared.syncWithConversations(nonDraftEnriched)
             QuotaWidgetStore.shared.publishConversationsFromApp(items: nonDraftEnriched, isDemo: settings.isDemoMode)
+            WatchSyncManager.shared.updateConversations(nonDraftEnriched)
             Task {
                 await LocalAlertWatcher.shared.scan(conversations: nonDraftEnriched, baseURL: url)
             }
@@ -484,6 +485,7 @@ public final class ConversationListViewModel {
                     cacheManager.prewarmSessions(for: all.prefix(15).map(\.id))
                     ActivityManager.shared.syncWithConversations(nonDraftEnriched)
                     QuotaWidgetStore.shared.publishConversationsFromApp(items: nonDraftEnriched, isDemo: settings.isDemoMode)
+                    WatchSyncManager.shared.updateConversations(nonDraftEnriched)
                     Task {
                         await LocalAlertWatcher.shared.scan(conversations: nonDraftEnriched, baseURL: retryURL)
                     }
@@ -562,6 +564,7 @@ public final class ConversationListViewModel {
             isEmailMasked: emailMasked,
             isDemo: settings.isDemoMode
         )
+        WatchSyncManager.shared.scheduleContextSync()
     }
 
     @MainActor

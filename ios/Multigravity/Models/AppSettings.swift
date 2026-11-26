@@ -313,6 +313,7 @@ public final class AppSettings {
             }
             UserDefaults.standard.set(themeMode, forKey: themeModeKey)
             applyAppearance()
+            WatchSyncManager.shared.scheduleContextSync()
         }
     }
 
@@ -793,6 +794,7 @@ public final class AppSettings {
         }
         if reloadWidget {
             QuotaWidgetStore.shared.reloadWidgetTimelines()
+            WatchSyncManager.shared.scheduleContextSync()
         }
     }
     
