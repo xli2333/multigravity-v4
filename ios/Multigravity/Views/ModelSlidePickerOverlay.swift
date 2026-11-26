@@ -672,178 +672,60 @@ private struct ReasoningEffortSliderSection: View {
             : Color(red: 0.31, green: 0.49, blue: 0.96).opacity(isDragging ? 0.28 : 0.20)
     }
 
+    private static let trackHeight: CGFloat = 24
+    private static let thumbSize: CGFloat = 24
+    private static let trackInset: CGFloat = 12
+
+    private var stopDotColor: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.18)
+            : Color(red: 0.39, green: 0.45, blue: 0.55).opacity(0.22)
+    }
+
+    private var trackStrokeColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.045)
+    }
+
+    private var wellBackgroundColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.025) : Color(red: 0.973, green: 0.978, blue: 0.990)
+    }
+
+    private var wellBorderColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.055) : Color.black.opacity(0.045)
+    }
+
+    private var headerTitleColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.80) : Color(red: 0.24, green: 0.28, blue: 0.36)
+    }
+
+    private var radialBloom: RadialGradient {
+        let peakOpacity: Double = colorScheme == .dark ? 0.30 : 0.24
+        return RadialGradient(
+            colors: [Color.white.opacity(peakOpacity), Color.white.opacity(0)],
+            center: .trailing,
+            startRadius: 1,
+            endRadius: 28
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .center) {
-                Text("推理等级")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(
-                        colorScheme == .dark
-                            ? Color.white.opacity(0.80)
-                            : Color(red: 0.24, green: 0.28, blue: 0.36)
-                    )
-
-                Spacer()
-
-                Text(currentEffortTitle)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(tierLabelColor)
-                    .contentTransition(.interpolate)
-                    .animation(.easeOut(duration: 0.15), value: currentEffortTitle)
-            }
-            .padding(.horizontal, 2)
+            headerRow
 
             GeometryReader { geo in
-                let trackHeight: CGFloat = 24
-                let thumbSize: CGFloat = 24
-                let inset: CGFloat = trackHeight / 2 // 12pt
-                let totalWidth = max(trackHeight, geo.size.width)
-                let usableWidth = max(1, totalWidth - inset * 2)
-                let thumbCenterX = inset + effectiveFraction * usableWidth
-                let activeSpanWidth = max(0, thumbCenterX)
-
-                ZStack(alignment: .leading) {
-                    // 0. Soft Ambient Under-Glow beneath active trail
-                    if activeSpanWidth > inset {
-                        Capsule(style: .continuous)
-                            .fill(ambientGlowColor)
-                            .frame(width: min(totalWidth, activeSpanWidth + 4), height: trackHeight - 2)
-                            .blur(radius: 6)
-                            .offset(y: 2)
-                    }
-
-                    // 1. Clipped Track + Multi-Hue Fill + Thumb Light-Bloom + Stardust
-                    ZStack(alignment: .leading) {
-                        Capsule(style: .continuous)
-                            .fill(trackBackground)
-
-                        if isAdjustable {
-                            ForEach(0..<variants.count, id: \.self) { idx in
-                                let stopX = inset + (CGFloat(idx) / CGFloat(max(1, variants.count - 1))) * usableWidth
-                                Circle()
-                                    .fill(
-                                        colorScheme == .dark
-                                            ? Color.white.opacity(0.18)
-                                            : Color(red: 0.39, green: 0.45, blue: 0.55).opacity(0.22)
-                                    )
-                                    .frame(width: 3, height: 3)
-                                    .position(x: stopX, y: trackHeight / 2)
-                            }
-                        }
-
-                        // Active gradient ends strictly at thumbCenterX underneath the flush 24pt white knob
-                        ZStack(alignment: .trailing) {
-                            Rectangle()
-                                .fill(activeGradient)
-
-                            // Soft light-source radial bloom emitted backward from the white knob
-                            RadialGradient(
-                                colors: [
-                                    Color.white.opacity(colorScheme == .dark ? 0.30 : 0.24),
-                                    Color.white.opacity(0)
-                                ],
-                                center: .trailing,
-                                startRadius: 1,
-                                endRadius: 28
-                            )
-                            .frame(width: min(activeSpanWidth, 34), height: trackHeight)
-
-                            SliderSparkleOverlay(width: activeSpanWidth, height: trackHeight)
-                                .frame(width: activeSpanWidth, height: trackHeight)
-                        }
-                        .frame(width: activeSpanWidth, height: trackHeight)
-                        .opacity(isAdjustable ? 1.0 : 0.65)
-                    }
-                    .frame(width: totalWidth, height: trackHeight)
-                    .clipShape(Capsule(style: .continuous))
-                    .overlay(
-                        Capsule(style: .continuous)
-                            .stroke(
-                                colorScheme == .dark
-                                    ? Color.white.opacity(0.05)
-                                    : Color.black.opacity(0.045),
-                                lineWidth: 0.6
-                            )
-                    )
-
-                    // 2. Flush 24pt Pure White Knob (zero colored collar on right edge)
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: thumbSize, height: thumbSize)
-                        .overlay(
-                            Circle()
-                                .stroke(
-                                    colorScheme == .dark ? Color.clear : Color.black.opacity(0.055),
-                                    lineWidth: 0.5
-                                )
-                        )
-                        .shadow(
-                            color: Color.black.opacity(colorScheme == .dark ? 0.38 : 0.16),
-                            radius: isDragging ? 4.5 : 3.0,
-                            x: 1,
-                            y: 1
-                        )
-                        .scaleEffect(isDragging ? 1.06 : 1.0)
-                        .position(x: thumbCenterX, y: trackHeight / 2)
-                        .animation(.interactiveSpring(response: 0.18, dampingFraction: 0.78), value: isDragging)
-                }
-                .frame(width: totalWidth, height: trackHeight)
-                .contentShape(Rectangle().inset(by: -8))
-                .highPriorityGesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { value in
-                            guard isAdjustable, variants.count > 1 else { return }
-                            if !isDragging {
-                                isDragging = true
-                            }
-                            let raw = (value.location.x - inset) / usableWidth
-                            let clamped = min(max(0, raw), 1)
-                            dragFraction = clamped
-
-                            let nearest = Int((clamped * CGFloat(variants.count - 1)).rounded())
-                            if nearest != state.selectedVariantIndex {
-                                state.selectVariantIndex(nearest, onSelect: onSelectModel)
-                            }
-                        }
-                        .onEnded { value in
-                            guard isAdjustable, variants.count > 1 else {
-                                isDragging = false
-                                dragFraction = nil
-                                return
-                            }
-                            let raw = (value.location.x - inset) / usableWidth
-                            let clamped = min(max(0, raw), 1)
-                            let nearest = Int((clamped * CGFloat(variants.count - 1)).rounded())
-                            if nearest != state.selectedVariantIndex {
-                                state.selectVariantIndex(nearest, onSelect: onSelectModel)
-                            }
-                            isDragging = false
-                            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
-                                dragFraction = nil
-                            }
-                        }
-                )
+                sliderCanvas(totalWidth: max(Self.trackHeight, geo.size.width))
             }
-            .frame(height: 24)
+            .frame(height: Self.trackHeight)
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(
-                    colorScheme == .dark
-                        ? Color.white.opacity(0.025)
-                        : Color(red: 0.973, green: 0.978, blue: 0.990)
-                )
+                .fill(wellBackgroundColor)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .stroke(
-                    colorScheme == .dark
-                        ? Color.white.opacity(0.055)
-                        : Color.black.opacity(0.045),
-                    lineWidth: 0.7
-                )
+                .stroke(wellBorderColor, lineWidth: 0.7)
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("推理等级")
@@ -861,6 +743,160 @@ private struct ReasoningEffortSliderSection: View {
                 break
             }
         }
+    }
+
+    private var headerRow: some View {
+        HStack(alignment: .center) {
+            Text("推理等级")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(headerTitleColor)
+
+            Spacer()
+
+            Text(currentEffortTitle)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(tierLabelColor)
+                .contentTransition(.interpolate)
+                .animation(.easeOut(duration: 0.15), value: currentEffortTitle)
+        }
+        .padding(.horizontal, 2)
+    }
+
+    @ViewBuilder
+    private func sliderCanvas(totalWidth: CGFloat) -> some View {
+        let inset = Self.trackInset
+        let usableWidth = max(1, totalWidth - inset * 2)
+        let thumbCenterX = inset + effectiveFraction * usableWidth
+        let activeSpanWidth = max(0, thumbCenterX)
+
+        ZStack(alignment: .leading) {
+            if activeSpanWidth > inset {
+                Capsule(style: .continuous)
+                    .fill(ambientGlowColor)
+                    .frame(width: min(totalWidth, activeSpanWidth + 4), height: Self.trackHeight - 2)
+                    .blur(radius: 6)
+                    .offset(y: 2)
+            }
+
+            clippedTrackLayer(
+                totalWidth: totalWidth,
+                usableWidth: usableWidth,
+                activeSpanWidth: activeSpanWidth
+            )
+
+            thumbKnobView(thumbCenterX: thumbCenterX)
+        }
+        .frame(width: totalWidth, height: Self.trackHeight)
+        .contentShape(Rectangle().inset(by: -8))
+        .highPriorityGesture(sliderDragGesture(usableWidth: usableWidth))
+    }
+
+    private func clippedTrackLayer(
+        totalWidth: CGFloat,
+        usableWidth: CGFloat,
+        activeSpanWidth: CGFloat
+    ) -> some View {
+        ZStack(alignment: .leading) {
+            Capsule(style: .continuous)
+                .fill(trackBackground)
+
+            if isAdjustable {
+                tierDotsLayer(usableWidth: usableWidth)
+            }
+
+            activeFillLayer(activeSpanWidth: activeSpanWidth)
+        }
+        .frame(width: totalWidth, height: Self.trackHeight)
+        .clipShape(Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(trackStrokeColor, lineWidth: 0.6)
+        )
+    }
+
+    private func tierDotsLayer(usableWidth: CGFloat) -> some View {
+        let count = variants.count
+        let denom = CGFloat(max(1, count - 1))
+        return ForEach(0..<count, id: \.self) { idx in
+            let stopX = Self.trackInset + (CGFloat(idx) / denom) * usableWidth
+            Circle()
+                .fill(stopDotColor)
+                .frame(width: 3, height: 3)
+                .position(x: stopX, y: Self.trackHeight / 2)
+        }
+    }
+
+    private func activeFillLayer(activeSpanWidth: CGFloat) -> some View {
+        ZStack(alignment: .trailing) {
+            Rectangle()
+                .fill(activeGradient)
+
+            radialBloom
+                .frame(width: min(activeSpanWidth, 34), height: Self.trackHeight)
+
+            SliderSparkleOverlay(width: activeSpanWidth, height: Self.trackHeight)
+                .frame(width: activeSpanWidth, height: Self.trackHeight)
+        }
+        .frame(width: activeSpanWidth, height: Self.trackHeight)
+        .opacity(isAdjustable ? 1.0 : 0.65)
+    }
+
+    private func thumbKnobView(thumbCenterX: CGFloat) -> some View {
+        let rimColor: Color = colorScheme == .dark ? .clear : Color.black.opacity(0.055)
+        let shadowOpacity: Double = colorScheme == .dark ? 0.38 : 0.16
+        let shadowRadius: CGFloat = isDragging ? 4.5 : 3.0
+        let scale: CGFloat = isDragging ? 1.06 : 1.0
+
+        return Circle()
+            .fill(Color.white)
+            .frame(width: Self.thumbSize, height: Self.thumbSize)
+            .overlay(
+                Circle().stroke(rimColor, lineWidth: 0.5)
+            )
+            .shadow(
+                color: Color.black.opacity(shadowOpacity),
+                radius: shadowRadius,
+                x: 1,
+                y: 1
+            )
+            .scaleEffect(scale)
+            .position(x: thumbCenterX, y: Self.trackHeight / 2)
+            .animation(.interactiveSpring(response: 0.18, dampingFraction: 0.78), value: isDragging)
+    }
+
+    private func sliderDragGesture(usableWidth: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                guard isAdjustable, variants.count > 1 else { return }
+                if !isDragging {
+                    isDragging = true
+                }
+                let raw = (value.location.x - Self.trackInset) / usableWidth
+                let clamped = min(max(0, raw), 1)
+                dragFraction = clamped
+
+                let nearest = Int((clamped * CGFloat(variants.count - 1)).rounded())
+                if nearest != state.selectedVariantIndex {
+                    state.selectVariantIndex(nearest, onSelect: onSelectModel)
+                }
+            }
+            .onEnded { value in
+                guard isAdjustable, variants.count > 1 else {
+                    isDragging = false
+                    dragFraction = nil
+                    return
+                }
+                let raw = (value.location.x - Self.trackInset) / usableWidth
+                let clamped = min(max(0, raw), 1)
+                let nearest = Int((clamped * CGFloat(variants.count - 1)).rounded())
+                if nearest != state.selectedVariantIndex {
+                    state.selectVariantIndex(nearest, onSelect: onSelectModel)
+                }
+                isDragging = false
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                    dragFraction = nil
+                }
+            }
     }
 }
 
