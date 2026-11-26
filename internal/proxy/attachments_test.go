@@ -192,8 +192,12 @@ func TestApplySmallAttachmentUsesNativeMedia(t *testing.T) {
 		t.Fatalf("expected 1 media entry, got: %v", msg["media"])
 	}
 	mItem := media[0].(map[string]interface{})
-	if mItem["uri"] != "file://"+a.Path {
-		t.Errorf("expected uri file://%s, got %v", a.Path, mItem["uri"])
+	wantURI := localPathToFileURI(a.Path)
+	if mItem["uri"] != wantURI {
+		t.Errorf("expected uri %s, got %v", wantURI, mItem["uri"])
+	}
+	if strings.Contains(mItem["mimeType"].(string), ";") {
+		t.Errorf("expected stripped base mimeType without parameters, got %v", mItem["mimeType"])
 	}
 }
 

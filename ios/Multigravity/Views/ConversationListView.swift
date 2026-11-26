@@ -1522,7 +1522,10 @@ public struct ConversationListView: View {
             pairingErrorMessage = String(localized: "请先完成配对，再分享文件到 Multigravity")
             return
         }
-        shareInbox.receive([url])
+        dismissAllModals()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            shareInbox.receive([url])
+        }
     }
     
     private func handleDeepLink(_ url: URL) {

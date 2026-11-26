@@ -11,8 +11,12 @@ extension ChatViewModel {
     /// URLs may be security-scoped; they are copied before this returns.
     @MainActor
     public func addFiles(from urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        if draftKey.isEmpty {
+            originDraftId = "local_draft_\(UUID().uuidString)"
+        }
         let key = draftKey
-        guard !key.isEmpty, !urls.isEmpty else { return }
+        guard !key.isEmpty else { return }
         let dir = DraftFileStore.shared.directory(for: key)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         
@@ -23,21 +27,44 @@ extension ChatViewModel {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             
-            let name = url.lastPathComponent
+            var name = url.lastPathComponent
+            if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                name = "attachment"
+            }
             let existing = selectedFiles + accepted
             let declared = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init) ?? -1
-            if let reason = AttachmentRules.validate(name: name, size: declared >= 0 ? declared : 1, existing: existing) {
+            if let reason = AttachmentRules.validate(name: name, size: declared > 0 ? declared : 1, existing: existing) {
                 rejected.append(reason)
                 continue
             }
             
-            let localName = "\(UUID().uuidString)-\(Self.safeLocalName(name))"
-            let target = dir.appendingPathComponent(localName)
+            let fileUUID = UUID().uuidString
+            var localName = "\(fileUUID)-\(Self.safeLocalName(name))"
+            var target = dir.appendingPathComponent(localName)
             var coordinationError: NSError?
             var didCopy = false
-            // Coordinated read also downloads iCloud Drive files that are not yet on the device.
-            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readURL in
+            // `.forUploading` downloads iCloud Drive placeholders AND automatically zips directory bundles (.pages/.numbers/.rtfd).
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { readURL in
+                let readExt = readURL.pathExtension.lowercased()
+                let origExt = (name as NSString).pathExtension.lowercased()
+                if readExt == "zip" && origExt != "zip" {
+                    name = "\(name).zip"
+                    localName = "\(fileUUID)-\(Self.safeLocalName(name))"
+                    target = dir.appendingPathComponent(localName)
+                }
+                try? FileManager.default.removeItem(at: target)
                 didCopy = (try? FileManager.default.copyItem(at: readURL, to: target)) != nil
+            }
+            if !didCopy {
+                // Fallback for third-party FileProviders that reject coordinated reads.
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
+                    try? FileManager.default.removeItem(at: target)
+                    didCopy = (try? FileManager.default.copyItem(at: url, to: target)) != nil
+                }
+                if !didCopy, let rawData = try? Data(contentsOf: url) {
+                    didCopy = (try? rawData.write(to: target, options: .atomic)) != nil
+                }
             }
             guard didCopy else {
                 rejected.append(String(localized: "无法读取文件：\(name)"))

@@ -64,9 +64,12 @@ public final class ShareInbox {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             
-            let name = url.lastPathComponent
+            var name = url.lastPathComponent
+            if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                name = "attachment"
+            }
             let ext = (name as NSString).pathExtension.lowercased()
-            let isImage = Self.imageExtensions.contains(ext)
+            var isImage = Self.imageExtensions.contains(ext)
             let preSize = ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? -1
             let preCap = AttachmentRules.isLargeMediaName(name) ? AttachmentRules.maxMediaFileBytes : AttachmentRules.maxFileBytes
             if preSize > preCap {
@@ -77,10 +80,27 @@ public final class ShareInbox {
             }
             let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let target = dir.appendingPathComponent(name)
-            do {
-                try fm.copyItem(at: url, to: target)
-            } catch {
+            var target = dir.appendingPathComponent(name)
+            var coordinationError: NSError?
+            var didCopy = false
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { readURL in
+                let readExt = readURL.pathExtension.lowercased()
+                if readExt == "zip" && ext != "zip" {
+                    name = "\(name).zip"
+                    isImage = false
+                    target = dir.appendingPathComponent(name)
+                }
+                try? fm.removeItem(at: target)
+                didCopy = (try? fm.copyItem(at: readURL, to: target)) != nil
+            }
+            if !didCopy {
+                try? fm.removeItem(at: target)
+                didCopy = (try? fm.copyItem(at: url, to: target)) != nil
+            }
+            if !didCopy, let rawData = try? Data(contentsOf: url) {
+                didCopy = (try? rawData.write(to: target, options: .atomic)) != nil
+            }
+            guard didCopy else {
                 try? fm.removeItem(at: dir)
                 added.append(SharedFile(id: UUID().uuidString, name: name, size: 0, url: target, isImage: false, rejectReason: String(localized: "无法读取文件：\(name)")))
                 continue

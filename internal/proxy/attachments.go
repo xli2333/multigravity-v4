@@ -588,11 +588,14 @@ func applyAttachmentsToMessage(rawMap map[string]interface{}) (bool, error) {
 		}
 		for _, a := range smallAtts {
 			mimeType := a.Mime
+			if base, _, mErr := mime.ParseMediaType(mimeType); mErr == nil && base != "" {
+				mimeType = base
+			}
 			if mimeType == "" {
 				mimeType = "application/octet-stream"
 			}
 			mediaList = append(mediaList, map[string]interface{}{
-				"uri":      "file://" + a.Path,
+				"uri":      localPathToFileURI(a.Path),
 				"mimeType": mimeType,
 			})
 		}

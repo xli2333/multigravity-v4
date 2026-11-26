@@ -9,6 +9,30 @@ permissions:
   contents: write
 
 jobs:
+  build-windows-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test proxy attachments & Build Windows mgy.exe
+        run: |
+          go test ./internal/proxy/...
+          mkdir -p dist/windows
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X 'main.Version=1.2.6'" -o dist/windows/mgy.exe ./cmd/gateway
+
+      - name: Upload Windows Gateway Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gateway-mgy
+          path: dist/windows/mgy.exe
+          retention-days: 14
+
   package-ipa:
     runs-on: macos-latest
     steps:

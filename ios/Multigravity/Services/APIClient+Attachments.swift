@@ -20,16 +20,16 @@ extension APIClient {
         if let token = KeychainHelper.shared.read(key: .deviceToken), !token.isEmpty {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        
+
         let isDemoEndpoint = DemoGateway.isEnabled
             && endpoint.host == DemoGateway.host
             && endpoint.port == DemoGateway.port
-        
+
         let data: Data
         let response: URLResponse
         if !isDemoEndpoint, E2EECrypto.shared.shouldEncrypt(url: endpoint) {
             do {
-                request.httpBody = try Data(contentsOf: fileURL)
+                request.httpBody = try Data(contentsOf: fileURL, options: .mappedIfSafe)
                 onProgress?(0.25)
                 (data, response) = try await transport.send(request: request)
                 onProgress?(0.95)
@@ -54,36 +54,41 @@ extension APIClient {
         } else if !isDemoEndpoint,
                   endpoint.scheme?.lowercased() == "https",
                   CloudflareAnycastAccelerator.isCloudflareTunnelHost(endpoint.host ?? "") {
-            // Stream 32 KB chunks through the fastest Asia Anycast edge IP; fall back to streamed URLSession on error.
+            // Try accelerated Anycast edge first; fall back to native URLSession file upload on transport or edge error.
+            var acceleratedResult: (Data, URLResponse)? = nil
             do {
-                (data, response) = try await transport.uploadCloudflareAcceleratedHTTPS(
+                let candidate = try await transport.uploadCloudflareAcceleratedHTTPS(
                     request: request,
                     fileURL: fileURL,
                     onProgress: onProgress
                 )
+                if let http = candidate.1 as? HTTPURLResponse,
+                   (200...299).contains(http.statusCode) || [401, 413, 415, 426].contains(http.statusCode) {
+                    acceleratedResult = candidate
+                }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                (data, response) = try await Self.uploadViaStreamedURLSession(
+                acceleratedResult = nil
+            }
+
+            if let acceleratedResult {
+                (data, response) = acceleratedResult
+            } else {
+                (data, response) = try await Self.uploadViaURLSession(
                     request: request,
                     fileURL: fileURL,
                     onProgress: onProgress
                 )
             }
-        } else if isDemoEndpoint {
-            (data, response) = try await Self.uploadViaDemoURLSession(
-                request: request,
-                fileURL: fileURL,
-                onProgress: onProgress
-            )
         } else {
-            (data, response) = try await Self.uploadViaStreamedURLSession(
+            (data, response) = try await Self.uploadViaURLSession(
                 request: request,
                 fileURL: fileURL,
                 onProgress: onProgress
             )
         }
-        
+
         var finalData = data
         var finalResponse = response
         if !isDemoEndpoint,
@@ -94,7 +99,7 @@ extension APIClient {
            !NetworkTransport.isLocalOrPrivateHost(host) {
             E2EECrypto.shared.markHostRequiresE2EE(host)
             do {
-                request.httpBody = try Data(contentsOf: fileURL)
+                request.httpBody = try Data(contentsOf: fileURL, options: .mappedIfSafe)
                 onProgress?(0.25)
                 (finalData, finalResponse) = try await transport.send(request: request)
                 onProgress?(0.95)
@@ -104,7 +109,7 @@ extension APIClient {
                 throw APIError.networkError(error.localizedDescription)
             }
         }
-        
+
         guard let http = finalResponse as? HTTPURLResponse else {
             throw APIError.networkError("Invalid response type")
         }
@@ -124,65 +129,10 @@ extension APIClient {
             throw APIError.decodingError(error.localizedDescription)
         }
     }
-    
-    /// Streams a file upload through URLSession using Apple's bound streams (`Stream.getBoundStreams`)
-    /// so files under 2 MB emit smooth 32 KB chunk progress instead of CFNetwork's coarse 1–2 MB jumps.
-    private static func uploadViaStreamedURLSession(
-        request: URLRequest,
-        fileURL: URL,
-        onProgress: (@Sendable (Double) -> Void)?
-    ) async throws -> (Data, URLResponse) {
-        let totalBytes = ((try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.size] as? NSNumber)?.int64Value ?? 0
-        guard totalBytes > 0 else {
-            return try await uploadViaDemoURLSession(request: request, fileURL: fileURL, onProgress: onProgress)
-        }
-        
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 600
-        config.httpShouldSetCookies = false
-        config.protocolClasses = [DemoURLProtocol.self] + (config.protocolClasses ?? [])
-        
-        let reporter = UploadProgressReporter(onProgress: onProgress)
-        let delegate = UploadProgressDelegate(reporter: reporter)
-        let streamer: BoundedFileUploadStream
-        do {
-            streamer = try BoundedFileUploadStream(
-                fileURL: fileURL,
-                totalBytes: totalBytes,
-                pipeBufferSize: 16 * 1024,
-                readChunkSize: 32 * 1024,
-                reporter: reporter
-            )
-        } catch {
-            throw APIError.networkError(error.localizedDescription)
-        }
-        
-        var streamedRequest = request
-        streamedRequest.setValue("\(totalBytes)", forHTTPHeaderField: "Content-Length")
-        streamedRequest.httpBodyStream = streamer.inputStream
-        
-        let session = URLSession(configuration: config)
-        defer {
-            streamer.cancel()
-            session.finishTasksAndInvalidate()
-        }
-        
-        streamer.start()
-        do {
-            return try await withTaskCancellationHandler {
-                try await session.data(for: streamedRequest, delegate: delegate)
-            } onCancel: {
-                streamer.cancel()
-            }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw APIError.networkError(error.localizedDescription)
-        }
-    }
-    
-    private static func uploadViaDemoURLSession(
+
+    /// Streams a file directly from disk via `URLSession.upload(for:fromFile:delegate:)`,
+    /// preserving automatic stream rewinding across HTTP/2, Cloudflare edges, and system VPN/proxies.
+    private static func uploadViaURLSession(
         request: URLRequest,
         fileURL: URL,
         onProgress: (@Sendable (Double) -> Void)?
@@ -196,6 +146,7 @@ extension APIClient {
         let delegate = UploadProgressDelegate(reporter: reporter)
         let session = URLSession(configuration: config)
         defer { session.finishTasksAndInvalidate() }
+        onProgress?(0.05)
         do {
             return try await session.upload(for: request, fromFile: fileURL, delegate: delegate)
         } catch is CancellationError {
@@ -211,15 +162,15 @@ extension APIClient {
 nonisolated private final class UploadProgressReporter: Sendable {
     private let onProgress: (@Sendable (Double) -> Void)?
     private let lastPercent = OSAllocatedUnfairLock(initialState: -1)
-    
+
     init(onProgress: (@Sendable (Double) -> Void)?) {
         self.onProgress = onProgress
     }
-    
+
     func report(bytesSent: Int64, totalBytes: Int64) {
         guard totalBytes > 0, bytesSent > 0 else { return }
         let raw = max(0, min(1, Double(bytesSent) / Double(totalBytes)))
-        let scaled = min(0.95, raw * 0.95)
+        let scaled = min(0.95, max(0.05, raw * 0.95))
         let percent = Int((scaled * 100).rounded(.down))
         let shouldEmit = lastPercent.withLock { last -> Bool in
             if percent > last {
@@ -236,134 +187,13 @@ nonisolated private final class UploadProgressReporter: Sendable {
 
 nonisolated private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     private let reporter: UploadProgressReporter
-    
+
     init(reporter: UploadProgressReporter) {
         self.reporter = reporter
     }
-    
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard totalBytesExpectedToSend > 0 else { return }
         reporter.report(bytesSent: totalBytesSent, totalBytes: totalBytesExpectedToSend)
-    }
-}
-
-/// Streams a local file into an `InputStream` backed by `Stream.getBoundStreams`,
-/// reporting drained bytes in small chunks while respecting TCP back-pressure from `URLSession`.
-nonisolated private final class BoundedFileUploadStream: NSObject, StreamDelegate, @unchecked Sendable {
-    let inputStream: InputStream
-    private let outputStream: OutputStream
-    private let fileHandle: FileHandle
-    private let totalBytes: Int64
-    private let pipeBufferSize: Int
-    private let readChunkSize: Int
-    private let reporter: UploadProgressReporter
-    private let queue = DispatchQueue(label: "com.antigravity.mobile.attachment-upload-stream", qos: .userInitiated)
-    
-    private var bytesWritten: Int64 = 0
-    private var pendingBuffer = Data()
-    private var pendingOffset = 0
-    private var eof = false
-    private var isFinished = false
-    
-    init(
-        fileURL: URL,
-        totalBytes: Int64,
-        pipeBufferSize: Int,
-        readChunkSize: Int,
-        reporter: UploadProgressReporter
-    ) throws {
-        self.fileHandle = try FileHandle(forReadingFrom: fileURL)
-        self.totalBytes = totalBytes
-        self.pipeBufferSize = pipeBufferSize
-        self.readChunkSize = readChunkSize
-        self.reporter = reporter
-        var boundInput: InputStream?
-        var boundOutput: OutputStream?
-        Stream.getBoundStreams(withBufferSize: pipeBufferSize, inputStream: &boundInput, outputStream: &boundOutput)
-        guard let input = boundInput, let output = boundOutput else {
-            try? fileHandle.close()
-            throw URLError(.cannotOpenFile)
-        }
-        self.inputStream = input
-        self.outputStream = output
-        super.init()
-        self.outputStream.delegate = self
-    }
-    
-    func start() {
-        queue.async { [self] in
-            guard !isFinished else { return }
-            CFWriteStreamSetDispatchQueue(outputStream, queue)
-            outputStream.open()
-        }
-    }
-    
-    func cancel() {
-        queue.async { [self] in
-            finish()
-        }
-    }
-    
-    private func finish() {
-        guard !isFinished else { return }
-        isFinished = true
-        outputStream.delegate = nil
-        outputStream.close()
-        CFWriteStreamSetDispatchQueue(outputStream, nil)
-        try? fileHandle.close()
-    }
-    
-    func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
-        switch eventCode {
-        case .hasSpaceAvailable:
-            pump()
-        case .errorOccurred, .endEncountered:
-            finish()
-        default:
-            break
-        }
-    }
-    
-    private func pump() {
-        guard !isFinished else { return }
-        while outputStream.hasSpaceAvailable {
-            if pendingOffset >= pendingBuffer.count {
-                if eof {
-                    finish()
-                    return
-                }
-                do {
-                    if let chunk = try fileHandle.read(upToCount: readChunkSize), !chunk.isEmpty {
-                        pendingBuffer = chunk
-                        pendingOffset = 0
-                    } else {
-                        eof = true
-                        finish()
-                        return
-                    }
-                } catch {
-                    finish()
-                    return
-                }
-            }
-            let remaining = pendingBuffer.count - pendingOffset
-            let written = pendingBuffer.withUnsafeBytes { raw -> Int in
-                guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return -1 }
-                return outputStream.write(base.advanced(by: pendingOffset), maxLength: remaining)
-            }
-            if written > 0 {
-                pendingOffset += written
-                bytesWritten += Int64(written)
-                // Subtract the initial pipe buffer so progress stays at 0% during TCP/TLS handshake
-                // and starts advancing once URLSession actually pulls bytes out of the pipe.
-                let drained = bytesWritten - Int64(pipeBufferSize)
-                if drained > 0 {
-                    reporter.report(bytesSent: drained, totalBytes: totalBytes)
-                }
-            } else {
-                if written < 0 { finish() }
-                return
-            }
-        }
     }
 }

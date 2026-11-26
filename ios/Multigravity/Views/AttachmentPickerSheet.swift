@@ -365,6 +365,7 @@ struct AttachmentPickerSheet: View {
     let onOpenCamera: () -> Void
     let onOpenDocumentScanner: () -> Void
     let onFilesPicked: ([URL]) -> Void
+    var onOpenFilePicker: (() -> Void)? = nil
     var onOpenMentionPicker: (() -> Void)? = nil
     var onOpenWorkflowTemplates: (() -> Void)? = nil
 
@@ -402,8 +403,8 @@ struct AttachmentPickerSheet: View {
             allowsMultipleSelection: true
         ) { result in
             if case .success(let urls) = result, !urls.isEmpty {
-                dismiss()
                 onFilesPicked(urls)
+                dismiss()
             }
         }
         .fullScreenCover(item: $previewLaunchState) { state in
@@ -739,7 +740,12 @@ struct AttachmentPickerSheet: View {
     private var fileTile: some View {
         quickActionTile(icon: .paperclip, title: String(localized: "文件")) {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            showFileImporter = true
+            if let onOpenFilePicker {
+                dismiss()
+                onOpenFilePicker()
+            } else {
+                showFileImporter = true
+            }
         }
     }
     
