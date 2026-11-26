@@ -206,8 +206,10 @@ public final class PushNotificationManager: NSObject {
 
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.ambient, options: [.mixWithOthers])
-            try session.setActive(true)
+            if !BackgroundKeepAliveManager.shared.isExclusiveInAppAudioActive {
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try session.setActive(true)
+            }
             let player = try AVAudioPlayer(contentsOf: url)
             player.prepareToPlay()
             player.play()

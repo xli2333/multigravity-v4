@@ -9,18 +9,11 @@ import os
 public final class RelayPoolResolver: Sendable {
     public static let shared = RelayPoolResolver()
 
-    public static let defaultPoolURL = URL(string: "https://dispatcher.jiuge.space/api/relay/pool")!
-
     public struct PoolNode: Decodable, Sendable {
         public let id: String
         public let region: String
         public let priority: Int?
         public let host_template: String
-    }
-
-    private struct PoolManifest: Decodable, Sendable {
-        let pool_version: Int?
-        let nodes: [PoolNode]?
     }
 
     private struct CacheState {
@@ -60,45 +53,10 @@ public final class RelayPoolResolver: Sendable {
         return suffixes.contains { clean.hasSuffix($0) }
     }
 
-    /// Fetches (or returns 60s-cached) pool node templates from the dispatcher Worker.
+    /// Self-hosted mode: third-party relay pool discovery (`dispatcher.jiuge.space`) is disabled
+    /// so zero network traffic ever leaves the user's own Cloudflare / LAN endpoints.
     public func fetchPoolNodes(forceRefresh: Bool = false) async -> [PoolNode] {
-        let cached = cacheLock.withLock { state -> [PoolNode]? in
-            if !forceRefresh && !state.nodes.isEmpty && Date().timeIntervalSince(state.fetchedAt) < 60 {
-                return state.nodes
-            }
-            return nil
-        }
-        if let cached { return cached }
-
-        var req = URLRequest(url: Self.defaultPoolURL)
-        req.httpMethod = "GET"
-        req.timeoutInterval = 4.0
-
-        do {
-            let (data, resp) = try await NetworkTransport.shared.send(request: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                return cacheLock.withLock { $0.nodes }
-            }
-            let manifest = try JSONDecoder().decode(PoolManifest.self, from: data)
-            let nodes = manifest.nodes ?? []
-            var suffixes = Set<String>()
-            for node in nodes {
-                if let dotIdx = node.host_template.firstIndex(of: ".") {
-                    let suffix = String(node.host_template[dotIdx...]).lowercased()
-                    if suffix.count > 2 {
-                        suffixes.insert(suffix)
-                    }
-                }
-            }
-            cacheLock.withLock { state in
-                state.nodes = nodes
-                state.fetchedAt = Date()
-                state.trustedSuffixes.formUnion(suffixes)
-            }
-            return nodes
-        } catch {
-            return cacheLock.withLock { $0.nodes }
-        }
+        return []
     }
 
     /// Discovers which VPS node in `RELAY_POOL` currently serves this paired gateway.

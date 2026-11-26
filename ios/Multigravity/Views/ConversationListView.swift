@@ -1419,14 +1419,25 @@ public struct ConversationListView: View {
     private func handleScenePhaseChange(_ newPhase: ScenePhase) {
         if newPhase == .active {
             if AppSettings.shared.isPaired {
+                BackgroundKeepAliveManager.shared.refreshKeepAliveState()
                 viewModel.startAutoRefresh()
                 Task {
                     await viewModel.resumeActive()
                     await ProjectCacheManager.shared.fetchAndCacheProjects()
                 }
             }
+        } else if newPhase == .inactive {
+            if AppSettings.shared.isPaired && AppSettings.shared.enableLiveActivities {
+                let nonDraft = viewModel.conversations.filter { !$0.isDraft && !$0.isSubagent }
+                ActivityManager.shared.syncWithConversations(nonDraft)
+            }
         } else if newPhase == .background {
-            viewModel.stopAutoRefresh()
+            if BackgroundKeepAliveManager.shared.shouldKeepAlive {
+                BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+                viewModel.startAutoRefresh()
+            } else {
+                viewModel.stopAutoRefresh()
+            }
         }
     }
     
@@ -1448,6 +1459,8 @@ public struct ConversationListView: View {
     private func handleTokenRevoked() {
         isPairingInProgress = false
         settings.unpair()
+        LocalAlertWatcher.shared.resetForUnpair()
+        BackgroundKeepAliveManager.shared.refreshKeepAliveState()
         viewModel.stopAutoRefresh()
         viewModel.conversations.removeAll()
         viewModel.selectedWorkspaceFilter = nil
@@ -1479,6 +1492,11 @@ public struct ConversationListView: View {
             do {
                 _ = try await PairingService.shared.pair(with: info)
                 settings.refreshPairedState()
+                LocalAlertWatcher.shared.resetForUnpair()
+                BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+                if settings.enablePushNotifications && !settings.isDemoMode {
+                    _ = await PushNotificationManager.shared.requestAuthorizationAndRegister()
+                }
                 viewModel.startAutoRefresh()
                 await viewModel.fetchConversations()
                 await ProjectCacheManager.shared.fetchAndCacheProjects()

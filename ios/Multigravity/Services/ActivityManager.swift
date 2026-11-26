@@ -566,9 +566,10 @@ public final class ActivityManager {
             }
         }
 
-        // 3. Ensure the allowed working sessions have 1 dedicated Live Activity when app is in foreground
+        // 3. Ensure the allowed working sessions have 1 dedicated Live Activity when app is active, transitioning, or holding keep-alive
+        let canAttemptStart = UIApplication.shared.applicationState != .background || BackgroundKeepAliveManager.shared.isRunningKeepAlive
         for item in working.prefix(Self.maxConcurrentCards) {
-            guard UIApplication.shared.applicationState == .active else { continue }
+            guard canAttemptStart else { continue }
             guard !locallyDismissedCascadeIds.contains(item.id) else { continue }
             if findActiveActivity(for: item.id) == nil {
                 let status = item.status.needsAction ? "WAITING_APPROVAL" : "RUNNING"

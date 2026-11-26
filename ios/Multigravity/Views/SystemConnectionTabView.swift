@@ -829,6 +829,13 @@ public struct SystemConnectionTabView: View {
                     pushManager.syncPreferencesWithGateway()
                 }
 
+            Toggle("后台长连接保活（静音零打扰）", isOn: $settings.enableBackgroundKeepAlive)
+                .font(.system(size: 12.5, weight: .medium))
+                .tint(AGPalette.accentFill(colorScheme))
+                .onChange(of: settings.enableBackgroundKeepAlive) { _, _ in
+                    BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+                }
+
             Toggle("实时双工语音通话模式", isOn: $settings.enableVoiceMode)
                 .font(.system(size: 12.5, weight: .medium))
                 .tint(AGPalette.accentFill(colorScheme))

@@ -285,6 +285,12 @@ public struct SettingsSheet: View {
                             pushManager.syncPreferencesWithGateway()
                         }
 
+                    Toggle("后台长连接保活（静音零打扰）", isOn: $settings.enableBackgroundKeepAlive)
+                        .onChange(of: settings.enableBackgroundKeepAlive) { _, _ in
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+                        }
+
                     NavigationLink {
                         NotificationSoundSettingsView()
                     } label: {

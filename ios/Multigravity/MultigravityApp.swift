@@ -24,10 +24,23 @@ struct MultigravityApp: App {
                     settings.applyAppearance()
                     ActivityManager.shared.startRemoteTokenObservers()
                     PushNotificationManager.shared.syncAllTokensIfPaired()
+                    BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+                    if settings.isPaired && !settings.isDemoMode && settings.enablePushNotifications {
+                        Task {
+                            await PushNotificationManager.shared.refreshAuthorizationStatus()
+                            if PushNotificationManager.shared.authorizationStatus == .notDetermined {
+                                _ = await PushNotificationManager.shared.requestAuthorizationAndRegister()
+                            }
+                        }
+                    }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     if newPhase == .active {
                         settings.applyAppearance()
+                        BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+                    } else if newPhase == .background {
+                        settings.syncWidgetConfiguration(reloadWidget: true)
+                        BackgroundKeepAliveManager.shared.refreshKeepAliveState()
                     }
                 }
         }

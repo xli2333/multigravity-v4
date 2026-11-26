@@ -68,7 +68,9 @@ nonisolated struct QuotaTimelineProvider: TimelineProvider {
 
         // Synchronous <1ms fast-path: whenever the main app or a recent refresh synced within 15 minutes,
         // deliver the timeline immediately without spawning async tasks or waiting on network I/O.
-        if let cachedQuota, now.timeIntervalSince(cachedQuota.syncedAt) < 15 * 60 {
+        let quotaFresh = cachedQuota.map { now.timeIntervalSince($0.syncedAt) < 15 * 60 } ?? false
+        let convsFresh = cachedConvs.map { now.timeIntervalSince($0.syncedAt) < 15 * 60 } ?? false
+        if quotaFresh, let cachedQuota, (!needsConversations || convsFresh) {
             let entry = QuotaWidgetEntry(
                 date: now,
                 snapshot: cachedQuota,
@@ -1065,7 +1067,7 @@ private struct WidgetQuotaMetricCell: View {
 
 /// Pure `Shape`-based progress bar fill that avoids `GeometryReader` completely,
 /// preventing `SwiftUICore` `GeometryReaderLayout.placeSubviews` fatal assertions during WidgetKit timeline archival.
-nonisolated private struct QuotaBarFillShape: Shape {
+nonisolated struct QuotaBarFillShape: Shape {
     let fraction: CGFloat
 
     func path(in rect: CGRect) -> Path {

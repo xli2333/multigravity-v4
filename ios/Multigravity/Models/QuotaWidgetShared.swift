@@ -10,6 +10,7 @@ nonisolated public enum QuotaWidgetConstants {
     public static let appGroupID = "group.com.ghsaimo.antigravity"
     public static let widgetKind = "QuotaStatusWidget"
     public static let agentWidgetKind = "AgentStatusWidget"
+    public static let overviewWidgetKind = "WorkOverviewWidget"
     public static let deepLinkURL = URL(string: "antigravity://quota")!
     public static let conversationsDeepLinkURL = URL(string: "antigravity://conversations")!
     public static let snapshotFileName = "quota_widget_snapshot.json"
@@ -825,11 +826,99 @@ nonisolated public final class QuotaWidgetStore: Sendable {
     public static let shared = QuotaWidgetStore()
 
     private let lastConversationsReloadLock = OSAllocatedUnfairLock<Date?>(initialState: nil)
+    private let resolvedGroupLock = OSAllocatedUnfairLock<(resolved: Bool, groupID: String?, url: URL?)>(initialState: (false, nil, nil))
 
     private init() {}
 
+    /// Dynamically discovers the active App Group container so both official builds (`group.com.ghsaimo.antigravity`)
+    /// and re-signed builds (e.g. OmniSign / ESign / custom Bundle ID provisioning profiles) share the exact same container.
+    private static func extractProvisionedAppGroups(from bundleURL: URL) -> [String] {
+        let profileURL = bundleURL.appendingPathComponent("embedded.mobileprovision")
+        guard let rawData = try? Data(contentsOf: profileURL),
+              let plistStart = rawData.range(of: Data("<plist".utf8)),
+              let plistEnd = rawData.range(of: Data("</plist>".utf8), in: plistStart.lowerBound..<rawData.endIndex) else {
+            return []
+        }
+        let xmlData = rawData.subdata(in: plistStart.lowerBound..<plistEnd.upperBound)
+        guard let obj = try? PropertyListSerialization.propertyList(from: xmlData, format: nil) as? [String: Any],
+              let entitlements = obj["Entitlements"] as? [String: Any],
+              let groups = entitlements["com.apple.security.application-groups"] as? [String] else {
+            return []
+        }
+        return groups
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func resolveSharedContainer() -> (groupID: String?, url: URL?) {
+        var candidates: [String] = []
+        var seen = Set<String>()
+        func appendCandidate(_ id: String?) {
+            guard let trimmed = id?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty,
+                  seen.insert(trimmed).inserted else {
+                return
+            }
+            candidates.append(trimmed)
+        }
+
+        // 1. Exact App Groups declared in the signed bundle's embedded.mobileprovision (works after re-signing)
+        for group in extractProvisionedAppGroups(from: Bundle.main.bundleURL) {
+            appendCandidate(group)
+        }
+        // When running inside an .appex extension (PlugIns/ActivityExtension.appex), also inspect parent .app profile
+        if Bundle.main.bundleURL.pathExtension.lowercased() == "appex" {
+            let parentAppURL = Bundle.main.bundleURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+            for group in extractProvisionedAppGroups(from: parentAppURL) {
+                appendCandidate(group)
+            }
+        }
+
+        // 2. Default project App Group
+        appendCandidate(QuotaWidgetConstants.appGroupID)
+
+        // 3. Derived `group.<baseBundleID>` fallback for signers that map bundle ID -> group.<bundleID>
+        if var bundleID = Bundle.main.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !bundleID.isEmpty {
+            let extSuffixes = [".ActivityExtension", ".watchkitapp.widgets", ".watchkitapp", ".widgets"]
+            for suffix in extSuffixes where bundleID.hasSuffix(suffix) {
+                bundleID = String(bundleID.dropLast(suffix.count))
+                break
+            }
+            appendCandidate("group.\(bundleID)")
+        }
+
+        for candidate in candidates {
+            if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) {
+                return (candidate, url)
+            }
+        }
+        return (nil, nil)
+    }
+
+    public var activeAppGroupID: String? {
+        resolveContainerEntry().groupID
+    }
+
+    public var isSharedContainerAvailable: Bool {
+        resolveContainerEntry().url != nil
+    }
+
+    private func resolveContainerEntry() -> (groupID: String?, url: URL?) {
+        resolvedGroupLock.withLock { state in
+            if state.resolved {
+                return (state.groupID, state.url)
+            }
+            let result = Self.resolveSharedContainer()
+            state = (true, result.groupID, result.url)
+            return result
+        }
+    }
+
     private var containerURL: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: QuotaWidgetConstants.appGroupID)
+        resolveContainerEntry().url
     }
 
     private var snapshotURL: URL? {
@@ -935,6 +1024,7 @@ nonisolated public final class QuotaWidgetStore: Sendable {
     public func reloadWidgetTimelines() {
         WidgetCenter.shared.reloadTimelines(ofKind: QuotaWidgetConstants.widgetKind)
         WidgetCenter.shared.reloadTimelines(ofKind: QuotaWidgetConstants.agentWidgetKind)
+        WidgetCenter.shared.reloadTimelines(ofKind: QuotaWidgetConstants.overviewWidgetKind)
     }
 
     /// Parses gateway ISO8601 timestamps into a `Date` for native WidgetKit ticking countdowns.
@@ -975,8 +1065,31 @@ nonisolated public final class QuotaWidgetStore: Sendable {
         return Data(base64Encoded: s)
     }
 
+    private static func isLocalOrPrivateHost(_ host: String) -> Bool {
+        let lower = host.lowercased()
+        if lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower.hasSuffix(".local") {
+            return true
+        }
+        if lower.hasPrefix("10.") || lower.hasPrefix("192.168.") || lower.hasPrefix("169.254.") {
+            return true
+        }
+        if lower.hasPrefix("172.") {
+            let parts = lower.split(separator: ".")
+            if parts.count >= 2, let second = Int(parts[1]), (16...31).contains(second) {
+                return true
+            }
+        }
+        if lower.hasPrefix("100.") {
+            let parts = lower.split(separator: ".")
+            if parts.count >= 2, let second = Int(parts[1]), (64...127).contains(second) {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Executes a widget HTTP request, automatically encrypting via `POST /api/v1/e2ee/rpc` when
-    /// talking to a `r-*` relay host (or retrying encrypted if the gateway replies HTTP 426).
+    /// talking to a public HTTPS tunnel/relay host (or retrying encrypted if the gateway replies HTTP 426).
     private static func sendWidgetRequest(
         session: URLSession,
         baseURL: URL,
@@ -996,7 +1109,7 @@ nonisolated public final class QuotaWidgetStore: Sendable {
             return (devID, rawKey)
         }()
 
-        func sendEncrypted(deviceID: String, key: Data) async -> Data? {
+        func sendEncrypted(deviceID: String, key: Data) async -> (data: Data?, outerStatus: Int?) {
             struct InnerReq: Encodable {
                 let m: String
                 let p: String
@@ -1021,20 +1134,22 @@ nonisolated public final class QuotaWidgetStore: Sendable {
                       authenticating: Data("mgy-e2ee-v1:\(deviceID):c2s".utf8)
                   ),
                   let combined = sealed.combined else {
-                return nil
+                return (nil, nil)
             }
             let rpcURL = baseURL.appendingPathComponent("api/v1/e2ee/rpc")
             var req = URLRequest(url: rpcURL)
             req.httpMethod = "POST"
-            req.timeoutInterval = 2.8
+            req.timeoutInterval = 6.0
             req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             req.setValue(deviceID, forHTTPHeaderField: "X-Mgy-E2EE-Device")
             req.setValue("bin2,flate", forHTTPHeaderField: "X-Mgy-E2EE-Enc")
             req.httpBody = combined
 
             guard let (encResp, resp) = try? await session.data(for: req),
-                  let http = resp as? HTTPURLResponse,
-                  http.statusCode == 200,
+                  let http = resp as? HTTPURLResponse else {
+                return (nil, nil)
+            }
+            guard http.statusCode == 200,
                   encResp.count >= 28,
                   let box = try? AES.GCM.SealedBox(combined: encResp),
                   let respPlain = try? AES.GCM.open(
@@ -1043,7 +1158,7 @@ nonisolated public final class QuotaWidgetStore: Sendable {
                       authenticating: Data("mgy-e2ee-v1:\(deviceID):s2c".utf8)
                   ),
                   let firstByte = respPlain.first else {
-                return nil
+                return (nil, http.statusCode)
             }
             let status: Int
             let data: Data
@@ -1051,41 +1166,49 @@ nonisolated public final class QuotaWidgetStore: Sendable {
                 let unpacked: Data
                 if firstByte == 0x02 {
                     guard let inflated = try? (Data(respPlain.dropFirst()) as NSData).decompressed(using: .zlib) as Data else {
-                        return nil
+                        return (nil, http.statusCode)
                     }
                     unpacked = inflated
                 } else {
                     unpacked = Data(respPlain.dropFirst())
                 }
-                guard unpacked.count >= 4 else { return nil }
+                guard unpacked.count >= 4 else { return (nil, http.statusCode) }
                 let b = [UInt8](unpacked.prefix(4))
                 let metaLen = (Int(b[0]) << 24) | (Int(b[1]) << 16) | (Int(b[2]) << 8) | Int(b[3])
                 guard metaLen >= 2, 4 + metaLen <= unpacked.count,
                       let meta = try? JSONDecoder().decode(InnerResp.self, from: unpacked.subdata(in: 4..<(4 + metaLen))) else {
-                    return nil
+                    return (nil, http.statusCode)
                 }
                 status = meta.s
                 data = unpacked.subdata(in: (4 + metaLen)..<unpacked.count)
             } else {
                 guard let decoded = try? JSONDecoder().decode(InnerResp.self, from: respPlain) else {
-                    return nil
+                    return (nil, http.statusCode)
                 }
                 status = decoded.s
                 data = decoded.b.flatMap { Data(base64Encoded: $0) } ?? Data()
             }
-            guard (200...299).contains(status) else { return nil }
-            return data.count <= maxExtensionPayloadBytes ? data : nil
+            guard (200...299).contains(status) else { return (nil, status) }
+            return (data.count <= maxExtensionPayloadBytes ? data : nil, status)
         }
 
-        if baseURL.scheme?.lowercased() == "https", host.hasPrefix("r-"), let creds = hasE2EE {
-            return await sendEncrypted(deviceID: creds.deviceID, key: creds.key)
+        // Prefer direct E2EE on public HTTPS hosts (Cloudflare Tunnel / Relay) to avoid a 426 round-trip.
+        if baseURL.scheme?.lowercased() == "https", !isLocalOrPrivateHost(host), let creds = hasE2EE {
+            let result = await sendEncrypted(deviceID: creds.deviceID, key: creds.key)
+            if let data = result.data {
+                return data
+            }
+            // Only fall back to plaintext if the remote endpoint does not implement /api/v1/e2ee/rpc.
+            if host.hasPrefix("r-") || (result.outerStatus != 404 && result.outerStatus != 405) {
+                return nil
+            }
         }
 
         let trimmedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         let endpoint = baseURL.appendingPathComponent(trimmedPath)
         var req = URLRequest(url: endpoint)
         req.httpMethod = method
-        req.timeoutInterval = 2.8
+        req.timeoutInterval = 6.0
         for (k, v) in headers {
             req.setValue(v, forHTTPHeaderField: k)
         }
@@ -1096,7 +1219,7 @@ nonisolated public final class QuotaWidgetStore: Sendable {
             return nil
         }
         if http.statusCode == 426, let creds = hasE2EE {
-            return await sendEncrypted(deviceID: creds.deviceID, key: creds.key)
+            return await sendEncrypted(deviceID: creds.deviceID, key: creds.key).data
         }
         guard (200...299).contains(http.statusCode), data.count <= maxExtensionPayloadBytes else {
             return nil
@@ -1105,7 +1228,8 @@ nonisolated public final class QuotaWidgetStore: Sendable {
     }
 
     /// Lightweight background quota fetch used by WidgetKit timelines inside `ActivityExtension`.
-    /// Races all candidate URLs concurrently with a short 3.2s ceiling so unreachable LAN/tunnel URLs never stall WidgetKit.
+    /// Races all candidate URLs concurrently with a balanced 8.5s ceiling so mobile cellular / Cloudflare Tunnel
+    /// handshakes succeed reliably without hitting WidgetKit extension limits.
     public func fetchLatestQuotaFromGateway() async -> QuotaWidgetSnapshot? {
         guard let config = loadConfig() else {
             return nil
@@ -1121,8 +1245,8 @@ nonisolated public final class QuotaWidgetStore: Sendable {
         }
 
         let sessionConfig = URLSessionConfiguration.ephemeral
-        sessionConfig.timeoutIntervalForRequest = 2.8
-        sessionConfig.timeoutIntervalForResource = 3.2
+        sessionConfig.timeoutIntervalForRequest = 6.0
+        sessionConfig.timeoutIntervalForResource = 8.5
         sessionConfig.waitsForConnectivity = false
         let session = URLSession(configuration: sessionConfig)
         defer { session.invalidateAndCancel() }
@@ -1185,8 +1309,8 @@ nonisolated public final class QuotaWidgetStore: Sendable {
         }
 
         let sessionConfig = URLSessionConfiguration.ephemeral
-        sessionConfig.timeoutIntervalForRequest = 2.8
-        sessionConfig.timeoutIntervalForResource = 3.2
+        sessionConfig.timeoutIntervalForRequest = 6.0
+        sessionConfig.timeoutIntervalForResource = 8.5
         sessionConfig.waitsForConnectivity = false
         let session = URLSession(configuration: sessionConfig)
         defer { session.invalidateAndCancel() }
@@ -1592,7 +1716,7 @@ nonisolated public struct RefreshAgentStatusWidgetIntent: AppIntent {
 
     public func perform() async throws -> some IntentResult {
         _ = await QuotaWidgetStore.shared.fetchLatestConversationsFromGateway()
-        WidgetCenter.shared.reloadTimelines(ofKind: QuotaWidgetConstants.agentWidgetKind)
+        QuotaWidgetStore.shared.reloadWidgetTimelines()
         return .result()
     }
 }

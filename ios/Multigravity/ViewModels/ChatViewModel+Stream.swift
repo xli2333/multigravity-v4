@@ -501,6 +501,10 @@ extension ChatViewModel {
             disconnectStream()
             return
         }
+        // When silent background keep-alive is active, keep running/pending session streams connected seamlessly.
+        if BackgroundKeepAliveManager.shared.shouldKeepAlive && (isActivelyRunning || pendingInteraction != nil || canProceed) {
+            return
+        }
         // Avoid duplicate registration when both scenePhase and UIApplication notification fire together
         guard backgroundTaskId == .invalid else { return }
 

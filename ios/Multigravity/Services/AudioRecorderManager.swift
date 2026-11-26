@@ -158,7 +158,7 @@ public final class AudioRecorderManager: NSObject, ObservableObject, AVAudioReco
         isRecording = false
         isPaused = false
         ActivityManager.shared.endRecordingActivity()
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        BackgroundKeepAliveManager.shared.restoreAfterExclusiveAudio()
         NotificationCenter.default.post(name: .conversationDraftChanged, object: finishedCascadeId)
         return currentFileURL
     }
@@ -176,7 +176,7 @@ public final class AudioRecorderManager: NSObject, ObservableObject, AVAudioReco
             try? FileManager.default.removeItem(at: url)
         }
         currentFileURL = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        BackgroundKeepAliveManager.shared.restoreAfterExclusiveAudio()
         NotificationCenter.default.post(name: .conversationDraftChanged, object: canceledCascadeId)
     }
     

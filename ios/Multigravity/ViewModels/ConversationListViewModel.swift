@@ -311,7 +311,22 @@ public final class ConversationListViewModel {
     
     public func startAutoRefresh() {
         guard settings.isPaired else { return }
-        guard pollTask == nil else { return }
+        BackgroundKeepAliveManager.shared.onWakeCheck = { [weak self] in
+            guard let self, self.settings.isPaired else { return }
+            self.eventsClient.reconnectIfStale(maxAge: 15)
+            Task { await self.fetchConversations(isBackgroundPoll: true) }
+        }
+        BackgroundKeepAliveManager.shared.onHeartbeatTick = { [weak self] in
+            guard let self, self.settings.isPaired else { return }
+            self.eventsClient.reconnectIfStale(maxAge: 18)
+            if !self.eventsClient.isConnected || LocalAlertWatcher.shared.hasActiveTrackedWork {
+                Task { await self.fetchConversations(isBackgroundPoll: true) }
+            }
+        }
+        guard pollTask == nil else {
+            eventsClient.reconnectIfStale(maxAge: 15)
+            return
+        }
         eventsClient.onChange = { [weak self] in
             guard let self else { return }
             Task { await self.fetchConversations(isBackgroundPoll: true) }
@@ -330,8 +345,15 @@ public final class ConversationListViewModel {
             while !Task.isCancelled {
                 guard let self else { break }
                 let connectedAtStart = self.eventsClient.isConnected
-                let hasRunning = self.conversations.contains(where: { $0.status.isRunning || $0.status.needsAction })
-                let waitSeconds = connectedAtStart ? Self.eventsSafetyPollSeconds : (hasRunning ? 4 : 10)
+                let hasRunning = self.conversations.contains(where: {
+                    $0.status.isRunning || $0.status.needsAction || $0.hasRunningTasks || $0.hasRunningSubagents
+                }) || LocalAlertWatcher.shared.hasActiveTrackedWork
+                let waitSeconds: Int
+                if hasRunning {
+                    waitSeconds = connectedAtStart ? 3 : 2
+                } else {
+                    waitSeconds = connectedAtStart ? 30 : 10
+                }
                 try? await Task.sleep(nanoseconds: UInt64(waitSeconds) * 1_000_000_000)
                 guard !Task.isCancelled else { break }
                 guard self.settings.isPaired else { break }
@@ -420,6 +442,9 @@ public final class ConversationListViewModel {
             cacheManager.prewarmSessions(for: all.prefix(15).map(\.id))
             ActivityManager.shared.syncWithConversations(nonDraftEnriched)
             QuotaWidgetStore.shared.publishConversationsFromApp(items: nonDraftEnriched, isDemo: settings.isDemoMode)
+            Task {
+                await LocalAlertWatcher.shared.scan(conversations: nonDraftEnriched, baseURL: url)
+            }
             self.isLoading = false
         } catch {
             // Auto-failover: if current endpoint failed, probe candidate endpoints and retry once with alternative
@@ -459,6 +484,9 @@ public final class ConversationListViewModel {
                     cacheManager.prewarmSessions(for: all.prefix(15).map(\.id))
                     ActivityManager.shared.syncWithConversations(nonDraftEnriched)
                     QuotaWidgetStore.shared.publishConversationsFromApp(items: nonDraftEnriched, isDemo: settings.isDemoMode)
+                    Task {
+                        await LocalAlertWatcher.shared.scan(conversations: nonDraftEnriched, baseURL: retryURL)
+                    }
                     self.isLoading = false
                     self.errorMessage = nil
                     await fetchQuotas()
@@ -525,6 +553,7 @@ public final class ConversationListViewModel {
     @MainActor
     public func publishQuotaToWidget() {
         settings.syncWidgetConfiguration(reloadWidget: false)
+        LocalAlertWatcher.shared.observeQuota(quotaResponse)
         let emailMasked = UserDefaults.standard.bool(forKey: "cockpit_email_masked")
         QuotaWidgetStore.shared.publishFromApp(
             response: quotaResponse,

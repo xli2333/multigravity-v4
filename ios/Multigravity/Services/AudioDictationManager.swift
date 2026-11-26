@@ -44,12 +44,14 @@ public final class AudioDictationManager {
 
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onError = onError
+        BackgroundKeepAliveManager.shared.setDictatingActive(true)
 
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetoothHFP])
             try session.setActive(true)
         } catch {
+            BackgroundKeepAliveManager.shared.setDictatingActive(false)
             onError(String(localized: "无法配置音频会话: \(error.localizedDescription)"))
             return
         }
@@ -124,7 +126,7 @@ public final class AudioDictationManager {
             engine.stop()
         }
         audioEngine = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        BackgroundKeepAliveManager.shared.setDictatingActive(false)
 
         if let ws = webSocketTask, isReceiving {
             ws.send(.string("{\"type\":\"end\"}")) { [weak self] _ in
@@ -258,6 +260,7 @@ public final class NarrationAudioPlayer: NSObject, AVAudioPlayerDelegate, AVSpee
         guard !cleaned.isEmpty else { return }
         stop()
         isPlaying = true
+        BackgroundKeepAliveManager.shared.setNarrationActive(true)
         statusLabel = String(localized: "正在合成语音…")
 
         playTask = Task {
@@ -290,8 +293,12 @@ public final class NarrationAudioPlayer: NSObject, AVAudioPlayerDelegate, AVSpee
         audioPlayer = nil
         synthesizer?.stopSpeaking(at: .immediate)
         synthesizer = nil
+        let wasPlaying = isPlaying
         isPlaying = false
         statusLabel = ""
+        if wasPlaying {
+            BackgroundKeepAliveManager.shared.setNarrationActive(false)
+        }
     }
 
     private func speakWithSystemTTS(_ text: String) {

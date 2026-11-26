@@ -387,7 +387,13 @@ struct MessageShareCardView: View {
         return CGSize(width: w * scale, height: h * scale)
     }
 
-    static let landingURL = "https://mgy.jiuge.space"
+    static var landingURL: String {
+        if let raw = UserDefaults.standard.string(forKey: "antigravity.primary_cloud_url"),
+           !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return raw
+        }
+        return "https://antigravity.google"
+    }
 
     private static let qrImage: UIImage? = {
         let filter = CIFilter.qrCodeGenerator()

@@ -14,10 +14,16 @@ import os
 public final class CloudflareAnycastAccelerator: @unchecked Sendable {
     public static let shared = CloudflareAnycastAccelerator()
 
-    nonisolated private static let probeHost = "dispatcher.jiuge.space"
-    nonisolated private static let probeRequestData = Data(
-        "GET /cdn-cgi/trace HTTP/1.1\r\nHost: dispatcher.jiuge.space\r\nUser-Agent: Multigravity-Probe/1.0\r\nConnection: close\r\n\r\n".utf8
-    )
+    nonisolated private static var resolvedProbeHost: String {
+        if let raw = UserDefaults.standard.string(forKey: "antigravity.primary_cloud_url"),
+           let url = URL(string: raw),
+           let host = url.host?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased(),
+           !host.isEmpty,
+           !NetworkTransport.isLocalOrPrivateHost(host) {
+            return host
+        }
+        return "cp.cloudflare.com"
+    }
     nonisolated private static let probeTimeoutSeconds: TimeInterval = 1.8
     nonisolated private static let banTTLSeconds: TimeInterval = 24 * 60 * 60
 
@@ -89,14 +95,18 @@ public final class CloudflareAnycastAccelerator: @unchecked Sendable {
 
     public static func isCloudflareTunnelHost(_ host: String) -> Bool {
         let clean = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
-        if clean == "jiuge.space" || clean.hasSuffix(".trycloudflare.com") {
+        if clean.isEmpty || NetworkTransport.isLocalOrPrivateHost(clean) {
+            return false
+        }
+        if clean.hasSuffix(".trycloudflare.com") {
             return true
         }
-        // Only 1st-level *.jiuge.space subdomains (3 DNS labels) are Cloudflare Orange-Cloud proxied;
-        // 2nd-level regional VPS subdomains (e.g. r-xxxx.jp1.jiuge.space, >=4 labels) use direct DNS.
-        if clean.hasSuffix(".jiuge.space") {
-            let labels = clean.split(separator: ".")
-            return labels.count == 3
+        if let raw = UserDefaults.standard.string(forKey: "antigravity.primary_cloud_url"),
+           let url = URL(string: raw),
+           let configuredHost = url.host?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased(),
+           !configuredHost.isEmpty,
+           clean == configuredHost {
+            return true
         }
         return false
     }
@@ -255,9 +265,12 @@ public final class CloudflareAnycastAccelerator: @unchecked Sendable {
     }
 
     nonisolated private static func probeHTTPTrace(ip: String, timeoutSeconds: TimeInterval) async -> ProbeResult {
-        let requestData = Self.probeRequestData
+        let hostHeader = Self.resolvedProbeHost
+        let requestData = Data(
+            "GET /cdn-cgi/trace HTTP/1.1\r\nHost: \(hostHeader)\r\nUser-Agent: Multigravity-Probe/1.0\r\nConnection: close\r\n\r\n".utf8
+        )
         let tlsOptions = NWProtocolTLS.Options()
-        sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, Self.probeHost)
+        sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, hostHeader)
         let params = NWParameters(tls: tlsOptions)
         params.preferNoProxies = true
 

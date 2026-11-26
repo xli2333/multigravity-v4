@@ -499,7 +499,7 @@ public final class VoiceCallManager: ObservableObject {
         audioEngine = nil
         playbackFormat = nil
         pendingPlaybackBuffers = 0
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        BackgroundKeepAliveManager.shared.restoreAfterExclusiveAudio()
     }
 
     private func enqueuePCM24k(_ pcmData: Data) {

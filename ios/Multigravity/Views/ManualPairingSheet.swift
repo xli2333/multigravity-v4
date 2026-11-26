@@ -310,10 +310,7 @@ public struct ManualPairingSheet: View {
         
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         
-        var effectiveHost = trimmedHost
-        if !effectiveHost.contains(".") && !effectiveHost.contains(":") && effectiveHost.lowercased() != "localhost" {
-            effectiveHost = "\(effectiveHost).jiuge.space"
-        }
+        let effectiveHost = trimmedHost
         
         let info = PairingInfo(
             host: effectiveHost,

@@ -197,16 +197,19 @@ public final class PairingService: Sendable {
         }
         let validPort = port ?? 443
         
-        // Auto-expand compressed subdomain (e.g. 825a5a50 -> 825a5a50.jiuge.space)
+        // Expand bare 8-hex machine IDs only if another user pairs a default mgy node;
+        // custom domains (e.g. Cloudflare Tunnels) and IPs already contain '.' or ':' and are untouched.
         var validHost = rawHost
-        if !validHost.contains(".") && !validHost.contains(":") && validHost.lowercased() != "localhost" {
+        if !validHost.contains(".") && !validHost.contains(":") && validHost.lowercased() != "localhost",
+           validHost.count >= 6 && validHost.count <= 16 && validHost.allSatisfy({ $0.isHexDigit }) {
             validHost = "\(validHost).jiuge.space"
         }
         
         let effectiveSSL = sslExplicit ?? (validPort == 443 || (!validHost.hasPrefix("192.168.") && !validHost.hasPrefix("10.") && !validHost.hasPrefix("127.")))
         
         var validRelay = relayHost?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let r = validRelay, !r.isEmpty, !r.contains("."), !r.contains(":"), r.lowercased() != "localhost" {
+        if let r = validRelay, !r.isEmpty, !r.contains("."), !r.contains(":"), r.lowercased() != "localhost",
+           r.count >= 6 && r.count <= 16 && r.allSatisfy({ $0.isHexDigit }) {
             validRelay = "\(r).jiuge.space"
         }
         

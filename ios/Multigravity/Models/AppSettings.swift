@@ -60,6 +60,7 @@ public final class AppSettings {
     private let activeServerURLKey = "antigravity.active_server_url"
     private let enableLiveActivityKey = "antigravity.enable_live_activity"
     private let enablePushNotificationsKey = "antigravity.enable_push_notifications"
+    private let enableBackgroundKeepAliveKey = "antigravity.enable_background_keep_alive"
     private let notificationCompleteSoundKey = "antigravity.notification_complete_sound"
     private let notificationActionSoundKey = "antigravity.notification_action_sound"
     private let activeModelKey = "antigravity.active_model"
@@ -237,12 +238,28 @@ public final class AppSettings {
     public var enableLiveActivities: Bool {
         didSet {
             UserDefaults.standard.set(enableLiveActivities, forKey: enableLiveActivityKey)
+            Task { @MainActor in
+                BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+            }
         }
     }
 
     public var enablePushNotifications: Bool {
         didSet {
             UserDefaults.standard.set(enablePushNotifications, forKey: enablePushNotificationsKey)
+            Task { @MainActor in
+                BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+            }
+        }
+    }
+
+    /// 后台静音长连接保活（默认开启，使用 `.playback` + `[.mixWithOthers]` 零打扰保持 WebSocket 在线并触发本地推送与灵动岛）
+    public var enableBackgroundKeepAlive: Bool {
+        didSet {
+            UserDefaults.standard.set(enableBackgroundKeepAlive, forKey: enableBackgroundKeepAliveKey)
+            Task { @MainActor in
+                BackgroundKeepAliveManager.shared.refreshKeepAliveState()
+            }
         }
     }
 
@@ -846,6 +863,8 @@ public final class AppSettings {
         self.enableLiveActivities = savedLive
         let savedPush = UserDefaults.standard.object(forKey: enablePushNotificationsKey) as? Bool ?? true
         self.enablePushNotifications = savedPush
+        let savedKeepAlive = UserDefaults.standard.object(forKey: enableBackgroundKeepAliveKey) as? Bool ?? true
+        self.enableBackgroundKeepAlive = savedKeepAlive
         let savedCompleteSound = UserDefaults.standard.string(forKey: notificationCompleteSoundKey).flatMap { $0.isEmpty ? nil : $0 } ?? "glass"
         self.notificationCompleteSound = NotificationSoundOption.completeOptions.contains(where: { $0.id == savedCompleteSound }) ? savedCompleteSound : "glass"
         let savedActionSound = UserDefaults.standard.string(forKey: notificationActionSoundKey).flatMap { $0.isEmpty ? nil : $0 } ?? "alarm"
