@@ -312,7 +312,7 @@ public final class WatchSyncManager: NSObject {
                 return Self.makeApprovalSummary(from: pi)
             }
             if snap.canProceed, let uri = snap.proceedArtifactUri, !uri.isEmpty {
-                let fileName = uri.split(separator: "/").last.map(String.init) ?? snap.title
+                let fileName = uri.split(separator: "/").last.map(String.init) ?? snap.title ?? cascadeId
                 return WatchPendingApprovalSummary(
                     stepIndex: nil,
                     kind: "proceed",
@@ -341,9 +341,10 @@ public final class WatchSyncManager: NSObject {
         let wsName = latestConversations.first(where: { $0.id == cascadeId })?.workspaceName
             ?? CacheManager.shared.loadSession(for: cascadeId)?.workspaceName
             ?? "Chat"
-        let resolvedTitle = snap.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let trimmedSnapTitle = (snap.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTitle = trimmedSnapTitle.isEmpty
             ? (latestConversations.first(where: { $0.id == cascadeId })?.title ?? String(localized: "未命名会话"))
-            : snap.title
+            : trimmedSnapTitle
 
         return WatchConversationDetail(
             cascadeId: cascadeId,
