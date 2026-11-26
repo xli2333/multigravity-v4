@@ -38,9 +38,9 @@ public final class ModelSlidePickerState {
         static let defaultRowSpacing: CGFloat = 3
         static let compactRowSpacing: CGFloat = 2
         static let cardPadding: CGFloat = 7
-        static let cardMinWidth: CGFloat = 264
-        static let cardMaxWidth: CGFloat = 304
-        static let sliderSectionHeight: CGFloat = 74
+        static let cardMinWidth: CGFloat = 268
+        static let cardMaxWidth: CGFloat = 308
+        static let sliderSectionHeight: CGFloat = 68
         static let gapBetweenButtonAndMenu: CGFloat = 8
         static let horizontalMargin: CGFloat = 12
         static let topSafeMargin: CGFloat = 12
@@ -379,8 +379,8 @@ public struct ModelSlidePickerOverlay: View {
 
     private var tierLabelColor: Color {
         colorScheme == .dark
-            ? Color(red: 0.54, green: 0.58, blue: 1.00) // Cosmic Indigo-Violet (#8A94FF) matching ref image
-            : Color(red: 0.10, green: 0.45, blue: 0.91) // Vibrant Gemini Royal Blue (#1A73E8)
+            ? Color(red: 0.53, green: 0.58, blue: 0.98) // Refined Periwinkle-Indigo (#8794FA) matching ref image
+            : Color(red: 0.259, green: 0.522, blue: 0.957) // Official Google Gemini Blue (#4285F4)
     }
 
     public var body: some View {
@@ -434,15 +434,11 @@ public struct ModelSlidePickerOverlay: View {
             }
             .frame(height: listHeight)
 
-            // 2. Subtle Divider
-            Rectangle()
-                .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.07))
-                .frame(height: 0.75)
-                .padding(.horizontal, 4)
-                .padding(.top, 7)
-                .padding(.bottom, 7)
+            // 2. Subtle Spacer before Reasoning Effort Well
+            Spacer()
+                .frame(height: 6)
 
-            // 3. Gradient Reasoning Effort Slider Section (图1 同款)
+            // 3. Mature Multi-Hue Gradient Reasoning Effort Slider Section
             ReasoningEffortSliderSection(
                 state: state,
                 tierLabelColor: tierLabelColor,
@@ -456,15 +452,15 @@ public struct ModelSlidePickerOverlay: View {
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(
-                    colorScheme == .dark ? Color.white.opacity(0.11) : Color(red: 0.16, green: 0.48, blue: 0.96).opacity(0.18),
-                    lineWidth: 1
+                    colorScheme == .dark ? Color.white.opacity(0.09) : Color.black.opacity(0.06),
+                    lineWidth: 0.8
                 )
         )
         .shadow(
-            color: colorScheme == .dark ? Color.black.opacity(0.48) : Color(red: 0.10, green: 0.25, blue: 0.55).opacity(0.14),
-            radius: 20,
+            color: colorScheme == .dark ? Color.black.opacity(0.52) : Color.black.opacity(0.12),
+            radius: 24,
             x: 0,
-            y: 8
+            y: 10
         )
     }
 
@@ -579,21 +575,14 @@ public struct ModelSlidePickerOverlay: View {
             if colorScheme == .dark {
                 LinearGradient(
                     colors: [
-                        Color(red: 0.115, green: 0.12, blue: 0.16),
-                        Color(red: 0.095, green: 0.10, blue: 0.135)
+                        Color(red: 0.098, green: 0.102, blue: 0.133),
+                        Color(red: 0.082, green: 0.086, blue: 0.114)
                     ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+                    startPoint: .top,
+                    endPoint: .bottom
                 )
             } else {
-                LinearGradient(
-                    colors: [
-                        Color.white,
-                        Color(red: 0.975, green: 0.985, blue: 1.00)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                Color.white
             }
         }
     }
@@ -601,22 +590,22 @@ public struct ModelSlidePickerOverlay: View {
     private func rowHighlightFill(isHighlighted: Bool) -> Color {
         guard isHighlighted else { return .clear }
         return colorScheme == .dark
-            ? Color.white.opacity(0.08)
-            : Color(red: 0.16, green: 0.48, blue: 0.96).opacity(0.10)
+            ? Color.white.opacity(0.075)
+            : Color(red: 0.06, green: 0.09, blue: 0.16).opacity(0.048)
     }
 
     private func rowHighlightStroke(isHighlighted: Bool) -> Color {
         guard isHighlighted else { return .clear }
         return colorScheme == .dark
-            ? Color.white.opacity(0.14)
-            : Color(red: 0.16, green: 0.48, blue: 0.96).opacity(0.24)
+            ? Color.white.opacity(0.09)
+            : Color(red: 0.06, green: 0.09, blue: 0.16).opacity(0.055)
     }
 }
 
-/// 图1 同款丝滑渐变推理等级滑块：
-/// - 深色模式：宇宙蓝紫发光渐变 + 微星尘高光粒子 + 纯白发光滑块
-/// - 浅色模式：Google Gemini 蓝彩渐变 + 微光粒子 + 纯白立体滑块
-/// - 交互：120Hz 跟手无级拖拽，跨档位瞬时触发清脆震动反馈，松手弹簧吸附
+/// 成熟多色相推理等级滑块（对标参考图与 Google Gemini 官方多色相品牌渐变）：
+/// - 深色模式：静谧长春花蓝 `#5865E8` -> 丝绒靛紫 `#7860F2` -> 紫晶 `#9B5CF6` -> 柔光兰紫 `#BA6BFA` + 滑块背向柔光晕染 + 微米级柔焦星尘
+/// - 浅色模式：Google Gemini 官方品牌色域（天青 `#4796E3` -> Gemini 蓝 `#4285F4` -> 长春花靛 `#6B7BF4` -> 鸢尾淡紫 `#9177E7`）+ 滑块背向柔光晕染
+/// - 几何比例：24pt 纤巧胶囊轨道 + 24pt 齐平纯白圆滑块（右侧零溢色圈、零塑料假高光条、120Hz 跟手无级滑动与跨档清脆震动）
 private struct ReasoningEffortSliderSection: View {
     @Environment(\.colorScheme) private var colorScheme
     @Bindable var state: ModelSlidePickerState
@@ -647,127 +636,159 @@ private struct ReasoningEffortSliderSection: View {
 
     private var activeGradient: LinearGradient {
         if colorScheme == .dark {
-            // 图1 同款宇宙星云蓝紫渐变
             return LinearGradient(
-                colors: [
-                    Color(red: 0.29, green: 0.42, blue: 0.96), // #4A6BF5
-                    Color(red: 0.51, green: 0.38, blue: 0.98), // #8261FA
-                    Color(red: 0.74, green: 0.45, blue: 1.00)  // #BD73FF
+                stops: [
+                    .init(color: Color(red: 0.345, green: 0.396, blue: 0.910), location: 0.00), // #5865E8 Muted Periwinkle
+                    .init(color: Color(red: 0.471, green: 0.376, blue: 0.949), location: 0.38), // #7860F2 Velvet Indigo
+                    .init(color: Color(red: 0.608, green: 0.361, blue: 0.965), location: 0.75), // #9B5CF6 Electric Amethyst
+                    .init(color: Color(red: 0.729, green: 0.420, blue: 0.980), location: 1.00)  // #BA6BFA Luminous Orchid
                 ],
-                startPoint: .leading,
-                endPoint: .trailing
+                startPoint: UnitPoint(x: 0.0, y: 0.65),
+                endPoint: UnitPoint(x: 1.0, y: 0.35)
             )
         } else {
-            // 白天模式：鲜亮 Google Gemini 蓝渐变
             return LinearGradient(
-                colors: [
-                    Color(red: 0.09, green: 0.41, blue: 0.89), // #1769E3
-                    Color(red: 0.26, green: 0.52, blue: 0.96), // #4285F4 (Gemini Core Blue)
-                    Color(red: 0.44, green: 0.70, blue: 1.00)  // #70B3FF (Gemini Sky Highlight)
+                stops: [
+                    .init(color: Color(red: 0.278, green: 0.588, blue: 0.890), location: 0.00), // #4796E3 Official Gemini Cerulean
+                    .init(color: Color(red: 0.259, green: 0.522, blue: 0.957), location: 0.36), // #4285F4 Official Google Gemini Blue
+                    .init(color: Color(red: 0.420, green: 0.482, blue: 0.957), location: 0.72), // #6B7BF4 Gemini Periwinkle
+                    .init(color: Color(red: 0.569, green: 0.467, blue: 0.906), location: 1.00)  // #9177E7 Official Gemini Iris
                 ],
-                startPoint: .leading,
-                endPoint: .trailing
+                startPoint: UnitPoint(x: 0.0, y: 0.65),
+                endPoint: UnitPoint(x: 1.0, y: 0.35)
             )
         }
     }
 
     private var trackBackground: Color {
         colorScheme == .dark
-            ? Color(red: 0.165, green: 0.17, blue: 0.225)
-            : Color(red: 0.89, green: 0.935, blue: 0.995)
+            ? Color(red: 0.145, green: 0.150, blue: 0.192)
+            : Color(red: 0.925, green: 0.935, blue: 0.957)
     }
 
-    private var glowColor: Color {
+    private var ambientGlowColor: Color {
         colorScheme == .dark
-            ? Color(red: 0.64, green: 0.44, blue: 1.00).opacity(isDragging ? 0.58 : 0.42)
-            : Color(red: 0.20, green: 0.50, blue: 0.96).opacity(isDragging ? 0.42 : 0.28)
+            ? Color(red: 0.58, green: 0.36, blue: 0.96).opacity(isDragging ? 0.42 : 0.30)
+            : Color(red: 0.31, green: 0.49, blue: 0.96).opacity(isDragging ? 0.28 : 0.20)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .center) {
                 Text("推理等级")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(colorScheme == .dark ? Color.white.opacity(0.72) : Color(red: 0.30, green: 0.35, blue: 0.44))
+                    .foregroundColor(
+                        colorScheme == .dark
+                            ? Color.white.opacity(0.80)
+                            : Color(red: 0.24, green: 0.28, blue: 0.36)
+                    )
 
                 Spacer()
 
                 Text(currentEffortTitle)
-                    .font(.system(size: 12.5, weight: .bold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(tierLabelColor)
                     .contentTransition(.interpolate)
                     .animation(.easeOut(duration: 0.15), value: currentEffortTitle)
             }
-            .padding(.horizontal, 5)
+            .padding(.horizontal, 2)
 
             GeometryReader { geo in
-                let trackHeight: CGFloat = 30
-                let thumbSize: CGFloat = 22
-                let inset: CGFloat = trackHeight / 2 // 15pt so thumb centers cleanly inside capsule ends
+                let trackHeight: CGFloat = 24
+                let thumbSize: CGFloat = 24
+                let inset: CGFloat = trackHeight / 2 // 12pt
                 let totalWidth = max(trackHeight, geo.size.width)
                 let usableWidth = max(1, totalWidth - inset * 2)
                 let thumbCenterX = inset + effectiveFraction * usableWidth
-                let fillWidth = min(totalWidth, max(trackHeight, thumbCenterX + inset))
+                let activeSpanWidth = max(0, thumbCenterX)
 
                 ZStack(alignment: .leading) {
-                    // 1. Recessed Pill Track
-                    Capsule(style: .continuous)
-                        .fill(trackBackground)
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .stroke(
-                                    colorScheme == .dark
-                                        ? Color.white.opacity(0.08)
-                                        : Color(red: 0.16, green: 0.48, blue: 0.96).opacity(0.16),
-                                    lineWidth: 1
-                                )
-                        )
-
-                    // 2. Discrete Tier Stop Dots
-                    if isAdjustable {
-                        ForEach(0..<variants.count, id: \.self) { idx in
-                            let stopX = inset + (CGFloat(idx) / CGFloat(max(1, variants.count - 1))) * usableWidth
-                            Circle()
-                                .fill(
-                                    colorScheme == .dark
-                                        ? Color.white.opacity(0.28)
-                                        : Color(red: 0.12, green: 0.42, blue: 0.88).opacity(0.30)
-                                )
-                                .frame(width: 4, height: 4)
-                                .position(x: stopX, y: trackHeight / 2)
-                        }
+                    // 0. Soft Ambient Under-Glow beneath active trail
+                    if activeSpanWidth > inset {
+                        Capsule(style: .continuous)
+                            .fill(ambientGlowColor)
+                            .frame(width: min(totalWidth, activeSpanWidth + 4), height: trackHeight - 2)
+                            .blur(radius: 6)
+                            .offset(y: 2)
                     }
 
-                    // 3. Active Gradient Fill + Starry Sparkles (matching ref image)
+                    // 1. Clipped Track + Multi-Hue Fill + Thumb Light-Bloom + Stardust
                     ZStack(alignment: .leading) {
                         Capsule(style: .continuous)
-                            .fill(activeGradient)
+                            .fill(trackBackground)
 
-                        SliderSparkleOverlay(width: fillWidth, height: trackHeight)
+                        if isAdjustable {
+                            ForEach(0..<variants.count, id: \.self) { idx in
+                                let stopX = inset + (CGFloat(idx) / CGFloat(max(1, variants.count - 1))) * usableWidth
+                                Circle()
+                                    .fill(
+                                        colorScheme == .dark
+                                            ? Color.white.opacity(0.18)
+                                            : Color(red: 0.39, green: 0.45, blue: 0.55).opacity(0.22)
+                                    )
+                                    .frame(width: 3, height: 3)
+                                    .position(x: stopX, y: trackHeight / 2)
+                            }
+                        }
+
+                        // Active gradient ends strictly at thumbCenterX underneath the flush 24pt white knob
+                        ZStack(alignment: .trailing) {
+                            Rectangle()
+                                .fill(activeGradient)
+
+                            // Soft light-source radial bloom emitted backward from the white knob
+                            RadialGradient(
+                                colors: [
+                                    Color.white.opacity(colorScheme == .dark ? 0.30 : 0.24),
+                                    Color.white.opacity(0)
+                                ],
+                                center: .trailing,
+                                startRadius: 1,
+                                endRadius: 28
+                            )
+                            .frame(width: min(activeSpanWidth, 34), height: trackHeight)
+
+                            SliderSparkleOverlay(width: activeSpanWidth, height: trackHeight)
+                                .frame(width: activeSpanWidth, height: trackHeight)
+                        }
+                        .frame(width: activeSpanWidth, height: trackHeight)
+                        .opacity(isAdjustable ? 1.0 : 0.65)
                     }
-                    .frame(width: fillWidth, height: trackHeight)
+                    .frame(width: totalWidth, height: trackHeight)
                     .clipShape(Capsule(style: .continuous))
-                    .shadow(color: glowColor, radius: isDragging ? 9 : 6, x: 0, y: 2)
-                    .opacity(isAdjustable ? 1.0 : 0.65)
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(
+                                colorScheme == .dark
+                                    ? Color.white.opacity(0.05)
+                                    : Color.black.opacity(0.045),
+                                lineWidth: 0.6
+                            )
+                    )
 
-                    // 4. Crisp Luminous White Thumb Knob
+                    // 2. Flush 24pt Pure White Knob (zero colored collar on right edge)
                     Circle()
                         .fill(Color.white)
                         .frame(width: thumbSize, height: thumbSize)
-                        .shadow(
-                            color: colorScheme == .dark
-                                ? Color(red: 0.72, green: 0.50, blue: 1.00).opacity(0.65)
-                                : Color(red: 0.10, green: 0.36, blue: 0.82).opacity(0.32),
-                            radius: isDragging ? 7 : 4,
-                            x: 0,
-                            y: 1.5
+                        .overlay(
+                            Circle()
+                                .stroke(
+                                    colorScheme == .dark ? Color.clear : Color.black.opacity(0.055),
+                                    lineWidth: 0.5
+                                )
                         )
-                        .scaleEffect(isDragging ? 1.10 : 1.0)
+                        .shadow(
+                            color: Color.black.opacity(colorScheme == .dark ? 0.38 : 0.16),
+                            radius: isDragging ? 4.5 : 3.0,
+                            x: 1,
+                            y: 1
+                        )
+                        .scaleEffect(isDragging ? 1.06 : 1.0)
                         .position(x: thumbCenterX, y: trackHeight / 2)
                         .animation(.interactiveSpring(response: 0.18, dampingFraction: 0.78), value: isDragging)
                 }
                 .frame(width: totalWidth, height: trackHeight)
-                .contentShape(Rectangle().inset(by: -6))
+                .contentShape(Rectangle().inset(by: -8))
                 .highPriorityGesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
@@ -797,16 +818,33 @@ private struct ReasoningEffortSliderSection: View {
                                 state.selectVariantIndex(nearest, onSelect: onSelectModel)
                             }
                             isDragging = false
-                            withAnimation(.spring(response: 0.24, dampingFraction: 0.80)) {
+                            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
                                 dragFraction = nil
                             }
                         }
                 )
             }
-            .frame(height: 30)
-            .padding(.horizontal, 3)
+            .frame(height: 24)
         }
-        .padding(.bottom, 2)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(
+                    colorScheme == .dark
+                        ? Color.white.opacity(0.025)
+                        : Color(red: 0.973, green: 0.978, blue: 0.990)
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(
+                    colorScheme == .dark
+                        ? Color.white.opacity(0.055)
+                        : Color.black.opacity(0.045),
+                    lineWidth: 0.7
+                )
+        )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("推理等级")
         .accessibilityValue(currentEffortTitle)
@@ -826,53 +864,50 @@ private struct ReasoningEffortSliderSection: View {
     }
 }
 
-/// 滑块渐变填充内的微星尘与四角星光点（纯矢量绘制，0% Emoji）
+/// 滑块渐变内的柔焦微星尘粒子（无塑料高光横条、无卡通四角星，纯光学微尘）
 private struct SliderSparkleOverlay: View {
     let width: CGFloat
     let height: CGFloat
 
     private static let specks: [(xRatio: CGFloat, yRatio: CGFloat, size: CGFloat, opacity: Double)] = [
-        (0.14, 0.34, 2.2, 0.45),
-        (0.24, 0.68, 1.8, 0.35),
-        (0.36, 0.28, 2.8, 0.62),
-        (0.48, 0.72, 2.0, 0.42),
-        (0.58, 0.40, 3.2, 0.70),
-        (0.69, 0.66, 2.1, 0.50),
-        (0.78, 0.30, 2.5, 0.65)
+        (0.10, 0.56, 1.8, 0.72),
+        (0.13, 0.45, 1.0, 0.42),
+        (0.28, 0.62, 1.3, 0.52),
+        (0.32, 0.52, 2.0, 0.80),
+        (0.35, 0.69, 1.1, 0.44),
+        (0.39, 0.42, 1.15, 0.46),
+        (0.57, 0.28, 1.85, 0.76),
+        (0.63, 0.73, 1.25, 0.46),
+        (0.68, 0.64, 0.95, 0.34)
     ]
 
     var body: some View {
         Canvas { context, size in
-            guard size.width > 36 else { return }
-            // Soft top sheen highlight
-            let sheenRect = CGRect(x: 4, y: 2, width: max(0, size.width - 8), height: size.height * 0.38)
-            context.fill(
-                Path(roundedRect: sheenRect, cornerRadius: sheenRect.height / 2),
-                with: .color(Color.white.opacity(0.12))
-            )
+            guard size.width > 28 else { return }
+            let leftPad: CGFloat = 6.5
+            let usable = max(1, size.width - 18)
 
-            // Subtle starry micro-specks
-            for speck in Self.specks {
-                let x = speck.xRatio * max(0, size.width - 18) + 8
-                guard x < size.width - 16 else { continue }
-                let y = speck.yRatio * size.height
-                let rect = CGRect(x: x - speck.size / 2, y: y - speck.size / 2, width: speck.size, height: speck.size)
-                context.fill(Path(ellipseIn: rect), with: .color(Color.white.opacity(speck.opacity)))
+            // 1. Soft Gaussian glow layer
+            context.drawLayer { glowCtx in
+                glowCtx.addFilter(.blur(radius: 1.2))
+                for speck in Self.specks {
+                    let x = leftPad + speck.xRatio * usable
+                    guard x < size.width - 11 else { continue }
+                    let y = speck.yRatio * size.height
+                    let d = speck.size * 1.9
+                    let rect = CGRect(x: x - d / 2, y: y - d / 2, width: d, height: d)
+                    glowCtx.fill(Path(ellipseIn: rect), with: .color(Color.white.opacity(speck.opacity * 0.42)))
+                }
             }
 
-            // Crisp 4-point Gemini sparkle near ~42% of active bar
-            if size.width > 72 {
-                let cx = min(size.width - 26, max(22, size.width * 0.46))
-                let cy = size.height * 0.48
-                let r: CGFloat = 4.2
-                var star = Path()
-                star.move(to: CGPoint(x: cx, y: cy - r))
-                star.addQuadCurve(to: CGPoint(x: cx + r, y: cy), control: CGPoint(x: cx + 0.8, y: cy - 0.8))
-                star.addQuadCurve(to: CGPoint(x: cx, y: cy + r), control: CGPoint(x: cx + 0.8, y: cy + 0.8))
-                star.addQuadCurve(to: CGPoint(x: cx - r, y: cy), control: CGPoint(x: cx - 0.8, y: cy + 0.8))
-                star.addQuadCurve(to: CGPoint(x: cx, y: cy - r), control: CGPoint(x: cx - 0.8, y: cy - 0.8))
-                star.closeSubpath()
-                context.fill(star, with: .color(Color.white.opacity(0.72)))
+            // 2. Crisp micro-pinpoint cores
+            for speck in Self.specks {
+                let x = leftPad + speck.xRatio * usable
+                guard x < size.width - 11 else { continue }
+                let y = speck.yRatio * size.height
+                let d = speck.size
+                let rect = CGRect(x: x - d / 2, y: y - d / 2, width: d, height: d)
+                context.fill(Path(ellipseIn: rect), with: .color(Color.white.opacity(speck.opacity * 0.88)))
             }
         }
         .allowsHitTesting(false)
