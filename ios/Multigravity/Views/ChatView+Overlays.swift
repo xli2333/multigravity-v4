@@ -5,27 +5,7 @@ import AVFoundation
 extension ChatView {
     @ViewBuilder
     var floatingCards: some View {
-        if !viewModel.runningTasks.isEmpty {
-            RunningTasksCardView(
-                cascadeId: viewModel.cascadeId,
-                items: viewModel.runningTasks,
-                onStop: { task in
-                    Task {
-                        await viewModel.stopTask(task)
-                    }
-                },
-                onSendToBackground: { task in
-                    Task {
-                        await viewModel.sendTaskToBackground(stepIndices: [task.stepIndex])
-                    }
-                },
-                onToggleExpand: { isExpanded in
-                    handleFloatingCardToggle(isExpanded: isExpanded)
-                }
-            )
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-        
+        // 执行中的任务已收纳至右上角闪电（⚡）按钮展开，不在对话屏幕与输入法上方挤压空间。
         // 底部只放仍在运行的子代理（方便随时关停）；已结束的留在消息流里的内联卡片中，不占底部位置
         let runningSubagents = viewModel.subagents.filter(\.isRunning)
         if !runningSubagents.isEmpty {

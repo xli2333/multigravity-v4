@@ -4,9 +4,12 @@ public struct RunningTasksCardView: View {
     @Environment(\.colorScheme) private var colorScheme
     public let cascadeId: String
     public let items: [RunningTaskItem]
+    public let alwaysExpanded: Bool
     public let onStop: @MainActor @Sendable (RunningTaskItem) -> Void
     public let onSendToBackground: (@MainActor @Sendable (RunningTaskItem) -> Void)?
     public let onToggleExpand: (@MainActor @Sendable (Bool) -> Void)?
+    public let onOpenTaskBoard: (@MainActor @Sendable () -> Void)?
+    public let onClose: (@MainActor @Sendable () -> Void)?
     
     @State private var settings = AppSettings.shared
     @State private var isCardExpanded: Bool
@@ -18,16 +21,22 @@ public struct RunningTasksCardView: View {
     public init(
         cascadeId: String = "",
         items: [RunningTaskItem],
+        alwaysExpanded: Bool = false,
         onStop: @escaping @MainActor @Sendable (RunningTaskItem) -> Void,
         onSendToBackground: (@MainActor @Sendable (RunningTaskItem) -> Void)? = nil,
-        onToggleExpand: (@MainActor @Sendable (Bool) -> Void)? = nil
+        onToggleExpand: (@MainActor @Sendable (Bool) -> Void)? = nil,
+        onOpenTaskBoard: (@MainActor @Sendable () -> Void)? = nil,
+        onClose: (@MainActor @Sendable () -> Void)? = nil
     ) {
         self.cascadeId = cascadeId
         self.items = items
+        self.alwaysExpanded = alwaysExpanded
         self.onStop = onStop
         self.onSendToBackground = onSendToBackground
         self.onToggleExpand = onToggleExpand
-        _isCardExpanded = State(initialValue: !AppSettings.shared.shouldCollapseRunningTasks)
+        self.onOpenTaskBoard = onOpenTaskBoard
+        self.onClose = onClose
+        _isCardExpanded = State(initialValue: alwaysExpanded ? true : !AppSettings.shared.shouldCollapseRunningTasks)
     }
     
     public var body: some View {
@@ -53,7 +62,7 @@ public struct RunningTasksCardView: View {
                 
                 Spacer()
 
-                if isCardExpanded || !settings.shouldCollapseRunningTasks {
+                if alwaysExpanded || isCardExpanded || !settings.shouldCollapseRunningTasks {
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             showTerminalPanel.toggle()
@@ -97,26 +106,52 @@ public struct RunningTasksCardView: View {
                     .accessibilityLabel("终止任务")
                     .help("终止任务")
                 }
-                
-                // Expand / Collapse Card Toggle
-                Button(action: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        isCardExpanded.toggle()
+
+                if let onOpenTaskBoard {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        onOpenTaskBoard()
+                    } label: {
+                        AGLinearIcon(.layers, size: 13.5, color: AGPalette.textSecondary(colorScheme), lineWidth: 2.0)
+                            .frame(width: 26, height: 26)
+                            .background(Circle().fill(AGPalette.recessedWell(colorScheme)))
                     }
-                    onToggleExpand?(isCardExpanded)
-                }) {
-                    AGLinearIcon(.chevronDown, size: 13, color: AGPalette.textSecondary(colorScheme), lineWidth: 2.1)
-                        .rotationEffect(.degrees(isCardExpanded ? 0 : 180))
-                        .frame(width: 28, height: 28)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("打开全局后台任务看板")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(isCardExpanded ? String(localized: "折叠任务") : String(localized: "展开任务"))
-                .help(isCardExpanded ? String(localized: "折叠任务") : String(localized: "展开任务"))
+
+                if let onClose {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        onClose()
+                    } label: {
+                        AGLinearIcon(.close, size: 12, color: AGPalette.textSecondary(colorScheme), lineWidth: 2.1)
+                            .frame(width: 26, height: 26)
+                            .background(Circle().fill(AGPalette.recessedWell(colorScheme)))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("收起任务面板")
+                } else if !alwaysExpanded {
+                    // Expand / Collapse Card Toggle
+                    Button(action: {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            isCardExpanded.toggle()
+                        }
+                        onToggleExpand?(isCardExpanded)
+                    }) {
+                        AGLinearIcon(.chevronDown, size: 13, color: AGPalette.textSecondary(colorScheme), lineWidth: 2.1)
+                            .rotationEffect(.degrees(isCardExpanded ? 0 : 180))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isCardExpanded ? String(localized: "折叠任务") : String(localized: "展开任务"))
+                    .help(isCardExpanded ? String(localized: "折叠任务") : String(localized: "展开任务"))
+                }
             }
             .zIndex(10)
             
             // Expandable Content
-            if isCardExpanded {
+            if alwaysExpanded || isCardExpanded {
                 VStack(spacing: 8) {
                     ForEach(items) { item in
                         taskRow(item: item)

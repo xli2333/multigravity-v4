@@ -36,6 +36,7 @@ public struct ChatView: View {
     @State var previewDraftGallery: ImageGalleryData? = nil
     @State var showAttachmentSheet = false
     @State var pendingOpenFilePicker = false
+    @State var showRunningTasksPopover = false
     @State var showNavigatorSheet = false
     @State var showMcpSkillsSheet = false
     @State var mcpSkillsInitialTabOverride: McpSkillsSheet.Tab? = nil
@@ -238,23 +239,88 @@ public struct ChatView: View {
                     isInputFocused = true
                 }
             )
+            if showRunningTasksPopover && !viewModel.runningTasks.isEmpty {
+                ZStack(alignment: .topTrailing) {
+                    Color.black.opacity(colorScheme == .dark ? 0.28 : 0.10)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                                showRunningTasksPopover = false
+                            }
+                        }
+
+                    ScrollView(.vertical, showsIndicators: true) {
+                        RunningTasksCardView(
+                            cascadeId: viewModel.cascadeId,
+                            items: viewModel.runningTasks,
+                            alwaysExpanded: true,
+                            onStop: { task in
+                                Task { await viewModel.stopTask(task) }
+                            },
+                            onSendToBackground: { task in
+                                Task { await viewModel.sendTaskToBackground(stepIndices: [task.stepIndex]) }
+                            },
+                            onOpenTaskBoard: {
+                                showRunningTasksPopover = false
+                                mcpSkillsInitialTabOverride = .tasks
+                                showMcpSkillsSheet = true
+                            },
+                            onClose: {
+                                withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                                    showRunningTasksPopover = false
+                                }
+                            }
+                        )
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(maxWidth: 440)
+                    .frame(maxHeight: min(440, max(240, (chatAreaHeight > 0 ? chatAreaHeight : 480) * 0.78)))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 6)
+                }
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity.combined(with: .scale(scale: 0.94, anchor: .topTrailing)),
+                        removal: .opacity.combined(with: .scale(scale: 0.96, anchor: .topTrailing))
+                    )
+                )
+                .zIndex(480)
+            }
+        }
+        .onChange(of: viewModel.runningTasks.isEmpty) { _, isEmpty in
+            if isEmpty && showRunningTasksPopover {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    showRunningTasksPopover = false
+                }
+            }
         }
         .onChange(of: modelPickerState.isPresented) { _, presented in
             if presented {
                 if workflowPickerState.isPresented { workflowPickerState.dismiss() }
                 if commitPickerState.isPresented { commitPickerState.dismiss() }
+                if showRunningTasksPopover { showRunningTasksPopover = false }
             }
         }
         .onChange(of: workflowPickerState.isPresented) { _, presented in
             if presented {
                 if modelPickerState.isPresented { modelPickerState.dismiss() }
                 if commitPickerState.isPresented { commitPickerState.dismiss() }
+                if showRunningTasksPopover { showRunningTasksPopover = false }
             }
         }
         .onChange(of: commitPickerState.isPresented) { _, presented in
             if presented {
                 if modelPickerState.isPresented { modelPickerState.dismiss() }
                 if workflowPickerState.isPresented { workflowPickerState.dismiss() }
+                if showRunningTasksPopover { showRunningTasksPopover = false }
+            }
+        }
+        .onChange(of: showRunningTasksPopover) { _, presented in
+            if presented {
+                if modelPickerState.isPresented { modelPickerState.dismiss() }
+                if workflowPickerState.isPresented { workflowPickerState.dismiss() }
+                if commitPickerState.isPresented { commitPickerState.dismiss() }
             }
         }
         .navigationTitle(viewModel.currentTitle)
@@ -343,73 +409,126 @@ public struct ChatView: View {
 
         ToolbarItem(placement: .topBarTrailing) {
             let isAutoPermission = viewModel.permissionState.preset == "auto"
-            Menu {
-                Section("全局权限放行模式 (\(viewModel.permissionState.localizedLabel))") {
-                    Button {
-                        Task { await viewModel.updatePermissionPreset("strict") }
-                    } label: {
-                        Label("严格审批", systemImage: viewModel.permissionState.preset == "strict" ? "checkmark" : "lock.shield")
+            let inSessionTaskCount = viewModel.runningTasks.count
+            if inSessionTaskCount > 0 {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    isInputFocused = false
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        showRunningTasksPopover.toggle()
                     }
-                    Button {
-                        Task { await viewModel.updatePermissionPreset("sandbox") }
-                    } label: {
-                        Label("离席沙箱放行", systemImage: viewModel.permissionState.preset == "sandbox" ? "checkmark" : "shield.lefthalf.filled")
+                } label: {
+                    HStack(spacing: 3.5) {
+                        AGLinearIcon(
+                            .bolt,
+                            size: 13.5,
+                            color: AGPalette.amberText(colorScheme),
+                            lineWidth: 2.1
+                        )
+                        Text("\(inSessionTaskCount)")
+                            .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                            .foregroundColor(AGPalette.amberText(colorScheme))
                     }
-                    Button {
-                        if isAutoPermission {
-                            Task { await viewModel.updatePermissionPreset("auto") }
-                        } else {
-                            showAutoPermissionConfirm = true
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(
+                            showRunningTasksPopover
+                                ? AGPalette.amberFill(colorScheme).opacity(colorScheme == .dark ? 0.24 : 0.16)
+                                : AGPalette.amberSoft(colorScheme)
+                        )
+                    )
+                    .overlay(
+                        Capsule().stroke(
+                            showRunningTasksPopover
+                                ? AGPalette.amberFill(colorScheme).opacity(0.65)
+                                : AGPalette(colorScheme).amberBorder,
+                            lineWidth: 1
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    chatOptionsMenuItems(isAutoPermission: isAutoPermission)
+                }
+                .accessibilityLabel("展开正在执行的 \(inSessionTaskCount) 个任务（长按打开更多设置）")
+            } else {
+                Menu {
+                    chatOptionsMenuItems(isAutoPermission: isAutoPermission)
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        AGLinearIcon(
+                            isAutoPermission ? .bolt : .more,
+                            size: 17,
+                            color: isAutoPermission ? AGPalette.amberText(colorScheme) : AGPalette.textPrimary(colorScheme),
+                            lineWidth: 2.0
+                        )
+                        .frame(width: 26, height: 26)
+
+                        if viewModel.hasAnyBackgroundTasks {
+                            Circle()
+                                .fill(AGPalette.emeraldFill(colorScheme))
+                                .frame(width: 6.5, height: 6.5)
+                                .offset(x: 1, y: 1)
                         }
-                    } label: {
-                        Label("全自动放行", systemImage: isAutoPermission ? "checkmark" : "bolt.shield")
                     }
                 }
-                Divider()
-                Button {
-                    showMcpSkillsSheet = true
-                } label: {
-                    Label("工具、技能与后台任务看板", systemImage: "square.grid.2x2")
-                }
-                Button {
-                    workflowSheetStartInEditMode = false
-                    showWorkflowTemplateSheet = true
-                } label: {
-                    Label("多智能体工作流模板", systemImage: "square.stack.3d.up")
-                }
-                Button {
-                    btwInitialQuote = nil
-                    showBtwSheet = true
-                } label: {
-                    Label("旁路快问 (/btw)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
-                }
-                if GatewayCompatStore.shared.isAvailable(GatewayFeature.export) && !viewModel.isDraftConversation {
-                    Button {
-                        viewModel.exportMarkdown()
-                    } label: {
-                        Label("导出会话 Markdown", systemImage: "square.and.arrow.up")
-                    }
+                .accessibilityLabel(viewModel.hasAnyBackgroundTasks ? String(localized: "更多选项（有后台任务运行中）") : String(localized: "更多会话与工具选项"))
+                .accessibilityValue(viewModel.permissionState.localizedLabel)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func chatOptionsMenuItems(isAutoPermission: Bool) -> some View {
+        Section("全局权限放行模式 (\(viewModel.permissionState.localizedLabel))") {
+            Button {
+                Task { await viewModel.updatePermissionPreset("strict") }
+            } label: {
+                Label("严格审批", systemImage: viewModel.permissionState.preset == "strict" ? "checkmark" : "lock.shield")
+            }
+            Button {
+                Task { await viewModel.updatePermissionPreset("sandbox") }
+            } label: {
+                Label("离席沙箱放行", systemImage: viewModel.permissionState.preset == "sandbox" ? "checkmark" : "shield.lefthalf.filled")
+            }
+            Button {
+                if isAutoPermission {
+                    Task { await viewModel.updatePermissionPreset("auto") }
+                } else {
+                    showAutoPermissionConfirm = true
                 }
             } label: {
-                ZStack(alignment: .topTrailing) {
-                    AGLinearIcon(
-                        isAutoPermission ? .bolt : .more,
-                        size: 17,
-                        color: isAutoPermission ? AGPalette.amberText(colorScheme) : AGPalette.textPrimary(colorScheme),
-                        lineWidth: 2.0
-                    )
-                    .frame(width: 26, height: 26)
-
-                    if viewModel.hasAnyBackgroundTasks {
-                        Circle()
-                            .fill(AGPalette.emeraldFill(colorScheme))
-                            .frame(width: 6.5, height: 6.5)
-                            .offset(x: 1, y: 1)
-                    }
-                }
+                Label("全自动放行", systemImage: isAutoPermission ? "checkmark" : "bolt.shield")
             }
-            .accessibilityLabel(viewModel.hasAnyBackgroundTasks ? String(localized: "更多选项（有后台任务运行中）") : String(localized: "更多会话与工具选项"))
-            .accessibilityValue(viewModel.permissionState.localizedLabel)
+        }
+        Divider()
+        Button {
+            if viewModel.hasAnyBackgroundTasks {
+                mcpSkillsInitialTabOverride = .tasks
+            }
+            showMcpSkillsSheet = true
+        } label: {
+            Label("工具、技能与后台任务看板", systemImage: "square.grid.2x2")
+        }
+        Button {
+            workflowSheetStartInEditMode = false
+            showWorkflowTemplateSheet = true
+        } label: {
+            Label("多智能体工作流模板", systemImage: "square.stack.3d.up")
+        }
+        Button {
+            btwInitialQuote = nil
+            showBtwSheet = true
+        } label: {
+            Label("旁路快问 (/btw)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
+        }
+        if GatewayCompatStore.shared.isAvailable(GatewayFeature.export) && !viewModel.isDraftConversation {
+            Button {
+                viewModel.exportMarkdown()
+            } label: {
+                Label("导出会话 Markdown", systemImage: "square.and.arrow.up")
+            }
         }
     }
 
@@ -802,6 +921,7 @@ public struct ChatView: View {
 
     private func dismissChatModals() {
         pendingOpenFilePicker = false
+        showRunningTasksPopover = false
         showAttachmentSheet = false
         showNavigatorSheet = false
         showMcpSkillsSheet = false
