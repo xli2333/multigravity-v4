@@ -28,6 +28,10 @@ public final class ModelSlidePickerState {
     public var hasEnteredMenu: Bool = false
     public var activeModelID: String = ""
     public var maxImpactTrigger: Int = 0
+    /// 每个模型家族独立记忆各自的思考等级 variant ID（互不串改，持久化在本地 UserDefaults）。
+    public var rememberedVariantIDByRow: [String: String] = [:]
+
+    private static let perFamilyVariantDefaultsKey = "mgy.perFamilySelectedVariantID.v1"
 
     private let selectionHaptic = UISelectionFeedbackGenerator()
     private let stepImpactHaptic = UIImpactFeedbackGenerator(style: .rigid)
@@ -111,6 +115,14 @@ public final class ModelSlidePickerState {
             matchedVarIdx = min(max(0, builtRows[matchedRowIdx].defaultVariantIndex), max(0, builtRows[matchedRowIdx].variantsOrdered.count - 1))
         }
 
+        var storedMap = (UserDefaults.standard.dictionary(forKey: Self.perFamilyVariantDefaultsKey) as? [String: String]) ?? self.rememberedVariantIDByRow
+        let activeRowObj = builtRows[matchedRowIdx]
+        if activeRowObj.variantsOrdered.indices.contains(matchedVarIdx) {
+            storedMap[activeRowObj.id] = activeRowObj.variantsOrdered[matchedVarIdx].id
+            UserDefaults.standard.set(storedMap, forKey: Self.perFamilyVariantDefaultsKey)
+        }
+
+        self.rememberedVariantIDByRow = storedMap
         self.providerKind = ModelDefaultsLogic.providerKind(forID: activeModel)
         self.activeModelID = activeModel
         self.rows = builtRows
@@ -155,25 +167,25 @@ public final class ModelSlidePickerState {
         stepImpactHaptic.prepare()
     }
 
+    /// 读取指定模型家族独立记忆的档位下标（未手动调整过则回退到该模型自身的默认档位）。
+    public func rememberedVariantIndex(for row: ModelPickerRow) -> Int {
+        guard !row.variantsOrdered.isEmpty else { return 0 }
+        if row.hasEffortTiers, let savedID = rememberedVariantIDByRow[row.id],
+           let idx = row.variantsOrdered.firstIndex(where: { $0.id.caseInsensitiveCompare(savedID) == .orderedSame }) {
+            return idx
+        }
+        return min(max(0, row.defaultVariantIndex), row.variantsOrdered.count - 1)
+    }
+
+    private func persistRememberedVariant(rowID: String, variantID: String) {
+        rememberedVariantIDByRow[rowID] = variantID
+        UserDefaults.standard.set(rememberedVariantIDByRow, forKey: Self.perFamilyVariantDefaultsKey)
+    }
+
     public func selectRow(_ rowIndex: Int, onSelect: (String) -> Void) {
         guard rows.indices.contains(rowIndex) else { return }
-        let previousRank = currentVariant?.effortRank
         let targetRow = rows[rowIndex]
-        let newVarIdx: Int
-        if targetRow.hasEffortTiers, let prevRank = previousRank {
-            if let exact = targetRow.variantsOrdered.firstIndex(where: { $0.effortRank == prevRank }) {
-                newVarIdx = exact
-            } else {
-                // Closest available effort rank
-                newVarIdx = targetRow.variantsOrdered.enumerated().min(by: { a, b in
-                    let da = abs((a.element.effortRank?.rawValue ?? 1) - prevRank.rawValue)
-                    let db = abs((b.element.effortRank?.rawValue ?? 1) - prevRank.rawValue)
-                    return da < db
-                })?.offset ?? targetRow.defaultVariantIndex
-            }
-        } else {
-            newVarIdx = min(max(0, targetRow.defaultVariantIndex), max(0, targetRow.variantsOrdered.count - 1))
-        }
+        let newVarIdx = rememberedVariantIndex(for: targetRow)
 
         selectedRowIndex = rowIndex
         selectedVariantIndex = newVarIdx
@@ -181,6 +193,9 @@ public final class ModelSlidePickerState {
             let chosen = targetRow.variantsOrdered[newVarIdx]
             activeModelID = chosen.id
             providerKind = targetRow.providerKind
+            if targetRow.hasEffortTiers {
+                persistRememberedVariant(rowID: targetRow.id, variantID: chosen.id)
+            }
             onSelect(chosen.id)
         }
     }
@@ -195,6 +210,9 @@ public final class ModelSlidePickerState {
         let chosen = row.variantsOrdered[variantIndex]
         activeModelID = chosen.id
         providerKind = row.providerKind
+        if row.hasEffortTiers {
+            persistRememberedVariant(rowID: row.id, variantID: chosen.id)
+        }
         let isNowMax = row.hasEffortTiers && row.variantsOrdered.count > 1 && variantIndex == row.variantsOrdered.count - 1
         if isNowMax && !wasMax {
             selectionHaptic.selectionChanged()
@@ -288,16 +306,7 @@ public final class ModelSlidePickerState {
                 hoveredRowIndex = idx
                 selectedRowIndex = idx
                 let row = rows[idx]
-                if row.hasEffortTiers {
-                    let curRank = currentVariant?.effortRank
-                    if let curRank, let matched = row.variantsOrdered.firstIndex(where: { $0.effortRank == curRank }) {
-                        selectedVariantIndex = matched
-                    } else {
-                        selectedVariantIndex = min(max(0, row.defaultVariantIndex), row.variantsOrdered.count - 1)
-                    }
-                } else {
-                    selectedVariantIndex = 0
-                }
+                selectedVariantIndex = row.hasEffortTiers ? rememberedVariantIndex(for: row) : 0
                 selectionHaptic.selectionChanged()
             }
             return
@@ -318,6 +327,9 @@ public final class ModelSlidePickerState {
             let vIdx = Int((frac * CGFloat(row.variantsOrdered.count - 1)).rounded())
             if selectedVariantIndex != vIdx {
                 selectedVariantIndex = vIdx
+                if row.variantsOrdered.indices.contains(vIdx) {
+                    persistRememberedVariant(rowID: row.id, variantID: row.variantsOrdered[vIdx].id)
+                }
                 triggerStepHaptic()
             }
             return
@@ -502,17 +514,21 @@ public struct ModelSlidePickerOverlay: View {
         let isSelectedFamily = state.selectedRowIndex == index
         let isHovered = state.hoveredRowIndex == index
         let isHighlighted = isSelectedFamily || isHovered
-        let currentRank = state.currentVariant?.effortRank
+        let rowVarIdx: Int = isSelectedFamily
+            ? min(max(0, state.selectedVariantIndex), max(0, row.variantsOrdered.count - 1))
+            : state.rememberedVariantIndex(for: row)
         let rowEffortLabel: String? = {
-            guard row.hasEffortTiers else { return nil }
-            if isSelectedFamily, let cur = state.currentVariant {
-                return cur.effortDisplayLabel
+            guard row.hasEffortTiers, row.variantsOrdered.indices.contains(rowVarIdx) else { return nil }
+            return row.variantsOrdered[rowVarIdx].effortDisplayLabel
+        }()
+        let rowEffortColor: Color = {
+            guard row.hasEffortTiers, row.variantsOrdered.count > 1 else { return tierLabelColor }
+            let frac = Double(rowVarIdx) / Double(max(1, row.variantsOrdered.count - 1))
+            if colorScheme == .dark {
+                return FluidMeshPalette.lerpColor(from: (0.42, 0.56, 0.98), to: (0.76, 0.52, 0.99), t: frac)
+            } else {
+                return FluidMeshPalette.lerpColor(from: (0.22, 0.52, 0.95), to: (0.50, 0.38, 0.92), t: frac)
             }
-            if let currentRank, let matched = row.variantsOrdered.first(where: { $0.effortRank == currentRank }) {
-                return matched.effortDisplayLabel
-            }
-            let defIdx = min(max(0, row.defaultVariantIndex), row.variantsOrdered.count - 1)
-            return row.variantsOrdered[defIdx].effortDisplayLabel
         }()
 
         Button {
@@ -549,7 +565,7 @@ public struct ModelSlidePickerOverlay: View {
                 if let effortText = rowEffortLabel {
                     Text(effortText)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(tierLabelColor)
+                        .foregroundColor(rowEffortColor)
                         .lineLimit(1)
                 }
 

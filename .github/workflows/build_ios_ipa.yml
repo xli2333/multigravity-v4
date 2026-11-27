@@ -51,7 +51,7 @@ jobs:
           # 2. Fallback iOS-only IPA (for signers without watchOS provisioning profile support)
           rm -rf Payload/Multigravity.app/Watch
           ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/Multigravity-v4.0-ios-only-unsigned.ipa"
-          cp "$GITHUB_WORKSPACE/Multigravity-v4.0-ios-only-unsigned.ipa" "$GITHUB_WORKSPACE/Multigravity-v4.0.5-build405-ios.ipa"
+          cp "$GITHUB_WORKSPACE/Multigravity-v4.0-ios-only-unsigned.ipa" "$GITHUB_WORKSPACE/Multigravity-v4.0.6-build406-ios.ipa"
 
           ls -lh "$GITHUB_WORKSPACE"/*.ipa
 
@@ -76,5 +76,5 @@ jobs:
           files: |
             Multigravity-v4.0-unsigned.ipa
             Multigravity-v4.0-ios-only-unsigned.ipa
-            Multigravity-v4.0.5-build405-ios.ipa
+            Multigravity-v4.0.6-build406-ios.ipa
           prerelease: false
