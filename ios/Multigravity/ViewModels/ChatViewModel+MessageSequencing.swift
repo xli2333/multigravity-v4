@@ -169,6 +169,12 @@ extension ChatViewModel {
         if self.pendingOptimisticMessageId == nil {
             self.knownServerMessageIds = Set(fullList.map(\.id))
         }
+        ArtifactLibraryManager.shared.scheduleIngest(
+            cascadeId: self.cascadeId,
+            title: self.currentTitle,
+            workspaceName: self.workspaceName,
+            messages: fullList
+        )
     }
     
     func mergeIncomingMessages(_ incoming: [ChatMessage]) {
@@ -302,6 +308,12 @@ extension ChatViewModel {
         if self.pendingOptimisticMessageId == nil {
             self.knownServerMessageIds = Set(base.map(\.id))
         }
+        ArtifactLibraryManager.shared.scheduleIngest(
+            cascadeId: self.cascadeId,
+            title: self.currentTitle,
+            workspaceName: self.workspaceName,
+            messages: base
+        )
     }
     
 }

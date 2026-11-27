@@ -762,7 +762,10 @@ public struct ConversationListView: View {
             SystemConnectionTabView(
                 linkMonitor: viewModel.linkMonitor,
                 onScanQRPair: { showQRScanner = true },
-                onManualPair: { showManualInput = true }
+                onManualPair: { showManualInput = true },
+                onOpenConversationId: { cid in
+                    openConversationById(cid)
+                }
             )
         }
     }

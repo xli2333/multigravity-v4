@@ -85,6 +85,7 @@ public final class AppSettings {
     private let demoModeKey = "antigravity.demo_mode"
     private let workspaceNotesKey = "antigravity.workspace_notes"
     private let cachedPermissionPresetKey = "antigravity.cached_permission_preset"
+    private let autoDownloadArtifactsKey = "antigravity.auto_download_artifacts"
 
     public var workspaceNotes: [String: String] {
         didSet { UserDefaults.standard.set(workspaceNotes, forKey: workspaceNotesKey) }
@@ -285,6 +286,18 @@ public final class AppSettings {
     public var enableVoiceMode: Bool {
         didSet {
             UserDefaults.standard.set(enableVoiceMode, forKey: enableVoiceModeKey)
+        }
+    }
+
+    /// 是否在后台自动将 Agent 生成的产物（视频、图片、PDF/Office/方案文档）缓存到手机本地，实现点开零等待（默认开启）
+    public var autoDownloadArtifacts: Bool {
+        didSet {
+            UserDefaults.standard.set(autoDownloadArtifacts, forKey: autoDownloadArtifactsKey)
+            #if !ACTIVITY_EXTENSION && !os(watchOS)
+            if autoDownloadArtifacts {
+                ArtifactLibraryManager.shared.enqueuePendingAutoDownloads()
+            }
+            #endif
         }
     }
 
@@ -925,6 +938,11 @@ public final class AppSettings {
         self.gatewayPlatform = UserDefaults.standard.string(forKey: gatewayPlatformKey)
         self.workspaceNotes = (UserDefaults.standard.dictionary(forKey: workspaceNotesKey) as? [String: String]) ?? [:]
         self.cachedPermissionPreset = UserDefaults.standard.string(forKey: cachedPermissionPresetKey) ?? "strict"
+        if UserDefaults.standard.object(forKey: autoDownloadArtifactsKey) == nil {
+            self.autoDownloadArtifacts = true
+        } else {
+            self.autoDownloadArtifacts = UserDefaults.standard.bool(forKey: autoDownloadArtifactsKey)
+        }
         syncWidgetConfiguration(reloadWidget: false)
     }
 }

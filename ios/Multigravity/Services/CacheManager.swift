@@ -794,6 +794,40 @@ public final class CacheManager: @unchecked Sendable {
                 self?.writePendingSession(cascadeId)
             }
         }
+        
+        let snapTitle = session.title ?? ""
+        let snapWS = session.workspaceName ?? ""
+        let snapMsgs = session.messages
+        Task { @MainActor in
+            ArtifactLibraryManager.shared.scheduleIngest(
+                cascadeId: cascadeId,
+                title: snapTitle,
+                workspaceName: snapWS,
+                messages: snapMsgs
+            )
+        }
+    }
+
+    /// Reads all cached session JSON snapshots from disk for background artifact indexing.
+    nonisolated public func allCachedSessionsOnDisk() -> [CachedChatSession] {
+        let sessionsDir = cacheDir.appendingPathComponent("sessions", isDirectory: true)
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: sessionsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        let localDecoder = JSONDecoder()
+        var loaded: [CachedChatSession] = []
+        for fileURL in urls where fileURL.pathExtension == "json" {
+            if let data = try? Data(contentsOf: fileURL),
+               let decoded = try? localDecoder.decode(CachedChatSession.self, from: data) {
+                loaded.append(decoded)
+            }
+        }
+        return loaded
     }
 
     /// Maximum number of tail messages written to on-disk session cache to prevent multi-MB

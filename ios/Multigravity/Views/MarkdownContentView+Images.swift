@@ -104,6 +104,17 @@ public final class MarkdownImageCache: @unchecked Sendable {
         }
     }
 
+    public func insertInMemoryOnly(_ image: UIImage, for url: URL) {
+        let key = cacheKey(for: url)
+        let cost = Int(image.size.width * image.size.height * 4)
+        cache.setObject(image, forKey: key, cost: min(cost, 10 * 1024 * 1024))
+    }
+
+    public func remove(for url: URL) {
+        let key = cacheKey(for: url)
+        cache.removeObject(forKey: key)
+    }
+
     public func clearMemory() {
         cache.removeAllObjects()
     }

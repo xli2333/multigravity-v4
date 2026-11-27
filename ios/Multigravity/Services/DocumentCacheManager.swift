@@ -136,6 +136,20 @@ public final class DocumentCacheManager: @unchecked Sendable {
         return size > 0 ? url : nil
     }
     
+    private func hashTokens(for uri: String, cascadeId: String?) -> [String] {
+        let baseKey = Self.canonicalMediaKey(for: uri)
+        guard !baseKey.isEmpty else { return [] }
+        var tokens: [String] = []
+        if let cid = cascadeId?.trimmingCharacters(in: .whitespacesAndNewlines), !cid.isEmpty, !baseKey.contains(cid) {
+            tokens.append("_\(sha256Hex("\(cid)_\(baseKey)", prefixLength: 16))")
+        }
+        let unoped = "_\(sha256Hex(baseKey, prefixLength: 16))"
+        if !tokens.contains(unoped) {
+            tokens.append(unoped)
+        }
+        return tokens
+    }
+    
     /// Checks if a valid non-empty permanently cached file exists for the given uri/fileName.
     public func getCachedFile(for uri: String, fileName: String, cascadeId: String? = nil) -> URL? {
         if let hit = validExistingFile(at: cacheFileURL(for: uri, fileName: fileName, cascadeId: cascadeId)) {
@@ -144,6 +158,21 @@ public final class DocumentCacheManager: @unchecked Sendable {
         if cascadeId != nil,
            let hit = validExistingFile(at: cacheFileURL(for: uri, fileName: fileName, cascadeId: nil)) {
             return hit
+        }
+        // Hash-token fallback: matches files auto-downloaded under server Content-Disposition filename
+        // even when tapped in Chat under a custom Markdown display label.
+        let tokens = hashTokens(for: uri, cascadeId: cascadeId)
+        if !tokens.isEmpty,
+           let files = try? fileManager.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) {
+            for token in tokens {
+                if let match = files.first(where: { candidate in
+                    let name = candidate.lastPathComponent
+                    guard !name.hasSuffix(".meta.json") else { return false }
+                    return name.contains(token) && validExistingFile(at: candidate) != nil
+                }) {
+                    return match
+                }
+            }
         }
         // Transparent fallback to pre-upgrade Library/Caches directory if present
         if let legacyHit = validExistingFile(at: cacheFileURL(in: legacyCacheDirectory, for: uri, fileName: fileName, cascadeId: cascadeId, canonical: false)) {
@@ -179,8 +208,18 @@ public final class DocumentCacheManager: @unchecked Sendable {
     /// Synchronously reads cached image/poster raw bytes from permanent local disk cache.
     public func cachedMediaData(for url: URL, namespace: String = "img") -> Data? {
         let fileURL = mediaFileURL(for: url, namespace: namespace)
-        guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
-        return try? Data(contentsOf: fileURL, options: .mappedIfSafe)
+        if fileManager.fileExists(atPath: fileURL.path),
+           let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
+           !data.isEmpty {
+            return data
+        }
+        if namespace == "img",
+           let docHit = getCachedFile(for: url.absoluteString, fileName: url.lastPathComponent),
+           let data = try? Data(contentsOf: docHit, options: .mappedIfSafe),
+           !data.isEmpty {
+            return data
+        }
+        return nil
     }
     
     /// Asynchronously writes image/poster raw bytes to permanent local disk cache.
@@ -336,5 +375,91 @@ public final class DocumentCacheManager: @unchecked Sendable {
         MarkdownImageCache.shared.clearMemory()
         VideoThumbnailCache.shared.clearMemory()
         URLCache.shared.removeAllCachedResponses()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .artifactCacheDidClearAll, object: nil)
+        }
+    }
+    
+    // MARK: - Per-Artifact Inspection & Targeted Local Eviction
+    
+    /// Returns the local cached URL and byte size on iPhone if this artifact is currently stored on disk.
+    public func localArtifactFileInfo(
+        for uri: String,
+        fileName: String,
+        cascadeId: String? = nil,
+        isMarkdown: Bool = false,
+        resolvedMediaURL: URL? = nil
+    ) -> (url: URL, byteSize: Int64)? {
+        let sizeOf: (URL) -> Int64 = { target in
+            let attrs = try? self.fileManager.attributesOfItem(atPath: target.path)
+            return (attrs?[.size] as? Int64) ?? 0
+        }
+        if isMarkdown,
+           let mdHit = getCachedMarkdown(for: uri, fileName: fileName, cascadeId: cascadeId) {
+            let sz = sizeOf(mdHit.fileURL)
+            if sz > 0 {
+                return (mdHit.fileURL, sz)
+            }
+        }
+        if let docHit = getCachedFile(for: uri, fileName: fileName, cascadeId: cascadeId) {
+            let sz = sizeOf(docHit)
+            if sz > 0 {
+                return (docHit, sz)
+            }
+        }
+        if let mediaURL = resolvedMediaURL,
+           let mediaHit = validExistingFile(at: mediaFileURL(for: mediaURL, namespace: "img")) {
+            let sz = sizeOf(mediaHit)
+            if sz > 0 {
+                return (mediaHit, sz)
+            }
+        }
+        return nil
+    }
+    
+    /// Deletes ONLY this single artifact's cached local files from the iPhone without touching server files or catalog metadata.
+    public func evictSingleArtifact(
+        uri: String,
+        fileName: String,
+        cascadeId: String? = nil,
+        resolvedMediaURL: URL? = nil
+    ) {
+        let directCandidates: [URL] = [
+            cacheFileURL(for: uri, fileName: fileName, cascadeId: cascadeId),
+            cacheFileURL(for: uri, fileName: fileName, cascadeId: nil),
+            cacheFileURL(in: legacyCacheDirectory, for: uri, fileName: fileName, cascadeId: cascadeId, canonical: false),
+            cacheFileURL(in: legacyCacheDirectory, for: uri, fileName: fileName, cascadeId: nil, canonical: false)
+        ]
+        for candidate in directCandidates {
+            if fileManager.fileExists(atPath: candidate.path) {
+                try? fileManager.removeItem(at: candidate)
+            }
+            let meta = metadataURL(for: candidate)
+            if fileManager.fileExists(atPath: meta.path) {
+                try? fileManager.removeItem(at: meta)
+            }
+        }
+        
+        let tokens = hashTokens(for: uri, cascadeId: cascadeId)
+        if !tokens.isEmpty {
+            for dir in [cacheDirectory, legacyCacheDirectory] {
+                if let files = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                    for file in files {
+                        let name = file.lastPathComponent
+                        if tokens.contains(where: { name.contains($0) }) {
+                            try? fileManager.removeItem(at: file)
+                        }
+                    }
+                }
+            }
+        }
+        
+        if let mediaURL = resolvedMediaURL {
+            let imgBin = mediaFileURL(for: mediaURL, namespace: "img")
+            if fileManager.fileExists(atPath: imgBin.path) {
+                try? fileManager.removeItem(at: imgBin)
+            }
+            MarkdownImageCache.shared.remove(for: mediaURL)
+        }
     }
 }

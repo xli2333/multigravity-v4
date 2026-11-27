@@ -13,6 +13,7 @@ public struct SystemConnectionTabView: View {
     public let linkMonitor: ConversationEventsClient?
     public let onScanQRPair: (() -> Void)?
     public let onManualPair: (() -> Void)?
+    public let onOpenConversationId: ((String) -> Void)?
 
     @State private var settings = AppSettings.shared
     @State private var connectionManager = ConnectionManager.shared
@@ -38,15 +39,18 @@ public struct SystemConnectionTabView: View {
     @State private var showSoundSettingsSheet: Bool = false
     @State private var showCompactModeSheet: Bool = false
     @State private var showGesturesGuideSheet: Bool = false
+    @State private var showArtifactManagerSheet: Bool = false
 
     public init(
         linkMonitor: ConversationEventsClient? = nil,
         onScanQRPair: (() -> Void)? = nil,
-        onManualPair: (() -> Void)? = nil
+        onManualPair: (() -> Void)? = nil,
+        onOpenConversationId: ((String) -> Void)? = nil
     ) {
         self.linkMonitor = linkMonitor
         self.onScanQRPair = onScanQRPair
         self.onManualPair = onManualPair
+        self.onOpenConversationId = onOpenConversationId
     }
 
     public var body: some View {
@@ -56,6 +60,11 @@ public struct SystemConnectionTabView: View {
 
                 // 1. Visual Zero-Knowledge Link Topology Card
                 topologyCard
+
+                // 1.5. Session Artifact Library & Local Storage File Manager Card
+                ArtifactStorageSummaryCard {
+                    showArtifactManagerSheet = true
+                }
 
                 // 2. Visual 3-Card Global Agent Permission Selector
                 permissionSelectorCard
@@ -155,6 +164,11 @@ public struct SystemConnectionTabView: View {
         }
         .sheet(isPresented: $showLicensesSheet) {
             OpenSourceLicensesSheet()
+        }
+        .sheet(isPresented: $showArtifactManagerSheet) {
+            ArtifactFileManagerSheet(onOpenConversationId: onOpenConversationId)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showSoundSettingsSheet) {
             NavigationStack {
@@ -920,7 +934,7 @@ public struct SystemConnectionTabView: View {
                     .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(AGPalette.border(colorScheme), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
-                .task {
+                .task(id: showArtifactManagerSheet) {
                     let sizeStr = await Task.detached(priority: .utility) {
                         DocumentCacheManager.shared.formattedCacheSize()
                     }.value

@@ -27,6 +27,7 @@ struct MultigravityApp: App {
                     BackgroundKeepAliveManager.shared.refreshKeepAliveState()
                     WatchSyncManager.shared.activateIfSupported()
                     WatchSyncManager.shared.scheduleContextSync()
+                    ArtifactLibraryManager.shared.bootstrapIfNeeded()
                     if settings.isPaired && !settings.isDemoMode && settings.enablePushNotifications {
                         Task {
                             await PushNotificationManager.shared.refreshAuthorizationStatus()
@@ -41,6 +42,7 @@ struct MultigravityApp: App {
                         settings.applyAppearance()
                         BackgroundKeepAliveManager.shared.refreshKeepAliveState()
                         WatchSyncManager.shared.scheduleContextSync()
+                        ArtifactLibraryManager.shared.bootstrapIfNeeded()
                     } else if newPhase == .background {
                         settings.syncWidgetConfiguration(reloadWidget: true)
                         BackgroundKeepAliveManager.shared.refreshKeepAliveState()
