@@ -908,10 +908,14 @@ private struct ReasoningEffortSliderSection: View {
         let isDark = colorScheme == .dark
         let meshPts = FluidMeshPalette.points(phase: sample.phase, turbulence: sample.turbulence)
         let meshCols = FluidMeshPalette.colors(isDark: isDark, fraction: sample.energy)
+        let baseGrad = FluidMeshPalette.baseUnderlayGradient(isDark: isDark, fraction: sample.energy)
 
         return ZStack(alignment: .trailing) {
+            Rectangle()
+                .fill(baseGrad)
+
             MeshGradient(
-                width: 3,
+                width: 4,
                 height: 3,
                 points: meshPts,
                 colors: meshCols
@@ -1094,35 +1098,56 @@ private enum FluidMeshPalette {
         )
     }
 
+    static func baseUnderlayGradient(isDark: Bool, fraction: Double) -> LinearGradient {
+        let reach = max(0.16, min(1.0, fraction))
+        if isDark {
+            let start = Color(red: 0.310, green: 0.376, blue: 0.898)
+            let mid = lerpColor(from: (0.310, 0.376, 0.898), to: (0.486, 0.349, 0.949), t: reach * 0.75)
+            let end = lerpColor(from: (0.310, 0.376, 0.898), to: (0.682, 0.369, 0.973), t: reach)
+            return LinearGradient(colors: [start, mid, end], startPoint: .leading, endPoint: .trailing)
+        } else {
+            let start = Color(red: 0.243, green: 0.541, blue: 0.918)
+            let mid = lerpColor(from: (0.243, 0.541, 0.918), to: (0.259, 0.482, 0.953), t: reach * 0.75)
+            let end = lerpColor(from: (0.243, 0.541, 0.918), to: (0.490, 0.435, 0.925), t: reach)
+            return LinearGradient(colors: [start, mid, end], startPoint: .leading, endPoint: .trailing)
+        }
+    }
+
     static func points(phase: Double, turbulence: Double) -> [SIMD2<Float>] {
-        let edgeAmp = 0.07 + 0.07 * turbulence
+        let edgeAmp = 0.05 + 0.05 * turbulence
         let waveAmpY = 0.16 + 0.14 * turbulence
-        let waveAmpX = 0.05 + 0.06 * turbulence
+        let waveAmpX = 0.045 + 0.055 * turbulence
 
-        let topMidX = Float(0.50 + sin(phase * 0.85) * edgeAmp)
-        let botMidX = Float(0.50 - sin(phase * 0.85) * edgeAmp)
+        // Strictly pin outer perimeter (x=0 on col 0, x=1 on col 3, y=0 on row 0, y=1 on row 2)
+        // so Bezier boundaries NEVER bow inward or expose dark wedges at the ends!
+        let topX1 = Float(0.33 + sin(phase * 0.85) * edgeAmp)
+        let topX2 = Float(0.67 + cos(phase * 0.85) * edgeAmp)
+        let botX1 = Float(0.33 - sin(phase * 0.85) * edgeAmp)
+        let botX2 = Float(0.67 - cos(phase * 0.85) * edgeAmp)
 
-        // Traveling sinusoidal liquid current snaking across Row 1
-        let p10x = Float(min(0.42, max(0.10, 0.24 + cos(phase * 1.10) * waveAmpX)))
-        let p10y = Float(min(0.84, max(0.16, 0.50 + sin(phase * 1.45) * waveAmpY)))
+        // Row 1: col 0 pinned at x=0.0, col 3 pinned at x=1.0; interior cols 1 & 2 swirl freely!
+        let p10y = Float(min(0.80, max(0.20, 0.50 + sin(phase * 1.45) * (waveAmpY * 0.75))))
 
-        let p11x = Float(min(0.72, max(0.32, 0.53 + sin(phase * 0.95 + 1.2) * waveAmpX)))
-        let p11y = Float(min(0.84, max(0.16, 0.48 + sin(phase * 1.45 - 1.55) * waveAmpY)))
+        let p11x = Float(min(0.48, max(0.18, 0.33 + cos(phase * 1.10) * waveAmpX)))
+        let p11y = Float(min(0.84, max(0.16, 0.50 + sin(phase * 1.45 - 1.25) * waveAmpY)))
 
-        let p12x = Float(min(0.92, max(0.64, 0.80 + cos(phase * 1.20 + 2.2) * waveAmpX)))
-        let p12y = Float(min(0.84, max(0.16, 0.52 + sin(phase * 1.45 - 3.10) * waveAmpY)))
+        let p12x = Float(min(0.82, max(0.52, 0.67 + sin(phase * 0.95 + 1.1) * waveAmpX)))
+        let p12y = Float(min(0.84, max(0.16, 0.49 + sin(phase * 1.45 - 2.50) * waveAmpY)))
+
+        let p13y = Float(min(0.80, max(0.20, 0.50 + sin(phase * 1.45 - 3.75) * (waveAmpY * 0.75))))
 
         return [
-            SIMD2<Float>(0.0, 0.0), SIMD2<Float>(topMidX, 0.0), SIMD2<Float>(1.0, 0.0),
-            SIMD2<Float>(p10x, p10y), SIMD2<Float>(p11x, p11y), SIMD2<Float>(p12x, p12y),
-            SIMD2<Float>(0.0, 1.0), SIMD2<Float>(botMidX, 1.0), SIMD2<Float>(1.0, 1.0)
+            SIMD2<Float>(0.0, 0.0), SIMD2<Float>(topX1, 0.0), SIMD2<Float>(topX2, 0.0), SIMD2<Float>(1.0, 0.0),
+            SIMD2<Float>(0.0, p10y), SIMD2<Float>(p11x, p11y), SIMD2<Float>(p12x, p12y), SIMD2<Float>(1.0, p13y),
+            SIMD2<Float>(0.0, 1.0), SIMD2<Float>(botX1, 1.0), SIMD2<Float>(botX2, 1.0), SIMD2<Float>(1.0, 1.0)
         ]
     }
 
     static func colors(isDark: Bool, fraction: Double) -> [Color] {
         // Progressive Codex unfolding: calm blue at Low -> multi-hue Gemini/Cosmic nebula at Medium/High
         let reach = max(0.16, min(1.0, fraction))
-        let midReach = reach * 0.55
+        let c1Reach = reach * 0.38
+        let c2Reach = reach * 0.72
 
         if isDark {
             let t0 = (0.290, 0.361, 0.886) // #4A5CE2 Periwinkle
@@ -1140,15 +1165,18 @@ private enum FluidMeshPalette {
 
             return [
                 lerpColor(from: t0, to: t0, t: 0),
-                lerpColor(from: t0, to: t1, t: midReach * 1.4),
+                lerpColor(from: t0, to: t1, t: c1Reach * 1.35),
+                lerpColor(from: t1, to: t2, t: c2Reach),
                 lerpColor(from: t0, to: t2, t: reach),
 
                 lerpColor(from: m0, to: m0, t: 0),
-                lerpColor(from: m0, to: m1, t: midReach * 1.4),
+                lerpColor(from: m0, to: m1, t: c1Reach * 1.35),
+                lerpColor(from: m1, to: m2, t: c2Reach),
                 lerpColor(from: m0, to: m2, t: reach),
 
                 lerpColor(from: b0, to: b0, t: 0),
-                lerpColor(from: b0, to: b1, t: midReach * 1.4),
+                lerpColor(from: b0, to: b1, t: c1Reach * 1.35),
+                lerpColor(from: b1, to: b2, t: c2Reach),
                 lerpColor(from: b0, to: b2, t: reach)
             ]
         } else {
@@ -1168,15 +1196,18 @@ private enum FluidMeshPalette {
 
             return [
                 lerpColor(from: t0, to: t0, t: 0),
-                lerpColor(from: t0, to: t1, t: midReach * 1.4),
+                lerpColor(from: t0, to: t1, t: c1Reach * 1.35),
+                lerpColor(from: t1, to: t2, t: c2Reach),
                 lerpColor(from: t0, to: t2, t: reach),
 
                 lerpColor(from: m0, to: m0, t: 0),
-                lerpColor(from: m0, to: m1, t: midReach * 1.4),
+                lerpColor(from: m0, to: m1, t: c1Reach * 1.35),
+                lerpColor(from: m1, to: m2, t: c2Reach),
                 lerpColor(from: m0, to: m2, t: reach),
 
                 lerpColor(from: b0, to: b0, t: 0),
-                lerpColor(from: b0, to: b1, t: midReach * 1.4),
+                lerpColor(from: b0, to: b1, t: c1Reach * 1.35),
+                lerpColor(from: b1, to: b2, t: c2Reach),
                 lerpColor(from: b0, to: b2, t: reach)
             ]
         }
