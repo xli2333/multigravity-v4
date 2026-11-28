@@ -250,11 +250,14 @@ func TestLargeMedia200MBLimitsAndAMR(t *testing.T) {
 		t.Fatalf("document maxUploadBytes = %d, want 50MB", got)
 	}
 
-	if !supportsNativeAttachment(Attachment{Kind: "audio", Size: 180 * 1024 * 1024}) {
+	if !supportsNativeAttachment(Attachment{Kind: "audio", Name: "voice.m4a", Mime: "audio/mp4", Size: 180 * 1024 * 1024}) {
 		t.Fatalf("expected 180MB audio to support native media attachment")
 	}
-	if supportsNativeAttachment(Attachment{Kind: "document", Size: 25 * 1024 * 1024}) {
-		t.Fatalf("expected 25MB document to exceed 20MB native non-media cap")
+	if supportsNativeAttachment(Attachment{Kind: "document", Name: "large.pdf", Mime: "application/pdf", Size: 25 * 1024 * 1024}) {
+		t.Fatalf("expected 25MB PDF document to exceed 20MB native non-media cap")
+	}
+	if supportsNativeAttachment(Attachment{Kind: "spreadsheet", Name: "quote.xlsx", Mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", Size: 18 * 1024}) {
+		t.Fatalf("expected xlsx spreadsheet to skip native media attachment")
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/attachments", bytes.NewReader([]byte("#!AMR\nhello")))

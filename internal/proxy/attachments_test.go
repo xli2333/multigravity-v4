@@ -168,7 +168,7 @@ func TestSanitizeAttachmentName(t *testing.T) {
 
 func TestApplySmallAttachmentUsesNativeMedia(t *testing.T) {
 	setupInbox(t)
-	a := decodeAttachment(t, upload(t, "plan.md", []byte("# plan")))
+	a := decodeAttachment(t, upload(t, "spec.pdf", []byte("%PDF-1.4\nspec")))
 
 	msg := map[string]interface{}{
 		"cascadeId":   "c1",
@@ -183,7 +183,7 @@ func TestApplySmallAttachmentUsesNativeMedia(t *testing.T) {
 	if _, still := msg["attachments"]; still {
 		t.Error("attachments key must be removed before forwarding")
 	}
-	// Small files (<= 20MB) are passed as native media items AND retain attachment block in prompt text
+	// Small multimodal files (PDF/image/audio/video <= cap) are passed as native media items AND retain attachment block in prompt text
 	if gotText := msg["text"].(string); !strings.HasPrefix(gotText, "看看这个\n\n"+attachmentHeader) || !strings.Contains(gotText, a.Path) {
 		t.Errorf("prompt text should include attachment block, got: %q", gotText)
 	}
@@ -198,6 +198,28 @@ func TestApplySmallAttachmentUsesNativeMedia(t *testing.T) {
 	}
 	if strings.Contains(mItem["mimeType"].(string), ";") {
 		t.Errorf("expected stripped base mimeType without parameters, got %v", mItem["mimeType"])
+	}
+}
+
+func TestApplyOfficeAttachmentSkipsNativeMedia(t *testing.T) {
+	setupInbox(t)
+	a := decodeAttachment(t, upload(t, "报价单模板.xlsx", []byte("PK\x03\x04dummy-xlsx")))
+
+	msg := map[string]interface{}{
+		"cascadeId":   "c1",
+		"text":        "删掉不含税字样",
+		"items":       []interface{}{map[string]interface{}{"text": "删掉不含税字样"}},
+		"attachments": []interface{}{map[string]interface{}{"id": a.ID}},
+	}
+	changed, err := applyAttachmentsToMessage(msg)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if _, hasMedia := msg["media"]; hasMedia {
+		t.Fatalf("xlsx attachment must not be placed in native media[] (Gemini rejects file:// xlsx URIs), got: %v", msg["media"])
+	}
+	if gotText := msg["text"].(string); !strings.Contains(gotText, a.Path) {
+		t.Errorf("prompt text should include local inbox path, got: %q", gotText)
 	}
 }
 
@@ -295,10 +317,8 @@ func TestApplyAttachmentsOnlyNoText(t *testing.T) {
 	if _, err := applyAttachmentsToMessage(msg); err != nil {
 		t.Fatal(err)
 	}
-	// Small attachment without text produces media entry and synthesized empty items
-	media, ok := msg["media"].([]interface{})
-	if !ok || len(media) != 1 {
-		t.Fatalf("expected 1 media entry, got: %v", msg["media"])
+	if _, hasMedia := msg["media"]; hasMedia {
+		t.Fatalf("non-multimodal csv should not produce media entry, got: %v", msg["media"])
 	}
 	items, ok := msg["items"].([]interface{})
 	if !ok || len(items) != 1 {

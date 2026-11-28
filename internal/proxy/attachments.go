@@ -234,7 +234,28 @@ func maxUploadBytesForKind(kind string) int64 {
 	return int64(envInt("MGY_MAX_UPLOAD_MB", defaultMaxUploadMB)) * 1024 * 1024
 }
 
+func isMultimodalNativeAttachment(a Attachment) bool {
+	if isLargeMediaKind(a.Kind) {
+		return true
+	}
+	mimeType := strings.ToLower(strings.TrimSpace(a.Mime))
+	if base, _, err := mime.ParseMediaType(mimeType); err == nil && base != "" {
+		mimeType = base
+	}
+	if strings.HasPrefix(mimeType, "image/") ||
+		strings.HasPrefix(mimeType, "audio/") ||
+		strings.HasPrefix(mimeType, "video/") ||
+		mimeType == "application/pdf" {
+		return true
+	}
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(a.Name), "."))
+	return ext == "pdf"
+}
+
 func supportsNativeAttachment(a Attachment) bool {
+	if !isMultimodalNativeAttachment(a) {
+		return false
+	}
 	if isLargeMediaKind(a.Kind) {
 		return a.Size <= maxNativeMediaAttachBytes
 	}

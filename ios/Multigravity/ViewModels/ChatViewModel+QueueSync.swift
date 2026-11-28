@@ -300,10 +300,16 @@ extension ChatViewModel {
         guard (!text.isEmpty || hasImages || hasFiles || hasSlash || hasContextItems), let url = settings.serverURL else { return false }
         // The gateway appends the attachment block to the text; mirror it locally so optimistic
         // bubbles and queued items match what the server will echo back.
+        // Passing `wireText` directly (instead of raw `attachmentIds`) for uploaded files that
+        // already carry `line` prevents Windows gateways from injecting a non-standard `file://C:\...`
+        // entry into `media[]`, which Gemini API rejects with `400 Unsupported file URI type`.
         let bodyText = AttachmentRules.appendBlock(to: text, files: sendFiles)
+        let filesWithLine = sendFiles.filter { !($0.line ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let filesWithoutLine = sendFiles.filter { ($0.line ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let wireText = AttachmentRules.appendBlock(to: text, files: filesWithLine)
         // language_server 把斜杠命令的显示文本生成为 "/name 内容"，本地气泡与队列条目保持一致
         let displayText = hasSlash ? "/\(slashCommand!)" + (bodyText.isEmpty ? "" : " " + bodyText) : bodyText
-        let attachmentIds = sendFiles.compactMap(\.attachmentId)
+        let attachmentIds = filesWithoutLine.compactMap(\.attachmentId)
         
         hasUserManuallySelectedModel = true
         updateCascadeConfigRawModel(activeModelEnum, modelName: activeModel)
@@ -384,7 +390,7 @@ extension ChatViewModel {
                 do {
                     try await self.apiClient.sendMessage(
                         cascadeId: self.cascadeId,
-                        text: text,
+                        text: wireText,
                         model: self.activeModelEnum,
                         images: images,
                         deliveryStrategy: 2,
@@ -517,7 +523,7 @@ extension ChatViewModel {
                 if (images?.isEmpty == false) || hasFiles || hasSlash || hasContextItems {
                     try await apiClient.sendMessage(
                         cascadeId: newCascadeId,
-                        text: text,
+                        text: wireText,
                         model: activeModelEnum,
                         images: images,
                         cascadeConfigRaw: cascadeConfigRaw,
@@ -536,7 +542,7 @@ extension ChatViewModel {
             } else {
                 try await apiClient.sendMessage(
                     cascadeId: cascadeId,
-                    text: text,
+                    text: wireText,
                     model: activeModelEnum,
                     images: images,
                     cascadeConfigRaw: cascadeConfigRaw,
