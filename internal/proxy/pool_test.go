@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -133,5 +134,25 @@ func BenchmarkPooledRequestPayload(b *testing.B) {
 		buf.WriteString(`"}`)
 		PutSmallBuffer(buf)
 	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, errors.New("simulated client disconnect")
+}
+
+func TestReadBodyToPoolErrorReturnsSafeCleanup(t *testing.T) {
+	body, cleanup, err := readBodyToPool(errReader{}, 1024)
+	if err == nil {
+		t.Fatal("expected read error, got nil")
+	}
+	if body != nil {
+		t.Fatalf("expected nil body on error, got %d bytes", len(body))
+	}
+	if cleanup == nil {
+		t.Fatal("expected non-nil no-op cleanup func on error so defer cleanup() cannot panic")
+	}
+	cleanup()
 }
 

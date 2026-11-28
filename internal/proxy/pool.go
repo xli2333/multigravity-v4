@@ -129,7 +129,7 @@ func readBodyToPool(r io.Reader, limit int64) ([]byte, func(), error) {
 	}
 	if _, err := buf.ReadFrom(reader); err != nil {
 		cleanup()
-		return nil, nil, err
+		return nil, func() {}, err
 	}
 	return buf.Bytes(), cleanup, nil
 }

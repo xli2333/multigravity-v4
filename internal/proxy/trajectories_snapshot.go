@@ -21,9 +21,6 @@ import (
 // language_server (and our JSON decoding) from being hit once per consumer.
 const allTrajectoriesTTL = time.Second
 
-// maxAllTrajectoriesBody caps the upstream list response we are willing to buffer.
-const maxAllTrajectoriesBody = 64 * 1024 * 1024
-
 // allTrajectoriesParsed holds pre-decoded lightweight indices over a GetAllCascadeTrajectories
 // response so stream change detection, subagent live lookups, and events list hashing never
 // repeatedly json.Unmarshal megabytes of raw list JSON on hot paths.
@@ -365,7 +362,7 @@ func (p *Proxy) fetchAllTrajectoriesUpstream(ctx context.Context, port int, toke
 
 	buf := GetHugeBuffer()
 	defer PutHugeBuffer(buf)
-	if _, err := buf.ReadFrom(io.LimitReader(reader, maxAllTrajectoriesBody)); err != nil {
+	if _, err := buf.ReadFrom(reader); err != nil {
 		return nil, err
 	}
 	out := make([]byte, buf.Len())

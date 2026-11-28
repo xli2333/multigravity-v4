@@ -427,7 +427,7 @@ func (g *trajFlightGroup) doCtx(ctx context.Context, key string, fn func(context
 		c = &trajFlightCall{done: make(chan struct{})}
 		g.calls[key] = c
 		go func() {
-			upCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			upCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer func() {
 				cancel()
 				g.mu.Lock()
@@ -479,7 +479,14 @@ func (p *Proxy) fetchUpstreamTrajectoryUncached(ctx context.Context, cascadeID s
 		req.Header.Set("x-codeium-csrf-token", token)
 	}
 
-	resp, err := p.mediumClient.Do(req)
+	client := p.streamingHTTPClient()
+	if client == nil {
+		client = p.longClient
+	}
+	if client == nil {
+		client = p.mediumClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -501,21 +508,29 @@ func (p *Proxy) fetchUpstreamTrajectoryUncached(ctx context.Context, cascadeID s
 	}
 
 	const maxRawCacheBytes = 8 * 1024 * 1024
-	const maxUpstreamTrajectoryBytes = 64 * 1024 * 1024
 	rawBuf := GetHugeBuffer()
 	defer PutHugeBuffer(rawBuf)
-	if _, err := rawBuf.ReadFrom(io.LimitReader(reader, maxUpstreamTrajectoryBytes)); err != nil {
+	if _, err := rawBuf.ReadFrom(io.LimitReader(reader, maxRawCacheBytes+1)); err != nil {
 		return nil, fmt.Errorf("failed to read upstream response: %w", err)
 	}
 
 	var data upstreamTrajectoryResp
-	if err := json.Unmarshal(rawBuf.Bytes(), &data); err != nil {
-		return nil, fmt.Errorf("failed to decode upstream response: %w", err)
-	}
 	var preservedRaw []byte
-	if rawBuf.Len() > 0 && rawBuf.Len() <= maxRawCacheBytes {
-		preservedRaw = make([]byte, rawBuf.Len())
-		copy(preservedRaw, rawBuf.Bytes())
+	if rawBuf.Len() <= maxRawCacheBytes {
+		if err := json.Unmarshal(rawBuf.Bytes(), &data); err != nil {
+			return nil, fmt.Errorf("failed to decode upstream response: %w", err)
+		}
+		if rawBuf.Len() > 0 {
+			preservedRaw = make([]byte, rawBuf.Len())
+			copy(preservedRaw, rawBuf.Bytes())
+		}
+	} else {
+		// Stream-decode arbitrarily large local trajectories (>8MB) directly without
+		// buffering the full raw JSON or imposing an artificial size cap.
+		combined := io.MultiReader(bytes.NewReader(rawBuf.Bytes()), reader)
+		if err := json.NewDecoder(combined).Decode(&data); err != nil {
+			return nil, fmt.Errorf("failed to decode upstream response: %w", err)
+		}
 	}
 	compactTrajectoryMedia(&data)
 

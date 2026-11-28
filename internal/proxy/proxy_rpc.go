@@ -533,8 +533,17 @@ func (p *Proxy) handleGetAllCascadeTrajectories(w http.ResponseWriter, r *http.R
 		}(port, token)
 	}
 
-	bodyBytes, cleanup, _ := readBodyToPool(r.Body, 5*1024*1024)
-	defer cleanup()
+	bodyBytes, cleanup, readErr := readBodyToPool(r.Body, 5*1024*1024)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if readErr != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, readErr.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// P4: enforce the 4s budget via a context deadline instead of allocating a new http.Client per request.
 	listCtx, listCancel := context.WithTimeout(r.Context(), 4*time.Second)
@@ -1030,6 +1039,7 @@ func (p *Proxy) handleGetAllCascadeTrajectories(w http.ResponseWriter, r *http.R
 		case <-ctx.Done():
 		}
 
+		mu.Lock()
 		for cid, hasAction := range actionMap {
 			if hasAction && summaries[cid] != nil {
 				summaries[cid]["needsInput"] = true
@@ -1049,6 +1059,7 @@ func (p *Proxy) handleGetAllCascadeTrajectories(w http.ResponseWriter, r *http.R
 				delete(summaries[cid], "errorMessage")
 			}
 		}
+		mu.Unlock()
 	}
 
 	if r.Header.Get("X-Widget-Lite") == "1" {
